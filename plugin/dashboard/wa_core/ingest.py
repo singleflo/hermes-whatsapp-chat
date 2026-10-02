@@ -137,6 +137,20 @@ def _reopen_target(row: sqlite3.Row, rules: settings.Rules) -> tuple[str, str] |
     return None
 
 
+def _adopt_own_jid(conn: sqlite3.Connection, account_id: int, event: dict, now: int) -> None:
+    """Migrated accounts have no number yet: take it from the bridge's own ids (wa_name is left alone).
+
+    Runs inside the caller's transaction, so it cannot go through ``accounts.record_paired`` (own transaction).
+    """
+    own = next((b for b in event.get("botIds") or [] if isinstance(b, str) and b.endswith(WA_PHONE_SUFFIX)), None)
+    if own is None:
+        return
+    conn.execute(
+        "UPDATE accounts SET wa_jid = ?, phone = ?, updated_at = ? WHERE id = ? AND wa_jid IS NULL",
+        (own, _jid_number(own), now, account_id),
+    )
+
+
 def ingest_event(
     conn: sqlite3.Connection, account_id: int, event: dict, now: int, *, source: str = "live"
 ) -> int | None:
@@ -157,8 +171,11 @@ def ingest_event(
     direction = "out" if from_owner else "in"
 
     with db.write_txn(conn):
-        if conn.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone() is None:
+        account = conn.execute("SELECT wa_jid FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if account is None:
             raise errors.NotFound(f"account {account_id} not found")
+        if account["wa_jid"] is None:
+            _adopt_own_jid(conn, account_id, event, now)
         if wa_id and conn.execute(
             "SELECT 1 FROM messages WHERE account_id = ? AND wa_id = ?", (account_id, wa_id)
         ).fetchone():

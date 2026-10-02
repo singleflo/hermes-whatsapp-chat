@@ -1859,7 +1859,7 @@ function BoardCard({ card, onOpen }) {
   )
 }
 
-function BoardColumn({ col, hidden, onOpen, onDrop }) {
+function BoardColumn({ col, count, hidden, onOpen, onDrop }) {
   const [over, setOver] = useState(false)
   return h(
     'div',
@@ -1893,7 +1893,7 @@ function BoardColumn({ col, hidden, onOpen, onDrop }) {
       'div',
       { style: { ...F.row, fontSize: 12, fontWeight: 600 } },
       h('span', null, stateLabel(col.name)),
-      hidden ? null : h(Badge, { variant: 'muted' }, String(col.cards.length))
+      h(Badge, { variant: 'muted' }, String(count))
     ),
     hidden
       ? h('div', { style: T.muted }, 'Hidden. Enable "Show closed" to list them; drop a card here to close it.')
@@ -1965,7 +1965,14 @@ function BoardView({ onOpen }) {
           style: { display: 'flex', gap: 12, flex: '1 1 auto', minHeight: 0, overflowX: 'auto', alignItems: 'stretch' }
         },
         data.columns.map(col =>
-          h(BoardColumn, { key: col.name, col, hidden: col.name === 'closed' && !includeClosed, onOpen, onDrop })
+          h(BoardColumn, {
+            key: col.name,
+            col,
+            count: col.name === 'closed' && !includeClosed ? (data.counts || {}).closed || 0 : col.cards.length,
+            hidden: col.name === 'closed' && !includeClosed,
+            onOpen,
+            onDrop
+          })
         )
       )
     )

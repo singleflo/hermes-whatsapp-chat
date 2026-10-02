@@ -298,7 +298,7 @@
     )
   }
 
-  function BoardColumn({ col, cards, onOpen, onDropCard }) {
+  function BoardColumn({ col, cards, count, hidden, onOpen, onDropCard }) {
     const [over, setOver] = useState(false)
     return h(
       'div',
@@ -322,9 +322,13 @@
         'div',
         { className: 'wab-row' },
         h('strong', null, stateLabel(col.name)),
-        h(Badge, { tone: 'secondary' }, String(cards.length))
+        h(Badge, { tone: 'secondary' }, String(count))
       ),
-      cards.length === 0 ? h('div', { className: 'wab-muted wab-empty' }, 'No conversations') : null,
+      hidden
+        ? h('div', { className: 'wab-muted wab-empty' }, 'Hidden. Use "Show closed" to list them.')
+        : cards.length === 0
+          ? h('div', { className: 'wab-muted wab-empty' }, 'No conversations')
+          : null,
       cards.map(card => h(BoardCard, { key: card.id, card, onOpen }))
     )
   }
@@ -373,7 +377,16 @@
             'div',
             { className: 'wab-board' },
             board.data.columns.map(col =>
-              h(BoardColumn, { key: col.name, col, cards: col.cards, onOpen: app.openConversation, onDropCard })
+              h(BoardColumn, {
+                key: col.name,
+                col,
+                cards: col.cards,
+                count:
+                  col.name === 'closed' && !includeClosed ? (board.data.counts || {}).closed || 0 : col.cards.length,
+                hidden: col.name === 'closed' && !includeClosed,
+                onOpen: app.openConversation,
+                onDropCard
+              })
             )
           )
         : null

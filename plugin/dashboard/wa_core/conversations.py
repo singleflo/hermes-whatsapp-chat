@@ -185,7 +185,12 @@ def get_board(
             _CARD_SELECT + where + " ORDER BY c.last_message_at DESC, c.id DESC LIMIT ?", (*args, cfg.board.closed_limit)
         ).fetchall()
         by_col["closed"] = [_card(row, now, cfg.board.urgency_hours) for row in rows]
-    return {"columns": [{"name": name, "cards": by_col[name]} for name in BOARD_COLUMNS], "now": now}
+    where, args = _filters(account_id, q)
+    counts = {name: 0 for name in BOARD_COLUMNS}
+    sql = "SELECT c.state AS state, COUNT(*) AS n FROM conversations c" + where + " GROUP BY c.state"
+    for row in conn.execute(sql, args):
+        counts[row["state"]] = row["n"]
+    return {"columns": [{"name": name, "cards": by_col[name]} for name in BOARD_COLUMNS], "counts": counts, "now": now}
 
 
 def list_conversations(

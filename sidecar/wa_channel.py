@@ -106,7 +106,9 @@ def qr_svg(qr: str) -> str | None:
     except ImportError:
         log("segno is not installed: QR codes cannot be rendered (uv sync)")
         return None
-    return segno.make(qr, error="l").svg_inline(scale=4, dark="currentColor", light=None)
+    # segno validates colours, so render black and swap it for currentColor afterwards.
+    svg = segno.make(qr, error="l").svg_inline(scale=4, dark="#000", light=None)
+    return svg.replace('"#000"', '"currentColor"')
 
 
 # --- per-account runner ----------------------------------------------------------------

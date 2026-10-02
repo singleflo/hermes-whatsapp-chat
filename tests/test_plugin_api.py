@@ -447,6 +447,24 @@ def test_board_excludes_closed_unless_requested_and_limits_them(client, db, acco
     assert [c["contact_name"] for c in columns(client, include_closed="true")["closed"]] == ["Done 0", "Done 1"]
 
 
+def test_board_counts_report_every_state_total_even_with_closed_hidden(client, core, db, account):
+    other = add_account(core, db, "Second", color="blue")
+    for i in range(3):
+        add_conv(db, account, f"{i}@s.whatsapp.net", "closed", name=f"Done {i}")
+    add_conv(db, other, "9@s.whatsapp.net", "closed", name="Other shut")
+    add_conv(db, account, "n@s.whatsapp.net", "new", name="Alice")
+    add_conv(db, account, "w@s.whatsapp.net", "weird")
+    body = client.get(f"{PREFIX}/board", params={"include_closed": "false"}).json()
+    assert next(c for c in body["columns"] if c["name"] == "closed")["cards"] == []
+    assert body["counts"] == {"new": 1, "in_progress": 0, "waiting": 0, "muted": 0, "closed": 4, "weird": 1}
+    mine = client.get(f"{PREFIX}/board", params={"account_id": account}).json()["counts"]
+    assert (mine["closed"], mine["new"]) == (3, 1)
+    assert client.get(f"{PREFIX}/board", params={"account_id": other}).json()["counts"]["closed"] == 1
+    searched = client.get(f"{PREFIX}/board", params={"q": "Done"}).json()["counts"]
+    assert (searched["closed"], searched["new"]) == (3, 0)
+    assert set(client.get(f"{PREFIX}/board", params={"account_id": 9999}).json()["counts"].values()) == {0}
+
+
 def test_board_search_filters_by_name_or_phone_and_account(client, core, db, account):
     other = add_account(core, db, "Second", color="blue")
     add_conv(db, account, "111@s.whatsapp.net", "new", name="Alice Martin")
@@ -1388,6 +1406,32 @@ def test_record_paired_stores_phone_and_name(client, core, db):
     session.mkdir(parents=True)
     (session / "creds.json").write_text("{}", encoding="utf-8")
     assert client.get(f"{PREFIX}/accounts").json()["accounts"][0]["paired"] is True
+
+
+def test_ingest_fills_own_number_of_account_without_jid_from_bot_ids(core, db, account):
+    db.execute("UPDATE accounts SET wa_name = 'Shop' WHERE id = ?", (account,))
+    core.ingest.ingest_event(db, account, wa_event(botIds=["5551234@lid", f"{OWN_JID.split('@')[0]}:7@s.whatsapp.net"]), NOW)
+    row = core.accounts.get_account(db, account)
+    assert (row["wa_jid"], row["phone"], row["wa_name"]) == ("393990000000:7@s.whatsapp.net", "393990000000", "Shop")
+
+
+def test_ingest_fills_own_number_from_history_events_too(core, db, account):
+    core.ingest.ingest_event(db, account, wa_event(messageId="H1"), NOW, source="history")
+    assert core.accounts.get_account(db, account)["wa_jid"] == OWN_JID
+
+
+def test_ingest_never_overwrites_an_existing_own_jid(core, db, account):
+    core.accounts.record_paired(db, account, wa_jid="393330009999@s.whatsapp.net", wa_name="Shop", now=NOW)
+    core.ingest.ingest_event(db, account, wa_event(), NOW)
+    row = core.accounts.get_account(db, account)
+    assert (row["wa_jid"], row["phone"], row["wa_name"]) == ("393330009999@s.whatsapp.net", "393330009999", "Shop")
+
+
+def test_ingest_without_phone_bot_id_leaves_account_number_empty(core, db, account):
+    core.ingest.ingest_event(db, account, wa_event(botIds=["5551234@lid"]), NOW)
+    core.ingest.ingest_event(db, account, wa_event(messageId="M2", botIds=[]), NOW)
+    row = core.accounts.get_account(db, account)
+    assert (row["wa_jid"], row["phone"]) == (None, None)
 
 
 # --- WS /events ----------------------------------------------------------------
