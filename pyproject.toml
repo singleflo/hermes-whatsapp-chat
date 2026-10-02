@@ -1,0 +1,24 @@
+[project]
+name = "hermes-whatsapp-chat"
+version = "0.1.0"
+description = "Repo tooling for the hermes-whatsapp-chat Hermes plugin and its WhatsApp channel sidecar"
+requires-python = ">=3.11"
+dependencies = ["fastapi==0.133.1", "pydantic==2.13.4"]
+
+[dependency-groups]
+dev = ["httpx==0.28.1", "pytest==9.1.1", "ruff==0.15.10", "ty==0.0.82"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+preview = true
+
+[tool.ruff.lint]
+select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
+
+[tool.ty.environment]
+python-version = "3.11"

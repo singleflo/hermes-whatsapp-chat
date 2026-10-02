@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "hermes-agent": {
+      "source": "../../../.hermes/hermes-agent/skills/autonomous-ai-agents/hermes-agent",
+      "sourceType": "local",
+      "computedHash": "3463a64e1101f11774d4dbc22443440d2357f6cd3fbd4cf181fa5250a422d9e5"
+    },
+    "hermes-desktop-plugins": {
+      "source": "../../../.hermes/skills/hermes-desktop-plugins",
+      "sourceType": "local",
+      "computedHash": "2aa41e70f6b8096bfbe9a4596bee205f89d1b5cc139df63cbceff72952915e90"
+    },
+    "hermes-plugin-development": {
+      "source": "../../../.hermes/skills/software-development/hermes-plugin-development",
+      "sourceType": "local",
+      "computedHash": "eb9458a83beb3d106f83dd1f97c7406b51f1c2e532fc27956c1416de79deea2a"
+    }
+  }
+}

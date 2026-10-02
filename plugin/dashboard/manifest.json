@@ -1,0 +1,15 @@
+{
+  "name": "hermes-whatsapp-chat",
+  "label": "Conversations",
+  "description": "Kanban board of WhatsApp conversations - one card per contact, columns are conversation states",
+  "icon": "MessageSquare",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/wa-board",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
