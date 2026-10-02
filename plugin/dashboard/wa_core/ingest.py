@@ -1,0 +1,277 @@
+"""Rules engine: turn one bridge message event into a stored message plus conversation changes."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Any
+
+from . import conversations, db, errors, events, media, settings
+
+NON_SUBSTANTIVE_MEDIA = {"reaction", "poll_update"}
+WA_PHONE_SUFFIX = "@s.whatsapp.net"
+
+
+def _jid_number(jid: str) -> str:
+    return jid.split("@", 1)[0].split(":", 1)[0]
+
+
+def canonical_jid(event: dict) -> str:
+    """Conversation key: the contact's phone JID when the bridge provides one.
+
+    The bridge puts the phone JID in ``senderId`` when the chat is addressed by LID.
+    """
+    own = {_jid_number(b) for b in event.get("botIds") or []}
+    for candidate in (event.get("senderId"), event.get("chatId")):
+        if candidate and candidate.endswith(WA_PHONE_SUFFIX) and _jid_number(candidate) not in own:
+            return candidate
+    return str(event.get("chatId") or "")
+
+
+def event_ts(raw: Any, now: int) -> int:
+    if isinstance(raw, dict):  # protobuf Long
+        value = (int(raw.get("high", 0)) << 32) + (int(raw.get("low", 0)) & 0xFFFFFFFF)
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return now
+    return value if 0 < value <= now + 86400 else now
+
+
+def _is_group(event: dict) -> bool:
+    return bool(event.get("isGroup")) or str(event.get("chatId") or "").endswith("@g.us")
+
+
+def _meta(event: dict) -> str | None:
+    if not event.get("hasMedia"):
+        return None
+    return json.dumps(
+        {"mediaType": event.get("mediaType"), "media": media.media_entries(event.get("mediaUrls") or [])}
+    )
+
+
+def _insert_message(
+    conn: sqlite3.Connection,
+    conv_id: int,
+    account_id: int,
+    *,
+    wa_id: str | None,
+    direction: str,
+    author: str,
+    body: str,
+    ts: int,
+    source: str,
+    meta: str | None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            conv_id,
+            account_id,
+            wa_id,
+            direction,
+            author,
+            body,
+            ts,
+            "received" if direction == "in" else "sent",
+            source,
+            meta,
+        ),
+    )
+    return cur.lastrowid or 0
+
+
+def _create_conversation(
+    conn: sqlite3.Connection,
+    account_id: int,
+    jid: str,
+    *,
+    state: str,
+    name: str | None,
+    ts: int,
+    now: int,
+    unread: int,
+    last_inbound_at: int | None,
+) -> sqlite3.Row:
+    phone = _jid_number(jid) if jid.endswith(WA_PHONE_SUFFIX) else None
+    cur = conn.execute(
+        "INSERT INTO conversations (account_id, chat_jid, contact_name, phone, state, unread_count, last_message_at,"
+        " last_inbound_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (account_id, jid, name, phone, state, unread, ts, last_inbound_at, ts, now),
+    )
+    return conversations.get_row(conn, cur.lastrowid or 0)
+
+
+def _announce_created(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
+    """New live conversation: audit row + conversation.created + state_changed (from null)."""
+    conn.execute(
+        "INSERT INTO conversation_state_log (conversation_id, from_state, to_state, actor, reason, at)"
+        " VALUES (?,NULL,?,'auto','first message',?)",
+        (row["id"], row["state"], now),
+    )
+    events.emit(conn, "conversation.created", now=now, account_id=row["account_id"], conversation_id=row["id"])
+    events.emit(
+        conn,
+        "conversation.state_changed",
+        now=now,
+        account_id=row["account_id"],
+        conversation_id=row["id"],
+        payload={"from": None, "to": row["state"], "actor": "auto", "reason": "first message"},
+    )
+
+
+def _reopen_target(row: sqlite3.Row, rules: settings.Rules) -> tuple[str, str] | None:
+    """Policy move for an inbound message on the current state, as (target, reason)."""
+    state = row["state"]
+    if state == "closed" and rules.inbound_on_closed != "keep":
+        previous = row["previous_state"]
+        if rules.inbound_on_closed == "reopen_previous" and previous in ("new", "in_progress", "waiting"):
+            return previous, "rules.inbound_on_closed=reopen_previous"
+        return "new", f"rules.inbound_on_closed={rules.inbound_on_closed}"
+    if state == "waiting" and rules.inbound_on_waiting == "in_progress":
+        return "in_progress", "rules.inbound_on_waiting=in_progress"
+    if state == "muted" and rules.inbound_on_muted == "reopen_new":
+        return "new", "rules.inbound_on_muted=reopen_new"
+    return None
+
+
+def ingest_event(
+    conn: sqlite3.Connection, account_id: int, event: dict, now: int, *, source: str = "live"
+) -> int | None:
+    """Store one bridge message event. Returns the new message id; None for groups, empty jids and duplicates."""
+    if _is_group(event):
+        return None
+    jid = canonical_jid(event)
+    if not jid:
+        return None
+    from_owner = bool(event.get("fromOwner"))
+    ts = event_ts(event.get("timestamp"), now)
+    body = str(event.get("body") or "")
+    media_type = event.get("mediaType")
+    wa_id = str(event.get("messageId") or "") or None
+    meta = _meta(event)
+    name = event.get("senderName")
+    contact_name = name if not from_owner and name and name != _jid_number(jid) else None
+    direction = "out" if from_owner else "in"
+
+    with db.write_txn(conn):
+        if conn.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone() is None:
+            raise errors.NotFound(f"account {account_id} not found")
+        if wa_id and conn.execute(
+            "SELECT 1 FROM messages WHERE account_id = ? AND wa_id = ?", (account_id, wa_id)
+        ).fetchone():
+            return None
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE account_id = ? AND chat_jid = ?", (account_id, jid)
+        ).fetchone()
+        common = {"wa_id": wa_id, "direction": direction, "body": body, "ts": ts, "meta": meta}
+
+        if source == "history":
+            if row is None:
+                row = _create_conversation(
+                    conn, account_id, jid, state="closed", name=contact_name, ts=ts, now=now, unread=0,
+                    last_inbound_at=None,
+                )
+            message_id = _insert_message(
+                conn, row["id"], account_id, author="phone" if from_owner else "contact", source="history", **common
+            )
+            conn.execute(
+                "UPDATE conversations SET last_message_at = MAX(COALESCE(last_message_at, 0), ?) WHERE id = ?",
+                (ts, row["id"]),
+            )
+            return message_id
+
+        rules = settings.get_settings(conn).rules
+        if from_owner:
+            return _ingest_owner(conn, account_id, row, jid, common, rules, now)
+        return _ingest_inbound(
+            conn, account_id, row, jid, common, rules, contact_name, media_type, now
+        )
+
+
+def _ingest_inbound(
+    conn: sqlite3.Connection,
+    account_id: int,
+    row: sqlite3.Row | None,
+    jid: str,
+    common: dict[str, Any],
+    rules: settings.Rules,
+    contact_name: str | None,
+    media_type: str | None,
+    now: int,
+) -> int:
+    ts, body = common["ts"], common["body"]
+    created = row is None
+    if row is None:
+        row = _create_conversation(
+            conn, account_id, jid, state="new", name=contact_name, ts=ts, now=now, unread=1, last_inbound_at=ts
+        )
+    message_id = _insert_message(conn, row["id"], account_id, author="contact", source="live", **common)
+    if created:
+        _announce_created(conn, row, now)
+    else:
+        conn.execute(
+            "UPDATE conversations SET last_message_at = MAX(COALESCE(last_message_at, 0), ?), last_inbound_at = ?,"
+            " unread_count = unread_count + 1, contact_name = COALESCE(?, contact_name), updated_at = ?"
+            " WHERE id = ?",
+            (ts, ts, contact_name, now, row["id"]),
+        )
+        substantive = bool(body.strip()) and media_type not in NON_SUBSTANTIVE_MEDIA
+        move = _reopen_target(row, rules) if (row["state"] != "muted" or substantive) else None
+        if move:
+            conversations.force_transition(conn, row, move[0], actor="auto", reason=move[1], now=now)
+    events.emit(
+        conn,
+        "message.in",
+        now=now,
+        account_id=account_id,
+        conversation_id=row["id"],
+        message_id=message_id,
+        payload={"author": "contact"},
+    )
+    return message_id
+
+
+def _ingest_owner(
+    conn: sqlite3.Connection,
+    account_id: int,
+    row: sqlite3.Row | None,
+    jid: str,
+    common: dict[str, Any],
+    rules: settings.Rules,
+    now: int,
+) -> int:
+    ts = common["ts"]
+    last_inbound = row["last_inbound_at"] if row is not None else None
+    window = rules.auto_reply_window_seconds
+    is_auto = last_inbound is not None and window > 0 and 0 <= ts - last_inbound <= window
+    author = "auto_reply" if is_auto else "phone"
+    created = row is None
+    if row is None:
+        row = _create_conversation(
+            conn, account_id, jid, state="new" if is_auto else "waiting", name=None, ts=ts, now=now, unread=0,
+            last_inbound_at=None,
+        )
+    message_id = _insert_message(conn, row["id"], account_id, author=author, source="live", **common)
+    if created:
+        _announce_created(conn, row, now)
+    elif is_auto:
+        conn.execute(
+            "UPDATE conversations SET last_message_at = MAX(COALESCE(last_message_at, 0), ?), updated_at = ?"
+            " WHERE id = ?",
+            (ts, now, row["id"]),
+        )
+    else:
+        conversations.apply_outbound(conn, row["id"], ts=ts, now=now, reason="reply sent from the phone")
+    events.emit(
+        conn,
+        "message.out",
+        now=now,
+        account_id=account_id,
+        conversation_id=row["id"],
+        message_id=message_id,
+        payload={"author": author},
+    )
+    return message_id

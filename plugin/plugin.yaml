@@ -4,3 +4,4 @@ description: >-
   Kanban board of WhatsApp conversations — desktop page + dashboard tab +
   shared FastAPI backend over the plugin's own DB, fed by the independent
   WhatsApp channel (sidecar/ in the repo).
+python_runtime: external
