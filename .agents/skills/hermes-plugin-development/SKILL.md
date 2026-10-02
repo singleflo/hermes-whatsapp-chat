@@ -63,7 +63,7 @@ install/enable, and the dev loop.
    (`tmp_path` + `monkeypatch.setenv`). One red→green slice at a time;
    monkeypatch only external boundaries (LLM clients), never internals.
 4. **Own dev venv.** `uv sync --python 3.11` (deps in root `pyproject.toml`).
-5. **Install and enable.** `ln -s /Users/crotti/VSC/TOOLS/hermes-whatsapp-chat/plugin ~/.hermes/plugins/hermes-whatsapp-chat`; `hermes
+5. **Install and enable.** Dev alias = a REAL folder `~/.hermes/plugins/hermes-whatsapp-chat/` holding symlinks to `plugin.yaml`, `dashboard/` and `desktop/plugin.js` (commands in `AGENTS.md`). NEVER symlink the whole plugin dir: the desktop app skips symlinked folders, so the desktop half stays on "copying…". Then `hermes
    plugins enable <id>` (this gates the Python backend); restart the gateway
    (backend routes mount at startup). The desktop half is auto-copied by the
    Electron main process into `~/.hermes/desktop-plugins/<id>/` — toggle it on

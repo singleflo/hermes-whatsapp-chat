@@ -61,7 +61,12 @@ uv run pytest -q
 
 # Validate / install / enable
 hermes plugins validate .                          # run from plugin/
-ln -s "$PWD/plugin" ~/.hermes/plugins/hermes-whatsapp-chat   # dev alias; remove unlinks only the symlink
+# Dev alias: a REAL folder of symlinks. Never symlink the whole plugin dir: the desktop app
+# lists ~/.hermes/plugins/ with isDirectory() (false for symlinks) and would never copy the
+# desktop half (Plugins page stuck on "copying…").
+P=~/.hermes/plugins/hermes-whatsapp-chat; mkdir -p $P/desktop
+ln -s "$PWD/plugin/plugin.yaml" $P/plugin.yaml; ln -s "$PWD/plugin/dashboard" $P/dashboard
+ln -s "$PWD/plugin/desktop/plugin.js" $P/desktop/plugin.js
 hermes plugins enable hermes-whatsapp-chat
 hermes gateway restart                             # backend routes mount only at startup
 
