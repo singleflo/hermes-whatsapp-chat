@@ -12,6 +12,10 @@
   const { Badge, Button, Card, CardContent, Input, Toast } = SDK.components
   const fetchJSON = SDK.fetchJSON
   const API = '/api/plugins/hermes-whatsapp-chat'
+  // Bump together with API_VERSION in wa_core/service.py: the UI is newer than a backend that reports less.
+  const REQUIRED_API_VERSION = 3
+  const RESTART_TITLE = 'Restart the Hermes dashboard to finish installing or updating WhatsApp Chat'
+  const SERVICE_START_TIMEOUT_MS = 30000
 
   const STATE_LABELS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', muted: 'Muted', closed: 'Closed' }
   const ACCOUNT_STATE_LABELS = {
@@ -127,6 +131,21 @@
     return m[2]
   }
 
+  function errorStatus(err) {
+    if (err && typeof err.status === 'number' && err.status > 0) {
+      return err.status
+    }
+    const m = /^(\d{3}):/.exec(String((err && err.message) || err))
+    return m ? Number(m[1]) : null
+  }
+
+  // Toast text: "HTTP <status>: <detail>"; 404/405 usually mean Hermes still runs the previous backend.
+  function failureText(err) {
+    const status = errorStatus(err)
+    const hint = status === 404 || status === 405 ? ' — restart Hermes to load the updated plugin' : ''
+    return (status ? 'HTTP ' + status + ': ' : '') + (errorText(err) || 'Request failed') + hint
+  }
+
   function request(method, path, body) {
     const init = { method }
     if (body !== undefined) {
@@ -198,7 +217,7 @@
 
   // Fetch a GET path on mount/path change/tick; keep the last data on failure.
   function useApi(path, tick) {
-    const [state, setState] = useState({ data: null, error: null })
+    const [state, setState] = useState({ data: null, error: null, status: null })
     useEffect(() => {
       if (!path) {
         return undefined
@@ -207,12 +226,12 @@
       fetchJSON(API + path).then(
         d => {
           if (!cancelled) {
-            setState({ data: d, error: null })
+            setState({ data: d, error: null, status: null })
           }
         },
         e => {
           if (!cancelled) {
-            setState(s => ({ data: s.data, error: errorText(e) }))
+            setState(s => ({ data: s.data, error: errorText(e), status: errorStatus(e) }))
           }
         }
       )
@@ -437,7 +456,7 @@
         d => setState({ status: 'ready', data: d }),
         e => {
           setState({ status: 'idle', data: null })
-          app.showToast(errorText(e), 'error')
+          app.showToast(failureText(e), 'error')
         }
       )
     }
@@ -688,7 +707,7 @@
         e => {
           restoreRef.current = null
           setLoadingOlder(false)
-          app.showToast(errorText(e), 'error')
+          app.showToast(failureText(e), 'error')
         }
       )
     }
@@ -1132,26 +1151,61 @@
   const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
   // POSTs a /service/* or /skill/* route; app.call toasts failures and refreshes.
+  // After 'install' it keeps `busy` set until the restarted service reports a fresh heartbeat.
   function useServiceAction() {
     const app = useContext(AppCtx)
     const [busy, setBusy] = useState('')
     function run(key, path, doneMessage) {
       setBusy(key)
+      const since = nowSec()
       return app.call('POST', path, {}).then(res => {
-        setBusy('')
-        if (res && doneMessage) {
-          app.showToast(doneMessage, 'success')
+        if (!res || key !== 'install') {
+          setBusy('')
+          if (res && doneMessage) {
+            app.showToast(doneMessage, 'success')
+          }
+          return res
         }
-        return res
+        app.setRestart('restarting')
+        return app.waitForHeartbeat(since).then(started => {
+          app.setRestart(started ? '' : 'failed')
+          app.refresh()
+          setBusy('')
+          if (started) {
+            if (doneMessage) {
+              app.showToast(doneMessage, 'success')
+            }
+          } else {
+            app.showToast(
+              'Service did not start: no new heartbeat after 30 s. Check the log: ' + SERVICE_LOG_HINT,
+              'error'
+            )
+          }
+          return res
+        })
       })
     }
     return [busy, run]
+  }
+
+  function RestartBanner() {
+    return h(
+      Card,
+      { className: 'wab-banner' },
+      h(
+        CardContent,
+        null,
+        h('strong', { className: 'wab-error' }, RESTART_TITLE),
+        h('div', { className: 'wab-small' }, 'The plugin was updated but Hermes is still running the previous backend.')
+      )
+    )
   }
 
   function ServiceBanner() {
     const app = useContext(AppCtx)
     const [busy, run] = useServiceAction()
     const installed = !app.service || app.service.installed !== false
+    const restarting = app.restart === 'restarting'
     return h(
       Card,
       { className: 'wab-banner' },
@@ -1161,23 +1215,37 @@
         h(
           'strong',
           { className: 'wab-error' },
-          installed ? 'WhatsApp service is not running' : 'WhatsApp service is not installed'
+          restarting
+            ? 'Restarting service…'
+            : installed
+              ? 'WhatsApp service is not running'
+              : 'WhatsApp service is not installed'
         ),
         h(
           'div',
           { className: 'wab-small' },
-          installed
-            ? 'Numbers cannot connect, receive or send messages until the background service is running. Reinstalling restarts it.'
-            : 'Numbers cannot connect, receive or send messages until the background service is installed. It starts automatically and keeps running in the background.'
+          restarting
+            ? 'Waiting for the service to report in. This can take up to 30 seconds.'
+            : installed
+              ? 'Numbers cannot connect, receive or send messages until the background service is running. Reinstalling restarts it.'
+              : 'Numbers cannot connect, receive or send messages until the background service is installed. It starts automatically and keeps running in the background.'
         ),
-        installed
+        app.restart === 'failed'
           ? h(
               'div',
-              { className: 'wab-muted wab-small' },
-              'If it keeps failing, check the log: ',
+              { className: 'wab-error wab-small' },
+              'The service did not start within 30 s. Check the log: ',
               h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
             )
-          : null,
+          : installed && !restarting
+            ? h(
+                'div',
+                { className: 'wab-muted wab-small' },
+                'If it keeps failing, check the log: ',
+                h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
+              )
+            : null,
+        app.outdated ? h('div', { className: 'wab-warn wab-small' }, RESTART_TITLE) : null,
         h(
           'div',
           { className: 'wab-actions' },
@@ -1185,10 +1253,11 @@
             Button,
             {
               size: 'sm',
-              disabled: busy !== '',
+              disabled: busy !== '' || restarting || app.outdated,
+              title: app.outdated ? RESTART_TITLE : undefined,
               onClick: () => run('install', '/service/install', 'WhatsApp service installed')
             },
-            busy === 'install' ? 'Installing…' : installed ? 'Reinstall' : 'Install service'
+            busy === 'install' || restarting ? 'Restarting service…' : installed ? 'Reinstall' : 'Install service'
           )
         )
       )
@@ -1203,6 +1272,10 @@
       return null
     }
     const installed = s.installed !== false
+    const restarting = app.restart === 'restarting'
+    const locked = busy !== '' || restarting || app.outdated
+    const lockTitle = app.outdated ? RESTART_TITLE : undefined
+    const nodeKnown = Object.prototype.hasOwnProperty.call(s, 'node')
     function uninstall() {
       if (
         window.confirm(
@@ -1247,10 +1320,25 @@
         ),
         h(
           'div',
-          { className: s.node ? 'wab-muted wab-small' : 'wab-error wab-small' },
-          s.node ? 'Node.js: ' + s.node : 'Node.js not found. Install Node.js, then install the service.'
+          { className: s.node ? 'wab-muted wab-small' : nodeKnown ? 'wab-error wab-small' : 'wab-warn wab-small' },
+          s.node
+            ? 'Node.js: ' + s.node
+            : nodeKnown
+              ? 'Node.js not found. Install Node.js, then install the service.'
+              : 'Node.js: unknown (restart Hermes)'
         ),
-        installed && !s.running
+        restarting
+          ? h('div', { className: 'wab-small' }, 'Restarting service… waiting for it to report in (up to 30 s).')
+          : null,
+        app.restart === 'failed' && !s.running
+          ? h(
+              'div',
+              { className: 'wab-error wab-small' },
+              'The service did not start within 30 s. Check the log: ',
+              h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
+            )
+          : null,
+        installed && !s.running && !restarting && app.restart !== 'failed'
           ? h(
               'div',
               { className: 'wab-muted wab-small' },
@@ -1258,6 +1346,7 @@
               h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
             )
           : null,
+        app.outdated ? h('div', { className: 'wab-warn wab-small' }, RESTART_TITLE) : null,
         h(
           'div',
           { className: 'wab-actions' },
@@ -1266,15 +1355,23 @@
             {
               size: 'sm',
               outlined: installed,
-              disabled: busy !== '',
+              disabled: locked,
+              title: lockTitle,
               onClick: () => run('install', '/service/install', 'WhatsApp service installed')
             },
-            busy === 'install' ? 'Installing…' : installed ? 'Reinstall' : 'Install service'
+            busy === 'install' || restarting ? 'Restarting service…' : installed ? 'Reinstall' : 'Install service'
           ),
           installed
             ? h(
                 Button,
-                { size: 'sm', outlined: true, destructive: true, disabled: busy !== '', onClick: uninstall },
+                {
+                  size: 'sm',
+                  outlined: true,
+                  destructive: true,
+                  disabled: locked,
+                  title: lockTitle,
+                  onClick: uninstall
+                },
                 busy === 'uninstall' ? 'Uninstalling…' : 'Uninstall service'
               )
             : null
@@ -1291,6 +1388,8 @@
       return null
     }
     const installed = !!s.skill_installed
+    const locked = busy !== '' || app.outdated
+    const lockTitle = app.outdated ? RESTART_TITLE : undefined
     return h(
       Card,
       null,
@@ -1308,6 +1407,7 @@
           { className: 'wab-muted wab-small' },
           'Lets Hermes agents list, read and answer your WhatsApp conversations. Installed into the Hermes skills folder.'
         ),
+        app.outdated ? h('div', { className: 'wab-warn wab-small' }, RESTART_TITLE) : null,
         h(
           'div',
           { className: 'wab-actions' },
@@ -1316,7 +1416,8 @@
             {
               size: 'sm',
               outlined: installed,
-              disabled: busy !== '',
+              disabled: locked,
+              title: lockTitle,
               onClick: () => run('skill-install', '/skill/install', 'Hermes skill installed')
             },
             busy === 'skill-install' ? 'Installing…' : installed ? 'Reinstall skill' : 'Install skill'
@@ -1328,7 +1429,8 @@
                   size: 'sm',
                   outlined: true,
                   destructive: true,
-                  disabled: busy !== '',
+                  disabled: locked,
+                  title: lockTitle,
                   onClick: () => run('skill-remove', '/skill/uninstall', 'Hermes skill removed')
                 },
                 busy === 'skill-remove' ? 'Removing…' : 'Remove skill'
@@ -1374,6 +1476,16 @@
     const accounts = useApi('/accounts', tick)
     const service = useApi('/service', tick)
     const settings = useApi('/settings', tick)
+    const health = useApi('/health', tick)
+    const [restart, setRestart] = useState('')
+    const alive = useRef(true)
+
+    useEffect(
+      () => () => {
+        alive.current = false
+      },
+      []
+    )
 
     useEffect(() => {
       let disposed = false
@@ -1418,7 +1530,7 @@
         .then(
           res => res || {},
           e => {
-            showToast(errorText(e), 'error')
+            showToast(failureText(e), 'error')
             return null
           }
         )
@@ -1430,6 +1542,24 @@
         () => undefined
       )
     }
+
+    // Resolves true once /service reports a heartbeat newer than `since` (unix seconds); false after 30 s.
+    function waitForHeartbeat(since) {
+      const deadline = Date.now() + SERVICE_START_TIMEOUT_MS
+      function poll() {
+        if (!alive.current || Date.now() >= deadline) {
+          return Promise.resolve(false)
+        }
+        return new Promise(resolve => setTimeout(resolve, 1000))
+          .then(() => fetchJSON(API + '/service'))
+          .then(
+            s => !!s && s.heartbeat_at > since,
+            () => false
+          )
+          .then(ok => ok || poll())
+      }
+      return poll()
+    }
     function openConversation(id) {
       setSelectedId(id)
       setTab('chats')
@@ -1438,11 +1568,19 @@
     const accountList = accounts.data ? accounts.data.accounts || [] : []
     const serviceKnown = !!service.data
     const serviceUp = serviceKnown && !!service.data.running
+    const outdated = health.data
+      ? typeof health.data.api_version !== 'number' || health.data.api_version < REQUIRED_API_VERSION
+      : health.status === 404
     const ctx = {
       tick,
       accounts: accountList,
       service: service.data,
       serviceKnown,
+      outdated,
+      restart,
+      setRestart,
+      refresh: () => setTick(t => t + 1),
+      waitForHeartbeat,
       serviceUp,
       settings: settings.data,
       accountId,
@@ -1459,6 +1597,7 @@
       return h(
         'div',
         null,
+        outdated ? h(RestartBanner) : null,
         accounts.error
           ? h(Card, null, h(CardContent, null, 'Backend unreachable: ' + accounts.error))
           : h('div', { className: 'wab-muted wab-pad' }, 'Loading…')
@@ -1485,6 +1624,7 @@
               )
             : null
         ),
+        outdated ? h(RestartBanner) : null,
         accounts.error ? h('div', { className: 'wab-warn' }, 'Data may be stale: ' + accounts.error) : null,
         tab !== 'numbers' && serviceKnown && !serviceUp
           ? h(

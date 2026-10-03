@@ -14,8 +14,10 @@ import base64
 import binascii
 import importlib.util
 import logging
+import os
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -50,6 +52,22 @@ def _load_core():
 router = APIRouter()
 core = _load_core()
 router.include_router(core.automations_api.router)
+
+
+def _autostart() -> None:
+    """Refresh an installed service with the code now running (launchers, plist, restart). Runs at every
+    backend start, so install/update/Hermes upgrades take effect without a manual Reinstall."""
+    try:
+        outcome = core.service.ensure_service(now=int(time.time()))
+        log.info("hermes-whatsapp-chat service refresh: %s", outcome)
+    except Exception:
+        log.exception("hermes-whatsapp-chat service refresh failed")
+
+
+# The plugin's own scripts (sidecar, wa.py, seed_demo) load this file as "hwc_plugin_api": they must never
+# restart the service they belong to. Only Hermes' backend import (and tests, unless opted out) refreshes it.
+if os.environ.get("HWC_NO_AUTOSTART") != "1" and __name__ != "hwc_plugin_api":
+    threading.Thread(target=_autostart, name="hwc-autostart", daemon=True).start()
 
 
 # --- Error mapping ---------------------------------------------------------------
@@ -133,9 +151,15 @@ def health() -> dict[str, Any]:
         with closing(core.db.connect()) as conn:
             n = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        return {"ok": True, "db": str(core.db.db_path()), "conversations": n, "schema_version": version}
+        return {
+            "ok": True,
+            "api_version": core.service.API_VERSION,
+            "db": str(core.db.db_path()),
+            "conversations": n,
+            "schema_version": version,
+        }
     except Exception as exc:
-        return {"ok": False, "reason": str(exc)}
+        return {"ok": False, "api_version": core.service.API_VERSION, "reason": str(exc)}
 
 
 @router.get("/service")

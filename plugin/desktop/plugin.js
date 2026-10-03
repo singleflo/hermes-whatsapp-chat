@@ -50,13 +50,17 @@ let ctxRef = null
 const $tab = atom('chats')
 const $selected = atom(null)
 
+// Service (re)start progress after Install service / Reinstall: null | 'restarting' | 'failed'.
+const $restart = atom(null)
+
 // --- Shared helpers for SettingsPage -----------------------------------------
 // Module scope, consumed by the SettingsPage component pasted into this file:
 //   ID                      plugin id (also the first React Query key segment)
 //   rest(path, opts)        ctxRef.rest passthrough (GET by default)
 //   act(path, body, method) POST/PUT/DELETE + error toast + awaits refresh();
 //                           resolves the response data (or true) / false on failure
-//   errorText(err)          readable message from a ctx.rest rejection
+//   errorText(err)          readable message from a ctx.rest rejection (detail only)
+//   failureText(err)        toast text: "HTTP <status>: <detail>" (+ restart hint for 404/405)
 //   fmtAge(seconds)         "now" / "5m" / "3h" / "2d"
 //   fmtTime(unixSeconds)    viewer-locale short date + time
 //   refresh()               invalidates every [ID, …] query (returns a promise)
@@ -64,8 +68,11 @@ const $selected = atom(null)
 //   STATE_LABELS            conversation state id → label
 //   ACCOUNT_COLORS          account color name → var(--ui-*) css color
 //   AccountDot({account})   colored dot for an account (Account or conversation Card)
-//   ServiceBanner()         "WhatsApp service not installed / not running" + Install / Reinstall button
-//   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes
+//   ServiceBanner()         "WhatsApp service not installed / not running / restarting" + Install / Reinstall button
+//   OutdatedBanner()        "Restart Hermes…" when /health api_version < REQUIRED_API_VERSION
+//   useBackendOutdated()    true while the running backend is older than this UI
+//   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes;
+//                           'install' then waits for a fresh heartbeat (progress in $restart)
 //   SERVICE_LOG_HINT        where the service writes its log (shown on errors)
 
 const STATE_LABELS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', muted: 'Muted', closed: 'Closed' }
@@ -107,6 +114,25 @@ function errorText(err) {
   return m[2]
 }
 
+function errorStatus(err) {
+  if (err && typeof err.status === 'number') {
+    return err.status
+  }
+  const m = /^(\d{3}):/.exec(String((err && err.message) || err))
+  return m ? Number(m[1]) : null
+}
+
+// 404/405 on a plugin route usually means Hermes still runs the previous backend.
+function restartHint(err) {
+  const status = errorStatus(err)
+  return status === 404 || status === 405 ? ' — restart Hermes to load the updated plugin' : ''
+}
+
+function failureText(err) {
+  const status = errorStatus(err)
+  return (status ? 'HTTP ' + status + ': ' : '') + (errorText(err) || 'Request failed') + restartHint(err)
+}
+
 async function call(path, body, method, errTitle) {
   let out
   try {
@@ -117,7 +143,7 @@ async function call(path, body, method, errTitle) {
     const data = await ctxRef.rest(path, opts)
     out = data === undefined || data === null ? true : data
   } catch (err) {
-    host.notify({ kind: 'error', title: errTitle, message: errorText(err) })
+    host.notify({ kind: 'error', title: errTitle, message: failureText(err) })
     out = false
   }
   await refresh()
@@ -175,16 +201,94 @@ function AccountDot({ account, size = 8 }) {
 
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
+const SERVICE_START_TIMEOUT_MS = 30000
+const REQUIRED_API_VERSION = 3
+const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
+const RESTART_BODY =
+  'The plugin was updated but Hermes is still running the previous backend. Quit Hermes (⌘Q) and open it again.'
+
+// True when the running backend is older than this UI: /health lacks api_version, reports a lower one,
+// or the route does not exist at all (404, plugin routes are mounted only at Hermes startup).
+function useBackendOutdated() {
+  const q = useApi('health', '/health')
+  if (!q.data) {
+    return errorStatus(q.error) === 404
+  }
+  const v = q.data.api_version
+  return typeof v !== 'number' || v < REQUIRED_API_VERSION
+}
+
+function OutdatedBanner() {
+  const outdated = useBackendOutdated()
+  if (!outdated) {
+    return null
+  }
+  return h(
+    'div',
+    {
+      style: {
+        ...BANNER,
+        ...F.col,
+        gap: 4,
+        border: '1px solid var(--ui-red)',
+        background: 'color-mix(in srgb, var(--ui-red) 10%, transparent)'
+      }
+    },
+    h('div', { style: { fontWeight: 600 } }, RESTART_TITLE),
+    h('div', { style: T.muted }, RESTART_BODY)
+  )
+}
+
+function sleep(ms) {
+  return new Promise(resolve => ctxRef.setTimeout(resolve, ms))
+}
+
+// Resolves true once /service reports a heartbeat newer than `since` (unix seconds), false after the timeout.
+async function waitForHeartbeat(since) {
+  const deadline = Date.now() + SERVICE_START_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    await sleep(1000)
+    try {
+      const s = await rest('/service')
+      if (s && s.heartbeat_at > since) {
+        return true
+      }
+    } catch {
+      // keep polling until the deadline
+    }
+  }
+  return false
+}
+
 // POSTs a /service/* or /skill/* route; act() toasts failures and refreshes every query.
+// After 'install' it keeps `busy` set until the restarted service reports a fresh heartbeat.
 function useServiceAction() {
   const [busy, setBusy] = useState(null)
   const run = async (key, path, doneMessage) => {
     haptic('tap')
     setBusy(key)
-    const ok = await act(path, undefined)
-    setBusy(null)
-    if (ok && doneMessage) {
-      host.notify({ kind: 'info', message: doneMessage })
+    try {
+      const since = Math.floor(Date.now() / 1000)
+      const ok = await act(path, undefined)
+      if (ok && key === 'install') {
+        $restart.set('restarting')
+        const started = await waitForHeartbeat(since)
+        $restart.set(started ? null : 'failed')
+        await refresh()
+        if (!started) {
+          host.notify({
+            kind: 'error',
+            title: 'Service did not start',
+            message: 'No new heartbeat after 30 s. Check the log: ' + SERVICE_LOG_HINT
+          })
+          return
+        }
+      }
+      if (ok && doneMessage) {
+        host.notify({ kind: 'info', message: doneMessage })
+      }
+    } finally {
+      setBusy(null)
     }
   }
   return [busy, run]
@@ -193,33 +297,49 @@ function useServiceAction() {
 function ServiceBanner() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
-  if (!q.data || q.data.running) {
+  const outdated = useBackendOutdated()
+  const restart = useValue($restart)
+  if (!q.data || q.data.running || outdated) {
     return null
   }
   const installed = q.data.installed !== false
+  const restarting = restart === 'restarting'
   return h(
     'div',
     { style: { ...BANNER, ...F.col, gap: 4 } },
     h(
       'div',
       { style: { fontWeight: 600 } },
-      installed ? 'WhatsApp service is not running' : 'WhatsApp service is not installed'
+      restarting
+        ? 'Restarting service…'
+        : installed
+          ? 'WhatsApp service is not running'
+          : 'WhatsApp service is not installed'
     ),
     h(
       'div',
       { style: T.muted },
-      installed
-        ? 'Messages are neither received nor sent until the background service runs. Reinstalling restarts it.'
-        : 'Messages are neither received nor sent until the background service is installed. It starts automatically and keeps running in the background.'
+      restarting
+        ? 'Waiting for the service to report in. This can take up to 30 seconds.'
+        : installed
+          ? 'Messages are neither received nor sent until the background service runs. Reinstalling restarts it.'
+          : 'Messages are neither received nor sent until the background service is installed. It starts automatically and keeps running in the background.'
     ),
-    installed
+    restart === 'failed'
       ? h(
           'div',
-          { style: T.muted },
-          'If it keeps failing, check the log: ',
+          { style: T.warn },
+          'The service did not start within 30 s. Check the log: ',
           h('code', { style: CODE }, SERVICE_LOG_HINT)
         )
-      : null,
+      : installed && !restarting
+        ? h(
+            'div',
+            { style: T.muted },
+            'If it keeps failing, check the log: ',
+            h('code', { style: CODE }, SERVICE_LOG_HINT)
+          )
+        : null,
     h(
       'div',
       { style: { ...F.row, gap: 6 } },
@@ -228,8 +348,8 @@ function ServiceBanner() {
         {
           size: 'xs',
           variant: 'secondary',
-          loading: busy === 'install',
-          disabled: busy !== null,
+          loading: busy === 'install' || restarting,
+          disabled: busy !== null || restarting,
           onClick: () => run('install', '/service/install', 'WhatsApp service installed')
         },
         installed ? 'Reinstall' : 'Install service'
@@ -992,7 +1112,7 @@ function MediaItem({ msg, item, auto, onLoad }) {
         a.click()
         a.remove()
       } catch (err) {
-        host.notify({ kind: 'error', title: 'Download failed', message: errorText(err) })
+        host.notify({ kind: 'error', title: 'Download failed', message: failureText(err) })
       } finally {
         setBusy(false)
       }
@@ -1332,7 +1452,7 @@ function Thread({ id, optimistic, retried, blocked, onRetry }) {
       setOlder(prev => [...res.messages, ...prev])
       setOlderMore(res.has_more)
     } catch (err) {
-      host.notify({ kind: 'error', title: 'Could not load older messages', message: errorText(err) })
+      host.notify({ kind: 'error', title: 'Could not load older messages', message: failureText(err) })
     } finally {
       setLoadingOlder(false)
     }
@@ -2085,6 +2205,7 @@ function WaPage() {
         h(Codicon, { name: 'refresh' })
       )
     ),
+    h(OutdatedBanner, {}),
     h(ServiceBanner, {}),
     tab === 'chats' ? h(ChatsView, { selected, onSelect: open }) : null,
     tab === 'board' ? h(BoardView, { onOpen: open }) : null,
@@ -2469,13 +2590,13 @@ function set_errMsg(err) {
           .join('\n')
       }
       if (typeof d === 'string') {
-        return d
+        return d + restartHint(err)
       }
     } catch {
       // not JSON: fall through
     }
   }
-  return errorText(err)
+  return errorText(err) + restartHint(err)
 }
 
 // Calls the backend and returns {ok, data} or {ok:false, error} (error text kept for inline display).
@@ -3310,6 +3431,8 @@ function SettingsKeyValue({ label, value, warn }) {
 function SettingsServiceCard() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
+  const outdated = useBackendOutdated()
+  const restart = useValue($restart)
   const [confirm, setConfirm] = useState(false)
   const s = q.data
   if (!s) {
@@ -3321,11 +3444,15 @@ function SettingsServiceCard() {
       : jsx(Skeleton, { className: 'h-24 w-full' })
   }
   const installed = s.installed !== false
+  const restarting = restart === 'restarting'
+  const locked = busy !== null || restarting || outdated
+  const lockTitle = outdated ? RESTART_TITLE : undefined
   const badge = s.running
     ? ['success', 'Running']
     : installed
       ? ['destructive', 'Not running']
       : ['muted', 'Not installed']
+  const nodeKnown = Object.prototype.hasOwnProperty.call(s, 'node')
   return jsx(SettingsCard, {
     title: 'Service',
     desc: 'The background process that keeps your numbers connected and delivers messages. It starts at login and restarts if it stops.',
@@ -3343,11 +3470,30 @@ function SettingsServiceCard() {
       s.version ? jsx(SettingsKeyValue, { label: 'Version', value: String(s.version) }) : null,
       jsx(SettingsKeyValue, {
         label: 'Node.js',
-        value: s.node || 'Not found. Install Node.js, then install the service.',
+        value: s.node
+          ? s.node
+          : nodeKnown
+            ? 'Not found. Install Node.js, then install the service.'
+            : 'unknown (restart Hermes)',
         warn: !s.node
       }),
       s.heartbeat_at ? jsx(SettingsKeyValue, { label: 'Heartbeat', value: set_ago(s.heartbeat_at) }) : null,
-      installed && !s.running
+      restarting
+        ? set_h(
+            'div',
+            { className: 'text-xs', style: set_secondary },
+            'Restarting service… waiting for it to report in (up to 30 s).'
+          )
+        : null,
+      restart === 'failed' && !s.running
+        ? set_h(
+            'div',
+            { className: 'text-xs', style: set_errorBox },
+            'The service did not start within 30 s. Check the log: ',
+            set_h('code', { style: CODE }, SERVICE_LOG_HINT)
+          )
+        : null,
+      installed && !s.running && !restarting && restart !== 'failed'
         ? set_h(
             'div',
             { className: 'text-xs', style: set_muted },
@@ -3355,6 +3501,7 @@ function SettingsServiceCard() {
             set_h('code', { style: CODE }, SERVICE_LOG_HINT)
           )
         : null,
+      outdated ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, RESTART_TITLE) : null,
       confirm
         ? jsx(SettingsConfirm, {
             message:
@@ -3373,8 +3520,9 @@ function SettingsServiceCard() {
             jsx(Button, {
               size: 'sm',
               variant: installed ? 'secondary' : 'default',
-              loading: busy === 'install',
-              disabled: busy !== null,
+              loading: busy === 'install' || restarting,
+              disabled: locked,
+              title: lockTitle,
               onClick: () => run('install', '/service/install', 'WhatsApp service installed'),
               children: installed ? 'Reinstall' : 'Install service'
             }),
@@ -3382,7 +3530,8 @@ function SettingsServiceCard() {
               ? jsx(Button, {
                   size: 'sm',
                   variant: 'outline',
-                  disabled: busy !== null,
+                  disabled: locked,
+                  title: lockTitle,
                   onClick: () => setConfirm(true),
                   children: 'Uninstall service'
                 })
@@ -3395,11 +3544,13 @@ function SettingsServiceCard() {
 function SettingsSkillCard() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
+  const outdated = useBackendOutdated()
   const s = q.data
   if (!s) {
     return null
   }
   const installed = Boolean(s.skill_installed)
+  const lockTitle = outdated ? RESTART_TITLE : undefined
   return jsx(SettingsCard, {
     title: 'Hermes skill',
     desc: 'Lets Hermes agents list, read and answer your WhatsApp conversations. Installed into the Hermes skills folder.',
@@ -3414,6 +3565,7 @@ function SettingsSkillCard() {
           children: installed ? 'Installed' : 'Not installed'
         })
       ),
+      outdated ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, RESTART_TITLE) : null,
       set_h(
         'div',
         { className: 'flex flex-wrap gap-2' },
@@ -3421,7 +3573,8 @@ function SettingsSkillCard() {
           size: 'sm',
           variant: installed ? 'secondary' : 'default',
           loading: busy === 'skill-install',
-          disabled: busy !== null,
+          disabled: busy !== null || outdated,
+          title: lockTitle,
           onClick: () => run('skill-install', '/skill/install', 'Hermes skill installed'),
           children: installed ? 'Reinstall skill' : 'Install skill'
         }),
@@ -3430,7 +3583,8 @@ function SettingsSkillCard() {
               size: 'sm',
               variant: 'outline',
               loading: busy === 'skill-remove',
-              disabled: busy !== null,
+              disabled: busy !== null || outdated,
+              title: lockTitle,
               onClick: () => run('skill-remove', '/skill/uninstall', 'Hermes skill removed'),
               children: 'Remove skill'
             })

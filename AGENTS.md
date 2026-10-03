@@ -296,3 +296,9 @@ The JS halves are hand-written files that load as-is; there is no build step.
 - **Cover for every change:** state transitions (409 on invalid), rules per setting, history never triggers rules/automations, loop guard, `agent_active=0` skips, drafts (create/approve/discard), per-account isolation, v1→v2 migration, `/board` without N+1, empty DB returns 200.
 - **Out of scope:** UI pixel rendering, Hermes itself, the real WhatsApp bridge.
 - **Done** means pytest, ruff, ty and the JS lint are green, `hermes plugins validate plugin` passes, a fresh install from git needs no terminal step (Install service → Add number → QR works), `wa_channel.py status` shows the service running and the numbers connected, the board shows data on the Mac, notifications work, and the UI degrades gracefully.
+
+### Install / update lifecycle
+
+- Hermes mounts plugin backend routes **only at startup**: after install, reinstall or `hermes plugins update` the old backend keeps running until Hermes restarts. `API_VERSION` (`wa_core/service.py`, exposed in `/health` and `/service`) is checked by both UIs against `REQUIRED_API_VERSION`; a mismatch shows "Restart Hermes…" and disables service/skill buttons. Bump both on any route change.
+- On every backend import (Hermes start) `service.ensure_service` runs in a daemon thread (skipped with `HWC_NO_AUTOSTART=1` and when loaded as `hwc_plugin_api` by the sidecar/CLI): it rewrites launchers + plist and restarts the service if anything changed or its heartbeat is stale. "Reinstall" always restarts.
+- The sidecar fingerprints its own plugin code every 5 s: changed or reappeared → graceful exit (launchd restarts it on the new code); `plugin.yaml` missing for 120 s → the plugin was removed, so it deletes its plist and boots itself out (plugin-data is kept).

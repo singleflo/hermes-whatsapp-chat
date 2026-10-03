@@ -395,7 +395,7 @@ def test_service_install_without_node_is_503_and_changes_nothing(client, core, s
 
 
 def test_service_install_bootstrap_failure_is_503_with_launchctl_message(client, svc):
-    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error")]
+    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error"), completed([], 113)]
     r = client.post(f"{PREFIX}/service/install")
     assert r.status_code == 503
     assert "Bootstrap failed: 5: Input/output error" in r.json()["detail"]
@@ -465,6 +465,197 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
     assert client.get(f"{PREFIX}/service").json()["skill_installed"] is True
     client.post(f"{PREFIX}/skill/uninstall")
     assert client.get(f"{PREFIX}/service").json()["skill_installed"] is False
+
+
+# --- API version, ensure_service, sidecar self-check -----------------------------------
+
+
+def test_health_and_service_report_api_version(client, core):
+    assert core.service.API_VERSION == 3
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 3
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 3
+
+
+def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
+    body = client.get(f"{PREFIX}/health").json()
+    assert (body["ok"], body["api_version"]) == (False, 3)
+
+
+def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    now = int(time.time())
+    core.accounts.service_heartbeat(db, pid=4242, version="2.0", started_at=now - 100, now=now - heartbeat_age)
+    svc.calls.clear()
+    return now
+
+
+def _bootout_bootstrap(core, svc):
+    domain = f"gui/{os.getuid()}"
+    return [
+        ["launchctl", "bootout", f"{domain}/{core.service.LABEL}"],
+        ["launchctl", "bootstrap", domain, str(svc.plist)],
+    ]
+
+
+def test_ensure_service_is_absent_without_plist(core, svc):
+    assert core.service.ensure_service(now=int(time.time())) == "absent"
+    assert svc.calls == [] and not svc.py.exists() and not svc.plist.exists()
+
+
+def test_ensure_service_is_ok_when_files_identical_and_heartbeat_fresh(client, core, db, svc):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=3)
+    assert core.service.ensure_service(now=now) == "ok"
+    assert svc.calls == []
+
+
+def test_ensure_service_restarts_when_launcher_content_differs(client, core, db, svc):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=3)
+    good = svc.py.read_text()
+    svc.py.write_text("#!/bin/sh\nexec /old/hermes/venv/bin/python \"$@\"\n")
+    assert core.service.ensure_service(now=now) == "restarted"
+    assert svc.py.read_text() == good
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_ensure_service_restarts_when_plist_differs(client, core, db, svc):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=3)
+    plist = plistlib.loads(svc.plist.read_bytes())
+    plist["ProgramArguments"][1] = "/gone/plugin/sidecar/wa_channel.py"
+    svc.plist.write_bytes(plistlib.dumps(plist))
+    assert core.service.ensure_service(now=now) == "restarted"
+    assert plistlib.loads(svc.plist.read_bytes())["ProgramArguments"][1] != "/gone/plugin/sidecar/wa_channel.py"
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_ensure_service_restarts_when_heartbeat_is_stale(client, core, db, svc):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=16)
+    assert core.service.ensure_service(now=now) == "restarted"
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_ensure_service_restarts_when_service_never_reported(client, core, svc):
+    client.post(f"{PREFIX}/service/install")
+    svc.calls.clear()
+    assert core.service.ensure_service(now=int(time.time())) == "restarted"
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_ensure_service_reports_error_when_launchctl_fails(client, core, db, svc):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=60)
+    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed"), completed([], 113)]
+    assert core.service.ensure_service(now=now) == "error"
+
+
+def test_ensure_service_reports_error_without_node(client, core, db, svc, monkeypatch):
+    now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=60)
+    monkeypatch.setattr(core.service, "find_node", lambda: None)
+    assert core.service.ensure_service(now=now) == "error"
+    assert svc.calls == []
+
+
+def test_service_install_always_restarts_even_when_nothing_changed(client, core, svc):
+    client.post(f"{PREFIX}/service/install")
+    svc.calls.clear()
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_service_install_kickstarts_when_bootstrap_says_already_loaded(client, core, svc):
+    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error"), completed([], 0)]
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert svc.calls[-1] == ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{core.service.LABEL}"]
+
+
+@pytest.fixture
+def channel(plugin):
+    return _load("hwc_wa_channel_test", REPO_ROOT / "plugin" / "sidecar" / "wa_channel.py")
+
+
+@pytest.fixture
+def fake_plugin(tmp_path):
+    root = tmp_path / "installed"
+    (root / "sidecar").mkdir(parents=True)
+    (root / "dashboard" / "wa_core").mkdir(parents=True)
+    (root / "plugin.yaml").write_text("name: hermes-whatsapp-chat\nversion: 1\n")
+    (root / "sidecar" / "wa_channel.py").write_text("# channel\n")
+    (root / "dashboard" / "wa_core" / "service.py").write_text("# service\n")
+    return root
+
+
+def test_code_fingerprint_changes_with_manifest_channel_and_core_files(channel, fake_plugin):
+    base = channel.code_fingerprint(fake_plugin)
+    assert base is not None and channel.code_fingerprint(fake_plugin) == base
+
+    (fake_plugin / "plugin.yaml").write_text("name: hermes-whatsapp-chat\nversion: 2\n")
+    manifest = channel.code_fingerprint(fake_plugin)
+    assert manifest != base
+
+    os.utime(fake_plugin / "sidecar" / "wa_channel.py", ns=(1, 1))
+    sidecar = channel.code_fingerprint(fake_plugin)
+    assert sidecar != manifest
+
+    os.utime(fake_plugin / "dashboard" / "wa_core" / "service.py", ns=(1, 1))
+    assert channel.code_fingerprint(fake_plugin) != sidecar
+
+
+def test_code_fingerprint_is_none_without_manifest(channel, fake_plugin):
+    (fake_plugin / "plugin.yaml").unlink()
+    assert channel.code_fingerprint(fake_plugin) is None
+
+
+@pytest.fixture
+def supervisor(channel, fake_plugin, monkeypatch):
+    monkeypatch.setattr(channel, "PLUGIN_DIR", fake_plugin)
+    sup = object.__new__(channel.Supervisor)
+    sup.code_fp = channel.code_fingerprint(fake_plugin)
+    sup.code_missing_since = None
+    sup.exit_action = None
+    return sup
+
+
+def test_sidecar_keeps_running_while_code_is_unchanged(supervisor):
+    assert supervisor._code_check(100.0) is False
+    assert supervisor.exit_action is None
+
+
+def test_sidecar_restarts_when_code_changed(supervisor, fake_plugin):
+    (fake_plugin / "plugin.yaml").write_text("name: hermes-whatsapp-chat\nversion: 2\n")
+    assert supervisor._code_check(100.0) is True
+    assert supervisor.exit_action == "restart"
+
+
+def test_sidecar_restarts_when_plugin_reappears_after_reinstall(supervisor, fake_plugin):
+    manifest = (fake_plugin / "plugin.yaml").read_text()
+    (fake_plugin / "plugin.yaml").unlink()
+    assert supervisor._code_check(100.0) is False  # reinstall window opens
+    (fake_plugin / "plugin.yaml").write_text(manifest)  # identical code, but it was replaced
+    assert supervisor._code_check(105.0) is True
+    assert supervisor.exit_action == "restart"
+
+
+def test_sidecar_uninstalls_itself_when_plugin_stays_removed(supervisor, fake_plugin):
+    (fake_plugin / "plugin.yaml").unlink()
+    assert supervisor._code_check(100.0) is False
+    assert supervisor._code_check(219.0) is False
+    assert supervisor._code_check(220.0) is True
+    assert supervisor.exit_action == "uninstall"
+
+
+def test_sidecar_self_uninstall_deletes_plist_and_boots_out_last(supervisor, channel, tmp_path, monkeypatch):
+    plist = tmp_path / "LaunchAgents" / "x.plist"
+    plist.parent.mkdir()
+    plist.write_text("plist")
+    data = tmp_path / "plugin-data" / "keep.db"
+    data.parent.mkdir()
+    data.write_text("data")
+    calls = []
+    monkeypatch.setattr(channel, "PLIST_PATH", plist)
+    monkeypatch.setattr(channel, "BOOTOUT_TARGET", "gui/501/label")
+    monkeypatch.setattr(channel.subprocess, "run", lambda argv, **kw: calls.append((list(argv), plist.exists())))
+    supervisor._uninstall_self()
+    assert not plist.exists() and data.exists()
+    assert calls == [(["launchctl", "bootout", "gui/501/label"], False)]
 
 
 # --- Migration v1 -> v2 -----------------------------------------------------------

@@ -18,6 +18,7 @@ the plugin UI, not here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -59,6 +60,8 @@ MAX_PENDING = 5000
 HISTORY_INGEST_PER_TICK = 300
 HTTP_TIMEOUT = 5.0
 AUTOMATION_THREADS = 2
+CODE_CHECK_SECONDS = 5.0
+PLUGIN_GONE_SECONDS = 120.0  # plugin.yaml missing this long = removed (shorter = a reinstall in progress)
 
 
 def _load_api():
@@ -72,6 +75,25 @@ def _load_api():
 
 api = _load_api()
 core = api.core
+
+# Precomputed so the self-uninstall still works after the plugin dir (and its code) is gone.
+PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{core.service.LABEL}.plist"
+BOOTOUT_TARGET = f"gui/{os.getuid()}/{core.service.LABEL}"
+
+
+def code_fingerprint(plugin_dir: Path) -> tuple[Any, ...] | None:
+    """Identity of the plugin code on disk: (plugin.yaml hash, wa_channel.py mtime, wa_core dir + file
+    mtimes). None when ``plugin.yaml`` (or any watched file) is missing, e.g. mid-reinstall."""
+    try:
+        manifest = hashlib.sha256((plugin_dir / "plugin.yaml").read_bytes()).hexdigest()
+        channel = (plugin_dir / "sidecar" / "wa_channel.py").stat().st_mtime_ns
+        core_dir = plugin_dir / "dashboard" / "wa_core"
+        files = tuple(
+            (p.name, p.stat().st_mtime_ns) for p in sorted(core_dir.iterdir()) if p.is_file()
+        )
+        return (manifest, channel, core_dir.stat().st_mtime_ns, files)
+    except OSError:
+        return None
 
 
 def log(msg: str) -> None:
@@ -579,6 +601,9 @@ class Supervisor:
         self.slots: list[Future | None] = [None] * AUTOMATION_THREADS
         self.last_timers = 0.0
         self.last_precondition_check = time.monotonic()
+        self.code_fp = code_fingerprint(PLUGIN_DIR)
+        self.code_missing_since: float | None = None
+        self.exit_action: str | None = None
         self.conn: sqlite3.Connection | None = None
         self._update_deps(self.last_precondition_check)
 
@@ -699,12 +724,48 @@ class Supervisor:
                 proc.kill()
                 proc.wait()
 
+    def _code_check(self, mono: float) -> bool:
+        """Watch the plugin code on disk (updates and reinstalls replace the dir under this process).
+
+        Returns True when the loop must stop; ``self.exit_action`` says why (``restart``: new code is
+        there, launchd's KeepAlive starts it; ``uninstall``: the plugin stayed removed)."""
+        fp = code_fingerprint(PLUGIN_DIR)
+        if fp is None:
+            if self.code_missing_since is None:
+                self.code_missing_since = mono
+                log(f"plugin.yaml missing, waiting up to {PLUGIN_GONE_SECONDS:.0f} s for a reinstall")
+            elif mono - self.code_missing_since >= PLUGIN_GONE_SECONDS:
+                log("plugin removed, uninstalling service")
+                self.exit_action = "uninstall"
+                return True
+            return False
+        reappeared = self.code_missing_since is not None
+        self.code_missing_since = None
+        if reappeared or fp != self.code_fp:
+            log("plugin code changed, restarting")
+            self.exit_action = "restart"
+            return True
+        return False
+
+    def _uninstall_self(self) -> None:
+        """The plugin was removed: delete the LaunchAgent plist and unload the service (kills this process,
+        so it is the last action). Plugin data is never touched. Uses only precomputed paths/values."""
+        try:
+            PLIST_PATH.unlink(missing_ok=True)
+        except OSError as exc:
+            log(f"could not delete {PLIST_PATH}: {exc}")
+        try:
+            subprocess.run(["launchctl", "bootout", BOOTOUT_TARGET], capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"launchctl bootout failed: {exc}")
+
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
         log(f"channel {VERSION} started (pid {os.getpid()}, db {core.db.db_path()})")
         if self.precondition_error:
             log(f"PRECONDITION FAILED: {self.precondition_error}")
+        last_code_check = time.monotonic()
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
@@ -714,6 +775,14 @@ class Supervisor:
                 self._drop_connection()
             except Exception as exc:
                 log(f"tick failed: {exc!r}")
+            if started - last_code_check >= CODE_CHECK_SECONDS:
+                last_code_check = started
+                try:
+                    if self._code_check(started):
+                        self.stop_event.set()
+                        break
+                except Exception as exc:
+                    log(f"code check failed: {exc!r}")
             self.stop_event.wait(max(0.0, TICK_SECONDS - (time.monotonic() - started)))
         log("stopping")
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -723,6 +792,8 @@ class Supervisor:
                 runner.proc.terminate()
         self._finish(runners)
         self._drop_connection()
+        if self.exit_action == "uninstall":
+            self._uninstall_self()
         return 0
 
 

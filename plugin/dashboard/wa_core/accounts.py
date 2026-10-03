@@ -327,6 +327,7 @@ def service_info(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM service_status WHERE id = 1").fetchone()
     heartbeat = row["heartbeat_at"] if row else None
     return {
+        "api_version": service.API_VERSION,
         "running": heartbeat is not None and now - heartbeat <= HEARTBEAT_FRESH_SECONDS,
         "pid": row["pid"] if row else None,
         "version": row["version"] if row else None,
