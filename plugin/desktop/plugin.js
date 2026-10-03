@@ -238,7 +238,7 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 7
+const REQUIRED_API_VERSION = 8
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
   'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
@@ -2766,6 +2766,8 @@ function set_jevActionText(a) {
 }
 
 const SETTINGS_JEV_MAX_DOCUMENT = 20000
+// The backend allows two Hermes attempts of 180 s each plus the Jev check.
+const SETTINGS_JEV_GENERATE_TIMEOUT_MS = 400000
 const SETTINGS_JEV_PLACEHOLDER =
   '# My WhatsApp rules\n\n' +
   '- If a customer complains, asks for a refund or is upset, a person must handle it: take over the conversation.\n' +
@@ -5503,6 +5505,7 @@ function SettingsJevForm({ draft, set, onApplied }) {
   const [gen, setGen] = useState(null)
   const [genBusy, setGenBusy] = useState(false)
   const [genError, setGenError] = useState('')
+  const [genSeconds, setGenSeconds] = useState(0)
   const [applyBusy, setApplyBusy] = useState(false)
   const [applyError, setApplyError] = useState('')
   const [applyNote, setApplyNote] = useState('')
@@ -5512,13 +5515,28 @@ function SettingsJevForm({ draft, set, onApplied }) {
   const accountIds = j('account_ids', [])
   const doc = j('document', '')
 
+  // Generation runs in the backend (Hermes takes 10-60 s, longer than one API call may last): start, then poll.
   const generate = async () => {
     setGenBusy(true)
     setGenError('')
     setApplyError('')
     setApplyNote('')
+    setGenSeconds(0)
+    const started = Date.now()
     try {
-      setGen(await rest('/jev/generate', { method: 'POST', body: { document: doc, check: true } }))
+      let job = await rest('/jev/generate', { method: 'POST', body: { document: doc, check: true } })
+      while (job.status === 'running') {
+        if (Date.now() - started > SETTINGS_JEV_GENERATE_TIMEOUT_MS) {
+          throw new Error('Hermes is taking too long: try again')
+        }
+        await sleep(2000)
+        setGenSeconds(Math.round((Date.now() - started) / 1000))
+        job = await rest('/jev/generate/' + job.job_id)
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'generation failed')
+      }
+      setGen(job.result)
     } catch (err) {
       setGenError(set_errMsg(err))
     }
@@ -5594,7 +5612,9 @@ function SettingsJevForm({ draft, set, onApplied }) {
             { className: 'text-xs', style: set_muted },
             doc.length > SETTINGS_JEV_MAX_DOCUMENT
               ? 'Too long: ' + doc.length + ' / ' + SETTINGS_JEV_MAX_DOCUMENT + ' characters.'
-              : 'Uses your Hermes profile’s default model, about 10–30 s.'
+              : genBusy
+                ? 'Hermes is writing the conditions… ' + genSeconds + ' s'
+                : 'Uses your Hermes profile’s default model, about 20–60 s.'
           )
         ),
         genError ? set_h('div', { className: 'text-xs', style: set_errorBox }, genError) : null,

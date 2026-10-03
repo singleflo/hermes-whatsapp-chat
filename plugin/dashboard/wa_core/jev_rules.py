@@ -15,8 +15,10 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -408,12 +410,16 @@ def _check(cfg: settings.JevSettings, key: str, plan: Plan) -> tuple[list[dict[s
         return None, str(exc)
 
 
-def generate(conn, document: str, *, check: bool = True) -> dict[str, Any]:
-    """Turn the rules document into a plan (nothing is stored). Two attempts, then 502."""
+def _check_document(document: str) -> None:
     if not (document or "").strip():
         raise errors.Invalid("Write the Jev rules first")
     if len(document) > MAX_DOCUMENT_CHARS:
         raise errors.Invalid(f"The Jev rules are longer than {MAX_DOCUMENT_CHARS} characters")
+
+
+def generate(conn, document: str, *, check: bool = True) -> dict[str, Any]:
+    """Turn the rules document into a plan (nothing is stored). Two attempts, then 502."""
+    _check_document(document)
     cfg = settings.get_settings(conn).jev
     key = jev.api_key(conn)[0]
     base_prompt = build_prompt(document)
@@ -449,6 +455,50 @@ def generate(conn, document: str, *, check: bool = True) -> dict[str, Any]:
         "checks": checks,
         "check_error": check_error,
     }
+
+
+# --- Background generation (the desktop's API bridge gives up after 30 s) -------------------
+
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_LOCK = threading.Lock()
+_MAX_JOBS = 20
+
+
+def _run_job(job_id: str, document: str, check: bool) -> None:
+    try:
+        conn = db.connect()
+        try:
+            outcome: dict[str, Any] = {"status": "done", "result": generate(conn, document, check=check)}
+        finally:
+            conn.close()
+    except errors.WaError as exc:
+        outcome = {"status": "failed", "error": str(exc), "error_status": exc.status}
+    except Exception as exc:  # noqa: BLE001 - reported to the UI instead of dying in a thread
+        outcome = {"status": "failed", "error": f"generation failed: {exc}", "error_status": 500}
+    with _JOBS_LOCK:
+        _JOBS[job_id].update(outcome, finished_at=int(time.time()))
+
+
+def start_generate(document: str, *, check: bool = True) -> dict[str, Any]:
+    """Start ``generate`` in a background thread; poll it with ``generate_job``. Input errors raise at once."""
+    _check_document(document)
+    job_id = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        finished = [k for k, v in _JOBS.items() if v["status"] != "running"]
+        for old in finished[: max(0, len(_JOBS) - _MAX_JOBS + 1)]:
+            del _JOBS[old]
+        _JOBS[job_id] = {"job_id": job_id, "status": "running", "started_at": int(time.time())}
+    threading.Thread(target=_run_job, args=(job_id, document, check), name="jev-generate", daemon=True).start()
+    return generate_job(job_id)
+
+
+def generate_job(job_id: str) -> dict[str, Any]:
+    """``{job_id, status: running|done|failed, started_at, [finished_at], [result] | [error, error_status]}``."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise errors.NotFound("generation not found (the backend restarted): generate again")
+        return dict(job)
 
 
 # --- Rules --------------------------------------------------------------------------------

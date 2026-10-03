@@ -13,7 +13,7 @@
   const fetchJSON = SDK.fetchJSON
   const API = '/api/plugins/hermes-whatsapp-chat'
   // Bump together with API_VERSION in wa_core/service.py: the UI is newer than a backend that reports less.
-  const REQUIRED_API_VERSION = 7
+  const REQUIRED_API_VERSION = 8
   const RESTART_TITLE = 'Restart the Hermes dashboard to finish installing or updating WhatsApp Chat'
   const SERVICE_START_TIMEOUT_MS = 30000
 

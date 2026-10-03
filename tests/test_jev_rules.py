@@ -12,6 +12,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -385,11 +386,23 @@ def test_generate_retries_once_with_the_error_appended(env):
     assert "Your previous answer was not valid: invalid plan" in env.prompts[1]
 
 
-def test_two_invalid_answers_are_a_502(env):
+def run_generate(env, body: dict[str, Any]) -> dict[str, Any]:
+    """POST /jev/generate, then poll the job until it settles (the fake Hermes answers at once)."""
+    r = env.client.post(f"{PREFIX}/jev/generate", json=body)
+    assert r.status_code == 200, r.text
+    job = r.json()
+    deadline = time.monotonic() + 5
+    while job["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        job = env.client.get(f"{PREFIX}/jev/generate/{job['job_id']}").json()
+    return job
+
+
+def test_two_invalid_answers_fail_the_job_with_502(env):
     env.hermes_outputs[:] = ["nope", json.dumps({"conditions": []})]
-    r = env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT})
-    assert r.status_code == 502
-    assert "did not return a valid plan after 2 attempts" in r.json()["detail"] and "invalid plan" in r.json()["detail"]
+    job = run_generate(env, {"document": DOCUMENT})
+    assert job["status"] == "failed" and job["error_status"] == 502
+    assert "did not return a valid plan after 2 attempts" in job["error"] and "invalid plan" in job["error"]
     assert len(env.prompts) == 2
 
 
@@ -403,20 +416,21 @@ def test_generate_input_and_hermes_errors(env):
     assert env.client.post(f"{PREFIX}/jev/generate", json={"document": "x", "extra": 1}).status_code == 422
     assert env.prompts == []
     env.hermes_outputs.append(errors.Unavailable("Hermes could not generate the plan: gone"))
-    r = env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT})
-    assert r.status_code == 503 and "gone" in r.json()["detail"]
+    job = run_generate(env, {"document": DOCUMENT})
+    assert job["status"] == "failed" and job["error_status"] == 503 and "gone" in job["error"]
     env.hermes_outputs.append(errors.BadGateway("Hermes failed (exit 1): x"))
-    assert env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT}).status_code == 502
+    assert run_generate(env, {"document": DOCUMENT})["error_status"] == 502
+    assert env.client.get(f"{PREFIX}/jev/generate/unknown").status_code == 404
 
 
-def test_generate_route_returns_the_result_and_check_can_be_skipped(env):
+def test_generate_route_runs_in_the_background_and_check_can_be_skipped(env):
     set_key(env)
-    r = env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT, "check": False})
-    assert r.status_code == 200
-    body = r.json()
+    job = run_generate(env, {"document": DOCUMENT, "check": False})
+    assert job["status"] == "done"
+    body = job["result"]
     assert body["checks"] is None and body["check_error"] is None and env.posts == []
     assert [c["id"] for c in body["plan"]["conditions"]] == ["person", "agent"]
-    body = env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT}).json()
+    body = run_generate(env, {"document": DOCUMENT})["result"]
     assert len(body["checks"]) == 4 and len(env.posts) == 4
 
 
@@ -609,7 +623,7 @@ def test_apply_replaces_only_managed_rules_and_their_queued_runs(env):
 
 
 def test_apply_accepts_a_generate_result_and_rejects_bad_input_without_touching_anything(env):
-    generated = env.client.post(f"{PREFIX}/jev/generate", json={"document": DOCUMENT, "check": False}).json()
+    generated = run_generate(env, {"document": DOCUMENT, "check": False})["result"]
     assert apply_plan(env, generated["plan"]).status_code == 200
     ids = [r["id"] for r in managed(env)]
     assert len(ids) == 4

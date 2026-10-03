@@ -62,8 +62,15 @@ def put_key(body: KeyIn):
 
 @router.post("/jev/generate")
 def generate(body: GenerateIn):
-    with _conn() as conn:
-        return jev_rules.generate(conn, body.document, check=body.check)
+    """Starts the generation (Hermes takes 10-60 s) and returns the job; poll GET /jev/generate/{job_id}."""
+    with _conn():
+        return jev_rules.start_generate(body.document, check=body.check)
+
+
+@router.get("/jev/generate/{job_id}")
+def generate_status(job_id: str):
+    with _conn():
+        return jev_rules.generate_job(job_id)
 
 
 @router.post("/jev/apply")
