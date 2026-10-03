@@ -61,6 +61,7 @@ SCORES = {
     "sono molto deluso": {"person": 0.2},  # a miss: lands on Else
     "a che punto è la pratica?": {"agent": 0.9},
     "ciao": {},
+    "sono deluso, voglio una persona": {"person": 0.9},
 }
 
 
@@ -352,7 +353,7 @@ def test_run_hermes_failures_are_domain_errors_and_the_usage_file_is_removed(env
 def test_generate_returns_the_plan_and_scores_every_example(env):
     set_key(env)
     res = env.core.jev_rules.generate(env.conn, DOCUMENT)
-    assert res["attempts"] == 1 and res["model"] == "glm-test" and isinstance(res["latency_ms"], int)
+    assert res["model"] == "glm-test" and isinstance(res["latency_ms"], int)
     assert res["plan"] == env.core.jev_rules.normalize_plan(PLAN).model_dump()
     assert res["check_error"] is None
     checks = {c["text"]: c for c in res["checks"]}
@@ -363,8 +364,33 @@ def test_generate_returns_the_plan_and_scores_every_example(env):
     assert (miss["expected"], miss["exit"], miss["score"], miss["ok"]) == ("person", "else", None, False)
     assert miss["scores"] == {"person": 0.2, "agent": 0.1}
     assert checks["a che punto è la pratica?"]["ok"] and checks["ciao"]["expected"] == "else" and checks["ciao"]["ok"]
-    assert env.prompts == [env.core.jev_rules.build_prompt(DOCUMENT)]
-    assert len(env.posts) == 4 and {p["key"] for p in env.posts} == {KEY}
+    # the miss asked the model once more; its answer (the same plan) passed no more examples, so it was dropped
+    assert res["refined"] is False and res["attempts"] == 2
+    base = env.core.jev_rules.build_prompt(DOCUMENT)
+    assert env.prompts[0] == base and env.prompts[1].startswith(base)
+    assert "'sono molto deluso': should be Needs a person, Jev chose else (scores: Needs a person 0.20" in env.prompts[1]
+    assert len(env.posts) == 8 and {p["key"] for p in env.posts} == {KEY}
+
+
+def test_generate_keeps_the_refined_plan_when_more_examples_pass(env):
+    set_key(env)
+    better = json.loads(json.dumps(PLAN))
+    better["conditions"][0]["description"] = "The client is upset and asks for a person"
+    better["conditions"][0]["examples"] = ["voglio parlare con una persona", "sono deluso, voglio una persona"]
+    env.hermes_outputs[:] = [json.dumps(PLAN), json.dumps(better)]
+    res = env.core.jev_rules.generate(env.conn, DOCUMENT)
+    assert res["refined"] is True and res["attempts"] == 2
+    assert res["plan"]["conditions"][0]["description"] == "The client is upset and asks for a person"
+    assert all(c["ok"] for c in res["checks"]) and len(res["checks"]) == 4
+    # a refinement that fails is ignored: the first plan stays
+    env.hermes_outputs[:] = [json.dumps(PLAN), "nope", "still nope"]
+    res = env.core.jev_rules.generate(env.conn, DOCUMENT)
+    assert res["refined"] is False and res["plan"]["conditions"][0]["description"] == PLAN["conditions"][0]["description"]
+
+
+def test_generate_sends_the_plan_conditions_to_jev(env):
+    set_key(env)
+    env.core.jev_rules.generate(env.conn, DOCUMENT)
     for post in env.posts:  # the plan's conditions, not the stored ones
         assert list(post["body"]["questions"]) == ["person", "agent"]
         assert post["body"]["questions"]["agent"]["instructions"]["condition"] == "The client asks a routine question"
@@ -431,7 +457,7 @@ def test_generate_route_runs_in_the_background_and_check_can_be_skipped(env):
     assert body["checks"] is None and body["check_error"] is None and env.posts == []
     assert [c["id"] for c in body["plan"]["conditions"]] == ["person", "agent"]
     body = run_generate(env, {"document": DOCUMENT})["result"]
-    assert len(body["checks"]) == 4 and len(env.posts) == 4
+    assert len(body["checks"]) == 4 and len(env.posts) == 8  # 4 examples, then 4 again after the refinement
 
 
 def test_generate_without_a_key_skips_the_check(env):

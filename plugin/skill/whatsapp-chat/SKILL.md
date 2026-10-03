@@ -158,7 +158,7 @@ The user does not edit conditions one by one. They keep ONE Markdown document, t
    ```
 
    Say what should happen with these words, which map to actions: take over / I handle it (takeover), urgent (escalate), the agent drafts (agent draft, approved by a person), the agent answers by itself (agent reply, sent at once: only when the user explicitly wants automatic answers), always answer "..." (fixed reply, sent at once), close / waiting / in progress (set state), tag X (add tags).
-3. `{{WA_CLI}} jev generate FILE` and read the preview: every example should be ✓. A ✗ means two conditions overlap or a description is vague: sharpen the wording in the document (name the words or requests that signal each situation, keep one situation per section) and generate again. Report the notes the generator prints.
+3. `{{WA_CLI}} jev generate FILE` and read the preview: every example should be ✓ (when some miss, the generator already retried once with Jev's feedback). A remaining ✗ means two conditions overlap or a description is vague: sharpen the wording in the document (name the words or requests that signal each situation, keep one situation per section) and generate again. Report the notes the generator prints.
 4. Show the user the conditions, their actions and the checks. Apply only when they agree, or when they asked you to apply directly: `{{WA_CLI}} jev generate FILE --apply`.
 5. Confirm with two or three realistic messages: `{{WA_CLI}} jev test "..."`.
 6. Classification runs only while Jev is on and an API key is set (`jev show`). Turn it on with `{{WA_CLI}} jev on` only when the user asks; the API key is entered by the user in the plugin Settings → Jev (never ask for it in chat, never print it).

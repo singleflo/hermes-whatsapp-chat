@@ -417,41 +417,82 @@ def _check_document(document: str) -> None:
         raise errors.Invalid(f"The Jev rules are longer than {MAX_DOCUMENT_CHARS} characters")
 
 
-def generate(conn, document: str, *, check: bool = True) -> dict[str, Any]:
-    """Turn the rules document into a plan (nothing is stored). Two attempts, then 502."""
-    _check_document(document)
-    cfg = settings.get_settings(conn).jev
-    key = jev.api_key(conn)[0]
-    base_prompt = build_prompt(document)
-    prompt, started = base_prompt, time.monotonic()
-    plan: Plan | None = None
-    usage: dict[str, Any] = {}
-    problem = ""
-    attempts = 0
-    for attempts in (1, 2):
-        stdout, usage = _run_hermes(prompt, GENERATE_TIMEOUT_S)
+def _ask_plan(prompt: str) -> tuple[Plan, dict[str, Any], int]:
+    """One Hermes answer validated into a plan; a second try with the error appended, then 502."""
+    problem, ask = "", prompt
+    for attempt in (1, 2):
+        stdout, usage = _run_hermes(ask, GENERATE_TIMEOUT_S)
         try:
-            plan = normalize_plan(extract_json(stdout))
-            break
+            return normalize_plan(extract_json(stdout)), usage, attempt
         except ValueError as exc:
             problem = f"the answer is not valid JSON ({exc})"
         except errors.Invalid as exc:
             problem = str(exc)
-        prompt = base_prompt + f"\n\nYour previous answer was not valid: {problem}. Return only the corrected JSON object."
-    if plan is None:
-        raise errors.BadGateway(f"Hermes did not return a valid plan after 2 attempts: {problem}")
-    latency_ms = int((time.monotonic() - started) * 1000)
-    checks, check_error = None, None
+        ask = prompt + f"\n\nYour previous answer was not valid: {problem}. Return only the corrected JSON object."
+    raise errors.BadGateway(f"Hermes did not return a valid plan after 2 attempts: {problem}")
+
+
+def _refine_note(plan: Plan, checks: list[dict[str, Any]]) -> str:
+    """Feedback for one more answer when Jev chose the wrong condition for some examples."""
+    labels = {c.id: c.label for c in plan.conditions} | {jev.ELSE: "else"}
+    wrong = [
+        f"- '{c['text']}': should be {labels.get(c['expected'], c['expected'])}, Jev chose "
+        f"{labels.get(c['exit'], c['exit'])} (scores: "
+        + ", ".join(f"{labels.get(k, k)} {v:.2f}" for k, v in c["scores"].items())
+        + ")"
+        for c in checks
+        if not c["ok"]
+    ]
+    return (
+        "\n\nYour previous answer was:\n"
+        + json.dumps(plan.model_dump(), ensure_ascii=False)
+        + "\n\nJev scored its examples and chose the wrong condition for these:\n"
+        + "\n".join(wrong)
+        + "\n\nRewrite the descriptions so that every situation is clearly distinct: remove words and examples that"
+        " belong to another condition and name what is specific to each one. Keep the same rules, ids, actions and"
+        " order. Return only the corrected JSON object."
+    )
+
+
+def _passed(checks: list[dict[str, Any]] | None) -> int:
+    return sum(1 for c in checks or [] if c["ok"])
+
+
+def generate(conn, document: str, *, check: bool = True) -> dict[str, Any]:
+    """Turn the rules document into a plan (nothing is stored).
+
+    With ``check``, Jev scores the plan's example messages; when it picks the wrong condition for some, the
+    model gets one more try with that feedback and the plan whose examples pass more often is kept.
+    """
+    _check_document(document)
+    cfg = settings.get_settings(conn).jev
+    key = jev.api_key(conn)[0]
+    base_prompt = build_prompt(document)
+    started = time.monotonic()
+    plan, usage, attempts = _ask_plan(base_prompt)
+    checks, check_error, refined = None, None, False
     if check:
         if key is None:
             check_error = "No Jev API key: examples not checked"
         else:
             checks, check_error = _check(cfg.model_copy(update={"exits": plan_to_exits(plan)}), key, plan)
+    if checks and _passed(checks) < len(checks):
+        assert key is not None
+        try:
+            better, better_usage, more = _ask_plan(base_prompt + _refine_note(plan, checks))
+        except errors.WaError:
+            pass  # the refinement is a bonus: keep the first plan
+        else:
+            attempts += more
+            better_checks, _ = _check(cfg.model_copy(update={"exits": plan_to_exits(better)}), key, better)
+            if better_checks is not None and _passed(better_checks) > _passed(checks):
+                plan, checks, usage, refined = better, better_checks, better_usage, True
     return {
         "plan": plan.model_dump(),
         "model": usage.get("model"),
-        "latency_ms": latency_ms,
+        "latency_ms": int((time.monotonic() - started) * 1000),
         "attempts": attempts,
+        "refined": refined,
         "checks": checks,
         "check_error": check_error,
     }

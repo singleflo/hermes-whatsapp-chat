@@ -5301,7 +5301,8 @@ function SettingsJevPreview({ result, onApply, onDiscard, busy, error }) {
   const meta = [
     result.model,
     typeof result.latency_ms === 'number' ? (result.latency_ms / 1000).toFixed(1) + ' s' : '',
-    result.attempts > 1 ? result.attempts + ' attempts' : ''
+    result.attempts > 1 ? result.attempts + ' attempts' : '',
+    result.refined ? 'descriptions sharpened after the Jev check' : ''
   ].filter(Boolean)
   return jsx(SettingsCard, {
     title: 'Preview',

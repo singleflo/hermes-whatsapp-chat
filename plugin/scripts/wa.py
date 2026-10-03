@@ -300,6 +300,8 @@ def render_plan(result: dict) -> str:
         lines += ["Notes:", *[f"- {n}" for n in plan.notes]]
     if result.get("check_error"):
         lines.append(f"Check: {result['check_error']}")
+    if result.get("refined"):
+        lines.append("Descriptions sharpened once after the Jev check (more examples pass).")
     return "\n".join(lines)
 
 
