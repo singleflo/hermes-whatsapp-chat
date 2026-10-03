@@ -15,7 +15,7 @@
  import express from 'express';
  import { Boom } from '@hapi/boom';
  import pino from 'pino';
-@@ -132,6 +133,28 @@
+@@ -132,6 +133,27 @@
    : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
  const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
  const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
@@ -32,8 +32,7 @@
 +  ? {
 +      syncFullHistory: true,
 +      shouldSyncHistoryMessage: () => true,
-+      // The phone only sends full history to a desktop-class companion.
-+      browser: ['Mac OS', 'Desktop', '14.4.1'],
++      // No browser override: WhatsApp rejects the ['Mac OS', 'Desktop', ...] companion with 428 at pairing.
 +    }
 +  : SYNC_HISTORY === 'recent'
 +    ? {
@@ -44,7 +43,7 @@
  // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
  // when uploading media to WhatsApp servers (and, less often, on text sends),
  // which pins the bridge's HTTP handler until the upstream aiohttp timeout
-@@ -257,6 +280,11 @@
+@@ -257,6 +279,11 @@
  const messageQueue = [];
  const MAX_QUEUE_SIZE = 100;
  
@@ -56,7 +55,7 @@
  // Track recently sent message IDs.  Two purposes:
  //   1. Prevent echo-back loops with media in self-chat mode.
  //   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
-@@ -388,6 +416,38 @@
+@@ -388,6 +415,38 @@
  const scheduleReconnect = createReconnectScheduler(() => startSocket());
  const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
  
@@ -95,7 +94,7 @@
  async function startSocket() {
    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
    const version = await getWAVersion();
-@@ -399,6 +459,7 @@
+@@ -399,6 +458,7 @@
      printQRInTerminal: false,
      browser: ['Hermes Agent', 'Chrome', '120.0'],
      syncFullHistory: false,
@@ -103,7 +102,7 @@
      markOnlineOnConnect: false,
      // Required for Baileys 7.x: without this, incoming messages that need
      // E2EE session re-establishment are silently dropped (msg.message === null)
-@@ -794,6 +855,40 @@
+@@ -794,6 +854,40 @@
        }
      }
    });
@@ -144,7 +143,7 @@
  }
  
  // HTTP server
-@@ -1129,6 +1224,7 @@
+@@ -1129,6 +1223,7 @@
    res.json({
      status: connectionState,
      queueLength: messageQueue.length,
@@ -152,7 +151,7 @@
      uptime: process.uptime(),
      scriptHash: SCRIPT_HASH,
      sendReadReceipts: SEND_READ_RECEIPTS,
-@@ -1136,6 +1232,16 @@
+@@ -1136,6 +1231,16 @@
    });
  });
  

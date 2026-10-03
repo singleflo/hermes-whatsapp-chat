@@ -146,8 +146,7 @@ const HISTORY_SOCKET_OPTIONS = SYNC_HISTORY === 'full'
   ? {
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
-      // The phone only sends full history to a desktop-class companion.
-      browser: ['Mac OS', 'Desktop', '14.4.1'],
+      // No browser override: WhatsApp rejects the ['Mac OS', 'Desktop', ...] companion with 428 at pairing.
     }
   : SYNC_HISTORY === 'recent'
     ? {

@@ -400,6 +400,7 @@ class Runner:
             kind = event.get("event")
             qr = event.get("qr")
             if kind == "qr" and isinstance(qr, str):
+                self.error = None
                 self.qr = qr
                 self.qr_svg = qr_svg(qr)
                 self.last_qr_at = mono
@@ -420,6 +421,13 @@ class Runner:
                 else:
                     self.error = str(event.get("error") or "pairing error")
                     log(f"account {self.id}: pairing error: {self.error}")
+            elif kind == "disconnected" and self.qr is None and self.pair_connected_at is None:
+                # WhatsApp closed the socket before sending a QR (e.g. 428 for a rejected companion type):
+                # say so instead of showing "preparing" forever. 515 (restart after scan) is normal.
+                reason = event.get("reason")
+                if reason != 515:
+                    self.error = f"WhatsApp closed the pairing connection (code {reason}); retrying"
+                    log(f"account {self.id}: pairing disconnected before QR (code {reason})")
 
     def _pair_status(self) -> dict:
         if self.pair_connected_at is not None:
