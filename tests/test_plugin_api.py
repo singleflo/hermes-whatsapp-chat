@@ -312,6 +312,7 @@ def svc(core, tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(core.service, "_run", fake_run)
+    monkeypatch.setattr(core.service, "_sleep", lambda seconds: None)
     monkeypatch.setattr(core.service, "find_node", lambda: str(node))
     data = core.db.data_dir()
     return SimpleNamespace(
@@ -394,8 +395,8 @@ def test_service_install_without_node_is_503_and_changes_nothing(client, core, s
     assert not svc.plist.exists() and not svc.py.exists() and svc.calls == []
 
 
-def test_service_install_bootstrap_failure_is_503_with_launchctl_message(client, svc):
-    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error"), completed([], 113)]
+def test_service_install_bootstrap_failure_is_503_with_launchctl_message(client, core, svc):
+    svc.results[:] = [completed([], 3), *_bootstrap_failures(core), completed([], 113)]
     r = client.post(f"{PREFIX}/service/install")
     assert r.status_code == 503
     assert "Bootstrap failed: 5: Input/output error" in r.json()["detail"]
@@ -411,6 +412,17 @@ def test_service_install_without_launchctl_is_503(client, svc):
     svc.results[:] = [FileNotFoundError("launchctl"), FileNotFoundError("launchctl")]
     r = client.post(f"{PREFIX}/service/install")
     assert r.status_code == 503 and "launchctl" in r.json()["detail"]
+
+
+def _bootstrap_failures(core):
+    return [completed([], 5, "Bootstrap failed: 5: Input/output error")] * core.service.BOOTSTRAP_ATTEMPTS
+
+
+def test_service_install_retries_bootstrap_while_old_job_unloads(client, core, svc):
+    busy = completed([], 5, "Bootstrap failed: 5: Input/output error")
+    svc.results[:] = [completed([], 0), busy, busy, completed([], 0)]
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert [c[1] for c in svc.calls] == ["bootout", "bootstrap", "bootstrap", "bootstrap"]
 
 
 def test_service_uninstall_boots_out_and_removes_plist(client, svc):
@@ -543,7 +555,7 @@ def test_ensure_service_restarts_when_service_never_reported(client, core, svc):
 
 def test_ensure_service_reports_error_when_launchctl_fails(client, core, db, svc):
     now = _installed_with_heartbeat(client, core, db, svc, heartbeat_age=60)
-    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed"), completed([], 113)]
+    svc.results[:] = [completed([], 3), *_bootstrap_failures(core), completed([], 113)]
     assert core.service.ensure_service(now=now) == "error"
 
 
@@ -562,7 +574,7 @@ def test_service_install_always_restarts_even_when_nothing_changed(client, core,
 
 
 def test_service_install_kickstarts_when_bootstrap_says_already_loaded(client, core, svc):
-    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error"), completed([], 0)]
+    svc.results[:] = [completed([], 3), *_bootstrap_failures(core), completed([], 0)]
     assert client.post(f"{PREFIX}/service/install").status_code == 200
     assert svc.calls[-1] == ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{core.service.LABEL}"]
 

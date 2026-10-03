@@ -16,6 +16,7 @@ import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
+import time
 from typing import Any
 
 from . import db, errors
@@ -191,19 +192,35 @@ def _sync_service_files(node: str) -> tuple[dict[str, str], Path, bool]:
     return launchers, target, launchers_changed or plist_changed
 
 
+# launchd unloads asynchronously: a bootstrap issued right after bootout fails with
+# "Bootstrap failed: 5: Input/output error" until the old job is gone, so retry for a few seconds.
+BOOTSTRAP_ATTEMPTS = 20
+BOOTSTRAP_RETRY_SECONDS = 0.5
+
+
+def _sleep(seconds: float) -> None:  # test seam
+    time.sleep(seconds)
+
+
 def _reload_service(target: Path) -> None:
-    """Always (re)start the service: bootout + bootstrap, or ``kickstart -k`` when bootstrap says it is
-    still loaded. Raises ``Unavailable`` when launchctl cannot run or both attempts fail."""
+    """Always (re)start the service: bootout, then bootstrap (retried while launchd finishes unloading the
+    old job), then ``kickstart -k`` as a last resort. Raises ``Unavailable`` when launchctl cannot run or
+    every attempt fails."""
     domain = f"gui/{os.getuid()}"
     _launchctl(["bootout", f"{domain}/{LABEL}"])  # not loaded yet is fine
-    result = _launchctl(["bootstrap", domain, str(target)])
-    if result is None:
-        raise errors.Unavailable("launchctl is not available: the background service needs macOS")
-    if result.returncode == 0:
-        return
+    result = None
+    for attempt in range(BOOTSTRAP_ATTEMPTS):
+        result = _launchctl(["bootstrap", domain, str(target)])
+        if result is None:
+            raise errors.Unavailable("launchctl is not available: the background service needs macOS")
+        if result.returncode == 0:
+            return
+        if attempt + 1 < BOOTSTRAP_ATTEMPTS:
+            _sleep(BOOTSTRAP_RETRY_SECONDS)
     kick = _launchctl(["kickstart", "-k", f"{domain}/{LABEL}"])
     if kick is not None and kick.returncode == 0:
         return
+    assert result is not None
     detail = (result.stderr or result.stdout or "").strip() or f"exit code {result.returncode}"
     raise errors.Unavailable(f"launchctl bootstrap failed: {detail}")
 
