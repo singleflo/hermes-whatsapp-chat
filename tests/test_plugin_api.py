@@ -169,11 +169,25 @@ def add_conv(
     return cur.lastrowid
 
 
-def add_msg(db, conv_id, direction, body, ts, *, author=None, status=None, source="live", meta=None, wa_id=None):
+def add_msg(
+    db,
+    conv_id,
+    direction,
+    body,
+    ts,
+    *,
+    author=None,
+    status=None,
+    source="live",
+    meta=None,
+    wa_id=None,
+    remote_jid=None,
+    read_at=None,
+):
     account_id = db.execute("SELECT account_id FROM conversations WHERE id = ?", (conv_id,)).fetchone()[0]
     cur = db.execute(
-        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta,"
+        " remote_jid, read_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             conv_id,
             account_id,
@@ -185,6 +199,8 @@ def add_msg(db, conv_id, direction, body, ts, *, author=None, status=None, sourc
             status or ("received" if direction == "in" else "sent"),
             source,
             json.dumps(meta) if meta else None,
+            remote_jid,
+            read_at,
         ),
     )
     return cur.lastrowid
@@ -262,7 +278,7 @@ def test_health_reports_db_count_and_schema_version(client, db, account):
     body = client.get(f"{PREFIX}/health").json()
     assert body["ok"] is True
     assert body["conversations"] == 2
-    assert body["schema_version"] == 2
+    assert body["schema_version"] == 3
     assert body["db"].endswith("wa_board.db")
 
 
@@ -483,15 +499,15 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
 
 
 def test_health_and_service_report_api_version(client, core):
-    assert core.service.API_VERSION == 3
-    assert client.get(f"{PREFIX}/health").json()["api_version"] == 3
-    assert client.get(f"{PREFIX}/service").json()["api_version"] == 3
+    assert core.service.API_VERSION == 4
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 4
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 4
 
 
 def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["api_version"]) == (False, 3)
+    assert (body["ok"], body["api_version"]) == (False, 4)
 
 
 def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):
@@ -753,7 +769,7 @@ def test_v1_db_migrates_keeping_conversations_and_creating_accounts(client, core
     assert detail["state_history"][0]["to_state"] == "new"
     conn = core.db.connect()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute("SELECT last_inbound_at FROM conversations WHERE chat_jid = ?", (CONTACT_JID,)).fetchone()[0] == NOW - 100
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert not any(t.startswith("v1_") for t in tables)
@@ -1598,6 +1614,7 @@ DEFAULT_SETTINGS = {
     },
     "automations": {"enabled": True, "max_runs_per_conversation_per_hour": 10, "history_messages_in_prompt": 20},
     "media": {"max_upload_mb": 15},
+    "privacy": {"send_read_receipts": True},
 }
 
 
@@ -1898,3 +1915,324 @@ def test_seed_goes_into_a_demo_account_and_remove_keeps_real_data(client, core, 
     assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
     assert db.execute("SELECT COUNT(*) FROM conversation_state_log").fetchone()[0] == 0
     assert [a["label"] for a in client.get(f"{PREFIX}/accounts").json()["accounts"]] == ["Main"]
+
+
+# --- Schema v3, contacts by phone, receipts ------------------------------------------
+
+V2_SCHEMA = """
+CREATE TABLE conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, chat_jid TEXT NOT NULL,
+  contact_name TEXT, phone TEXT,
+  state TEXT NOT NULL DEFAULT 'new', previous_state TEXT,
+  priority INTEGER NOT NULL DEFAULT 0, muted_until INTEGER,
+  last_message_at INTEGER, last_inbound_at INTEGER,
+  unread_count INTEGER NOT NULL DEFAULT 0, agent_active INTEGER NOT NULL DEFAULT 1,
+  tags TEXT NOT NULL DEFAULT '[]', created_at INTEGER, updated_at INTEGER,
+  UNIQUE (account_id, chat_jid));
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+  wa_id TEXT, direction TEXT NOT NULL CHECK (direction IN ('in','out')),
+  author TEXT NOT NULL, body TEXT, ts INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('received','pending','sent','failed','draft','discarded')),
+  source TEXT NOT NULL DEFAULT 'live' CHECK (source IN ('live','history')),
+  meta TEXT, error TEXT, rule_id INTEGER);
+CREATE INDEX idx_messages_conv_ts ON messages(conversation_id, ts, id);
+CREATE UNIQUE INDEX idx_messages_wa_id ON messages(account_id, wa_id) WHERE wa_id IS NOT NULL;
+CREATE INDEX idx_messages_drafts ON messages(conversation_id) WHERE status = 'draft';
+PRAGMA user_version = 2;
+"""
+
+OWN_PHONE = OWN_JID.split("@")[0]
+
+
+def write_lid_mapping(core, account_id, lid, phone):
+    session = core.db.data_dir() / "sessions" / str(account_id)
+    session.mkdir(parents=True, exist_ok=True)
+    (session / f"lid-mapping-{lid}_reverse.json").write_text(json.dumps(phone), encoding="utf-8")
+
+
+def set_own_number(db, account_id):
+    db.execute("UPDATE accounts SET phone = ?, wa_jid = ? WHERE id = ?", (OWN_PHONE, OWN_JID, account_id))
+
+
+def receipt(wa_id, status, ts=None, chat=CONTACT_JID):
+    return {"type": "receipt", "id": wa_id, "chatId": chat, "status": status, "ts": ts or NOW}
+
+
+def test_v2_db_migrates_to_v3_keeping_rows_and_marking_old_inbound_read(client, core, tmp_path):
+    raw = sqlite3.connect(tmp_path / "wa_board.db")
+    raw.executescript(V2_SCHEMA)
+    raw.execute(
+        "INSERT INTO conversations (account_id, chat_jid, state, created_at, updated_at) VALUES (1, ?, 'new', ?, ?)",
+        (CONTACT_JID, NOW, NOW),
+    )
+    raw.executemany(
+        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status)"
+        " VALUES (1, 1, ?, ?, ?, ?, ?, ?)",
+        [("A1", "in", "contact", "hi", NOW - 100, "received"), ("A2", "out", "user", "hello", NOW - 50, "sent")],
+    )
+    raw.commit()
+    raw.close()
+
+    body = client.get(f"{PREFIX}/health").json()
+    assert (body["ok"], body["schema_version"], body["conversations"]) == (True, 3, 1)
+
+    conn = core.db.connect()
+    try:
+        rows = conn.execute("SELECT wa_id, ts, read_at, delivered_at, remote_jid FROM messages ORDER BY id").fetchall()
+        assert [tuple(r) for r in rows] == [("A1", NOW - 100, NOW - 100, None, None), ("A2", NOW - 50, None, None, None)]
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "v2_messages" not in tables
+        conn.execute("UPDATE messages SET status = 'delivered' WHERE wa_id = 'A2'")
+        assert conn.execute("SELECT status FROM messages WHERE wa_id = 'A2'").fetchone()[0] == "delivered"
+    finally:
+        conn.close()
+
+
+def test_ingest_keys_lid_chats_by_mapped_phone_and_keeps_unmapped_lids(core, db, account):
+    write_lid_mapping(core, account, "111", "393330009999")
+    assert core.ingest.ingest_event(db, account, owner_event(messageId="L1", chatId="111@lid"), NOW) is not None
+    row = conv_by_jid(db, account, "393330009999@s.whatsapp.net")
+    assert row is not None and row["phone"] == "393330009999"
+    assert conv_by_jid(db, account, "111@lid") is None
+    assert db.execute("SELECT remote_jid FROM messages WHERE wa_id = 'L1'").fetchone()[0] == "111@lid"
+
+    core.ingest.ingest_event(db, account, owner_event(messageId="L2", chatId="222@lid"), NOW)
+    unmapped = conv_by_jid(db, account, "222@lid")
+    assert unmapped is not None and unmapped["phone"] is None
+
+
+def test_ingest_ignores_system_broadcast_newsletter_and_self_chats(core, db, account):
+    write_lid_mapping(core, account, "333", OWN_PHONE)
+    for n, chat in enumerate(
+        ["0@s.whatsapp.net", "status@broadcast", "x@newsletter", OWN_JID, "333@lid"]
+    ):
+        event = wa_event(messageId=f"S{n}", chatId=chat, senderId=chat)
+        assert core.ingest.ingest_event(db, account, event, NOW) is None
+        assert core.ingest.ingest_event(db, account, event, NOW, source="history") is None
+    assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+
+
+def test_history_contact_name_is_used_unless_it_is_a_number(core, db, account):
+    core.ingest.ingest_event(
+        db, account, wa_event(messageId="H1", contactName="Anna", senderName=None), NOW - 500, source="history"
+    )
+    other = "393330002222@s.whatsapp.net"
+    core.ingest.ingest_event(
+        db,
+        account,
+        wa_event(messageId="H2", chatId=other, senderId=other, contactName="393330002222", senderName="Mario"),
+        NOW - 500,
+        source="history",
+    )
+    assert conv_by_jid(db, account, CONTACT_JID)["contact_name"] == "Anna"
+    assert conv_by_jid(db, account, other)["contact_name"] is None
+    # a later history event names an existing, still unnamed conversation but never renames a named one
+    core.ingest.ingest_event(db, account, wa_event(messageId="H3", chatId=other, senderId=other, contactName="Bea"), NOW, source="history")
+    core.ingest.ingest_event(db, account, wa_event(messageId="H4", contactName="Other"), NOW, source="history")
+    assert conv_by_jid(db, account, other)["contact_name"] == "Bea"
+    assert conv_by_jid(db, account, CONTACT_JID)["contact_name"] == "Anna"
+
+
+def test_receipts_move_outbound_messages_up_the_ladder_only(client, core, db, account):
+    conv = add_conv(db, account, CONTACT_JID, "waiting")
+    mid = add_msg(db, conv, "out", "hi", NOW - 60, wa_id="X", status="sent")
+    failed = add_msg(db, conv, "out", "late", NOW - 50, wa_id="F", status="failed")
+    db.execute("UPDATE messages SET error = 'send interrupted' WHERE id = ?", (failed,))
+
+    assert core.ingest.ingest_update(db, account, receipt("X", 3, NOW - 5), NOW) == "applied"
+    row = db.execute("SELECT status, delivered_at, read_at FROM messages WHERE id = ?", (mid,)).fetchone()
+    assert tuple(row) == ("delivered", NOW - 5, None)
+    assert core.ingest.ingest_update(db, account, receipt("X", 2), NOW) == "ignored"  # never moves down
+    assert core.ingest.ingest_update(db, account, receipt("X", 3), NOW) == "ignored"  # same rank
+    assert core.ingest.ingest_update(db, account, receipt("X", 4, NOW - 2), NOW) == "applied"
+    row = db.execute("SELECT status, delivered_at, read_at FROM messages WHERE id = ?", (mid,)).fetchone()
+    assert tuple(row) == ("read", NOW - 5, NOW - 2)
+
+    assert core.ingest.ingest_update(db, account, receipt("NOPE", 3), NOW) == "unmatched"
+    assert core.ingest.ingest_update(db, account, receipt("X", 1), NOW) == "ignored"  # not a receipt status
+    assert core.ingest.ingest_update(db, account, {"type": "bogus"}, NOW) == "ignored"
+
+    # a late receipt upgrades a message that was failed by the "send interrupted" timer and clears the error
+    assert core.ingest.ingest_update(db, account, receipt("F", 3), NOW) == "applied"
+    row = db.execute("SELECT status, error FROM messages WHERE id = ?", (failed,)).fetchone()
+    assert tuple(row) == ("delivered", None)
+
+    assert event_payloads(db, "message.status") == [{"status": "delivered"}, {"status": "read"}, {"status": "delivered"}]
+    thread = {m["id"]: m for m in messages(client, conv)["messages"]}
+    assert (thread[mid]["delivered_at"], thread[mid]["read_at"]) == (NOW - 5, NOW - 2)
+
+
+def test_receipt_for_another_numbers_message_is_unmatched(core, db, account):
+    other = add_account(core, db, "Second")
+    conv = add_conv(db, other, CONTACT_JID, "waiting")
+    add_msg(db, conv, "out", "hi", NOW - 60, wa_id="X", status="sent")
+    assert core.ingest.ingest_update(db, account, receipt("X", 3), NOW) == "unmatched"
+
+
+def test_contact_update_names_only_unnamed_conversations(core, db, account):
+    write_lid_mapping(core, account, "111", "393330009999")
+    phone_jid = "393330009999@s.whatsapp.net"
+    unnamed = add_conv(db, account, phone_jid, "new")
+    named = add_conv(db, account, CONTACT_JID, "new", name="Alice")
+
+    item = {"type": "contact", "jid": None, "lid": "111@lid", "pn": None, "name": "Bob", "notify": None, "verifiedName": None}
+    assert core.ingest.ingest_update(db, account, item, NOW) == "applied"
+    assert conv_row(db, unnamed)["contact_name"] == "Bob"
+    assert {"fields": ["contact_name"]} in event_payloads(db, "conversation.updated")
+
+    again = {**item, "name": "Robert"}
+    assert core.ingest.ingest_update(db, account, again, NOW) == "ignored"
+    assert conv_row(db, unnamed)["contact_name"] == "Bob"
+
+    by_pn = {"type": "contact", "jid": None, "lid": None, "pn": CONTACT_JID, "name": None, "notify": "Alicia", "verifiedName": None}
+    assert core.ingest.ingest_update(db, account, by_pn, NOW) == "ignored"
+    assert conv_row(db, named)["contact_name"] == "Alice"
+
+    digits = {**item, "lid": None, "pn": phone_jid, "name": "+393330009999"}
+    assert core.ingest.ingest_update(db, account, digits, NOW) == "ignored"
+
+
+def test_repair_rekeys_merges_and_drops_lid_and_system_conversations(core, db, account):
+    set_own_number(db, account)
+    write_lid_mapping(core, account, "111", "393330000001")
+    write_lid_mapping(core, account, "222", "393330000002")
+    write_lid_mapping(core, account, "333", OWN_PHONE)
+
+    a = add_conv(db, account, "111@lid", "new", unread=1)
+    add_msg(db, a, "in", "from A", NOW - 40, wa_id="MA")
+    c_jid = "393330000002@s.whatsapp.net"
+    c = add_conv(db, account, c_jid, "waiting", name="Carl", unread=2, last_at=NOW - 100, last_inbound_at=NOW - 100, tags=["vip"])
+    add_msg(db, c, "in", "from C", NOW - 100, wa_id="MC")
+    b = add_conv(db, account, "222@lid", "new", unread=3, last_at=NOW - 10, last_inbound_at=NOW - 10, tags=["vip", "lead"], priority=2)
+    add_msg(db, b, "in", "from B", NOW - 10, wa_id="MB")
+    d = add_conv(db, account, "0@s.whatsapp.net", "new")
+    add_msg(db, d, "in", "system", NOW - 30, wa_id="MD")
+    e = add_conv(db, account, "333@lid", "closed")
+    add_msg(db, e, "in", "self", NOW - 30, wa_id="ME", source="history")
+    f = add_conv(db, account, "444@lid", "new")
+    add_msg(db, f, "in", "unmapped", NOW - 30, wa_id="MF")
+
+    assert core.contacts.repair_lid_conversations(db, account, NOW) == 4
+
+    renamed = conv_row(db, a)
+    assert (renamed["chat_jid"], renamed["phone"]) == ("393330000001@s.whatsapp.net", "393330000001")
+    assert db.execute("SELECT remote_jid FROM messages WHERE wa_id = 'MA'").fetchone()[0] == "111@lid"
+
+    assert conv_row(db, b) is None
+    merged = conv_row(db, c)
+    assert (merged["unread_count"], merged["contact_name"], merged["state"], merged["priority"]) == (5, "Carl", "waiting", 2)
+    assert (merged["last_message_at"], merged["last_inbound_at"]) == (NOW - 10, NOW - 10)
+    assert json.loads(merged["tags"]) == ["vip", "lead"]
+    moved = db.execute("SELECT conversation_id, remote_jid FROM messages WHERE wa_id IN ('MB','MC') ORDER BY wa_id").fetchall()
+    assert [tuple(r) for r in moved] == [(c, "222@lid"), (c, None)]
+    assert {"fields": ["merged"]} in event_payloads(db, "conversation.updated")
+
+    for gone in (d, e):
+        assert conv_row(db, gone) is None
+        assert db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (gone,)).fetchone()[0] == 0
+    assert conv_row(db, f)["chat_jid"] == "444@lid"
+    assert db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (f,)).fetchone()[0] == 1
+
+    assert core.contacts.repair_lid_conversations(db, account, NOW) == 0
+
+
+# --- POST /conversations/{id}/read sends read receipts --------------------------------
+
+
+def read_calls(bridge):
+    return [c for c in bridge.calls if c[2] == "/read"]
+
+
+def seed_unread(db, account):
+    conv = add_conv(db, account, CONTACT_JID, "new", unread=2)
+    m1 = add_msg(db, conv, "in", "one", NOW - 30, wa_id="A", remote_jid="111@lid")
+    m2 = add_msg(db, conv, "in", "two", NOW - 20, wa_id="B")
+    old = add_msg(db, conv, "in", "old", NOW - 9000, wa_id="C", source="history")
+    return conv, m1, m2, old
+
+
+def read_at(db, *ids):
+    return [db.execute("SELECT read_at FROM messages WHERE id = ?", (i,)).fetchone()[0] for i in ids]
+
+
+def test_opening_a_conversation_sends_one_batch_of_read_receipts(client, db, account, bridge):
+    bridge.replies["/read"] = (200, {"success": True, "marked": True})
+    conv, m1, m2, old = seed_unread(db, account)
+
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+
+    (call,) = read_calls(bridge)
+    assert call[1] == "POST"
+    assert call[3] == {
+        "keys": [
+            {"remoteJid": "111@lid", "id": "A", "fromMe": False},
+            {"remoteJid": CONTACT_JID, "id": "B", "fromMe": False},
+        ]
+    }
+    assert all(t is not None for t in read_at(db, m1, m2))
+    assert read_at(db, old) == [None]  # history messages are never receipted
+    assert conv_row(db, conv)["unread_count"] == 0
+
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+    assert len(read_calls(bridge)) == 1
+
+
+def test_privacy_setting_off_marks_read_without_calling_the_bridge(client, db, account, bridge):
+    settings = client.get(f"{PREFIX}/settings").json()
+    settings["privacy"]["send_read_receipts"] = False
+    assert client.put(f"{PREFIX}/settings", json=settings).status_code == 200
+    conv, m1, m2, _ = seed_unread(db, account)
+
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+    assert read_calls(bridge) == []
+    assert all(t is not None for t in read_at(db, m1, m2))
+
+
+def test_read_receipts_retry_when_the_bridge_is_down_or_declines(client, db, account, bridge):
+    conv, m1, m2, _ = seed_unread(db, account)
+
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200  # no /read reply: bridge down
+    assert read_at(db, m1, m2) == [None, None]
+    assert conv_row(db, conv)["unread_count"] == 0
+
+    bridge.replies["/read"] = (200, {"success": True, "marked": False})
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+    assert read_at(db, m1, m2) == [None, None]
+
+    bridge.replies["/read"] = (200, {"success": True, "marked": True})
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+    assert all(t is not None for t in read_at(db, m1, m2))
+    assert len(read_calls(bridge)) == 3
+
+
+def test_read_receipts_skip_demo_and_stopped_numbers(client, core, db, bridge):
+    bridge.replies["/read"] = (200, {"success": True, "marked": True})
+    stopped = add_account(core, db, "Off", desired="stopped")
+    conv, m1, m2, _ = seed_unread(db, stopped)
+    assert client.post(f"{PREFIX}/conversations/{conv}/read").status_code == 200
+    assert read_calls(bridge) == []
+    assert read_at(db, m1, m2) == [None, None]
+
+
+# --- Card last_message_status ---------------------------------------------------------
+
+
+def test_card_reports_last_message_status_only_for_live_outbound(client, db, account):
+    out_live = add_conv(db, account, "1@s.whatsapp.net", "new")
+    add_msg(db, out_live, "out", "sent by us", NOW - 10, status="delivered")
+    last_in = add_conv(db, account, "2@s.whatsapp.net", "new")
+    add_msg(db, last_in, "out", "first", NOW - 20, status="read")
+    add_msg(db, last_in, "in", "answer", NOW - 10)
+    out_history = add_conv(db, account, "3@s.whatsapp.net", "closed")
+    add_msg(db, out_history, "out", "old", NOW - 10, source="history")
+
+    cards = {c["chat_jid"]: c for c in client.get(f"{PREFIX}/conversations").json()["conversations"]}
+    assert cards["1@s.whatsapp.net"]["last_message_status"] == "delivered"
+    assert cards["2@s.whatsapp.net"]["last_message_status"] is None
+    assert cards["3@s.whatsapp.net"]["last_message_status"] is None
+
+
+def test_settings_default_sends_read_receipts(client):
+    assert client.get(f"{PREFIX}/settings").json()["privacy"] == {"send_read_receipts": True}

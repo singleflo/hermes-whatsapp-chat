@@ -1,4 +1,4 @@
-"""Paths, schema v2, v1 -> v2 migration, connection helpers."""
+"""Paths, schema v3, v1/v2 -> v3 migrations, connection helpers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 PLUGIN_ID = "hermes-whatsapp-chat"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEMO_SUFFIX = "@demo.invalid"
 
 SCHEMA = """
@@ -48,9 +48,11 @@ CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
   wa_id TEXT, direction TEXT NOT NULL CHECK (direction IN ('in','out')),
   author TEXT NOT NULL, body TEXT, ts INTEGER NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('received','pending','sent','failed','draft','discarded')),
+  status TEXT NOT NULL CHECK (status IN
+    ('received','pending','sent','delivered','read','played','failed','draft','discarded')),
   source TEXT NOT NULL DEFAULT 'live' CHECK (source IN ('live','history')),
-  meta TEXT, error TEXT, rule_id INTEGER);
+  meta TEXT, error TEXT, rule_id INTEGER,
+  delivered_at INTEGER, read_at INTEGER, remote_jid TEXT);
 CREATE TABLE IF NOT EXISTS conversation_state_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
   from_state TEXT, to_state TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, at INTEGER NOT NULL);
@@ -82,6 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_drafts ON messages(conversation_id) WHER
 
 _V1_TABLES = ("conversations", "messages", "conversation_state_log")
 _V1_INDEXES = ("idx_messages_chat_ts", "idx_messages_wa_id", "idx_conversations_state", "idx_state_log_chat")
+_V2_MESSAGE_INDEXES = ("idx_messages_conv_ts", "idx_messages_wa_id", "idx_messages_drafts")
 
 
 # --- Paths ---------------------------------------------------------------------
@@ -157,14 +160,34 @@ def connect() -> sqlite3.Connection:
 def _upgrade(conn: sqlite3.Connection) -> None:
     with write_txn(conn):
         # Re-check inside the lock: another process may have migrated while we waited.
-        if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
             return
         if _is_v1(conn):
             _migrate_v1(conn, int(time.time()))
+        elif version == 2:
+            _migrate_v2(conn)
         else:
             for stmt in _statements():
                 conn.execute(stmt)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: rebuild ``messages`` (SQLite cannot alter a CHECK) with receipt columns."""
+    for idx in _V2_MESSAGE_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {idx}")
+    conn.execute("ALTER TABLE messages RENAME TO v2_messages")
+    for stmt in _statements():
+        conn.execute(stmt)
+    # Old inbound rows count as read, so the first open after the upgrade sends no receipts for them.
+    conn.execute(
+        "INSERT INTO messages (id, conversation_id, account_id, wa_id, direction, author, body, ts, status,"
+        " source, meta, error, rule_id, read_at)"
+        " SELECT id, conversation_id, account_id, wa_id, direction, author, body, ts, status,"
+        " source, meta, error, rule_id, CASE WHEN direction = 'in' THEN ts END FROM v2_messages"
+    )
+    conn.execute("DROP TABLE v2_messages")
 
 
 def _migrate_v1(conn: sqlite3.Connection, now: int) -> None:
@@ -205,10 +228,12 @@ def _migrate_v1(conn: sqlite3.Connection, now: int) -> None:
         (pattern, demo_id, main_id, now, now),
     )
     conn.execute(
-        "INSERT INTO messages (id, conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta)"
+        "INSERT INTO messages (id, conversation_id, account_id, wa_id, direction, author, body, ts, status, source,"
+        " meta, read_at)"
         " SELECT m.id, c.id, c.account_id, m.wa_id, m.direction,"
         " CASE m.direction WHEN 'in' THEN 'contact' ELSE 'user' END, m.body, m.ts,"
-        " CASE m.direction WHEN 'in' THEN 'received' ELSE 'sent' END, 'live', m.meta"
+        " CASE m.direction WHEN 'in' THEN 'received' ELSE 'sent' END, 'live', m.meta,"
+        " CASE WHEN m.direction = 'in' THEN m.ts END"
         " FROM v1_messages m JOIN conversations c ON c.chat_jid = m.chat_jid"
     )
     conn.execute(

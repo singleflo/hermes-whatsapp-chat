@@ -370,7 +370,10 @@ def escalate(conversation_id: int, payload: EscalateBody) -> dict[str, Any]:
 @router.post("/conversations/{conversation_id}/read")
 def mark_read(conversation_id: int) -> dict[str, Any]:
     with _session("mark read failed") as conn:
-        return core.conversations.mark_read(conn, conversation_id, now=_now())
+        summary = core.conversations.mark_read(conn, conversation_id, now=_now())
+        # Only this human-UI route sends read receipts; automations, CLI and agents never do.
+        core.outbound.send_read_receipts(conn, conversation_id, now=_now())
+        return summary
 
 
 @router.put("/conversations/{conversation_id}/tags")

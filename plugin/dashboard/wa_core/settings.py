@@ -111,6 +111,10 @@ class MediaSettings(_Strict):
     max_upload_mb: int = Field(default=15, ge=1, le=50)
 
 
+class Privacy(_Strict):
+    send_read_receipts: bool = True
+
+
 class Settings(_Strict):
     rules: Rules = Field(default_factory=lambda: Rules())
     notifications: Notifications = Field(default_factory=lambda: Notifications())
@@ -118,6 +122,7 @@ class Settings(_Strict):
     hours: Hours = Field(default_factory=lambda: Hours())
     automations: AutomationsSettings = Field(default_factory=lambda: AutomationsSettings())
     media: MediaSettings = Field(default_factory=lambda: MediaSettings())
+    privacy: Privacy = Field(default_factory=lambda: Privacy())
 
 
 def get_settings(conn: sqlite3.Connection) -> Settings:

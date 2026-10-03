@@ -14,6 +14,10 @@ import {
   Badge,
   Button,
   Codicon,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   ErrorState,
   haptic,
   host,
@@ -31,7 +35,8 @@ import {
   StatusDot,
   Textarea,
   useQuery,
-  useValue
+  useValue,
+  WorkspacePageHeaderControl
 } from '@hermes/plugin-sdk'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -46,9 +51,19 @@ const WA_JID_RE = /@(s\.whatsapp\.net|lid)$/
 // Set by register(); handlers read it imperatively, never from render closures.
 let ctxRef = null
 
-// Cross-component selection (also driven by notification clicks).
-const $tab = atom('chats')
-const $selected = atom(null)
+// Per-route UI state (also driven by notification clicks): the main page, every per-number
+// page and every split tile keep their own tab, selected conversation and number filter.
+// `account` is the WhatsApp number id, or null for "All numbers".
+const scopes = new Map()
+
+function getScope(route, accountId) {
+  let scope = scopes.get(route)
+  if (!scope) {
+    scope = { tab: atom('chats'), selected: atom(null), account: atom(accountId) }
+    scopes.set(route, scope)
+  }
+  return scope
+}
 
 // Service (re)start progress after Install service / Reinstall: null | 'restarting' | 'failed'.
 const $restart = atom(null)
@@ -202,7 +217,7 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 3
+const REQUIRED_API_VERSION = 4
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
   'The plugin was updated but Hermes is still running the previous backend. Quit Hermes (⌘Q) and open it again.'
@@ -455,7 +470,12 @@ function fmtPhone(p) {
 }
 
 function displayName(c) {
-  return c.contact_name || fmtPhone(c.phone) || c.chat_jid || 'Unknown'
+  return (
+    c.contact_name ||
+    fmtPhone(c.phone) ||
+    (/@lid$/.test(c.chat_jid || '') ? 'Unknown contact' : c.chat_jid) ||
+    'Unknown'
+  )
 }
 
 function initials(name) {
@@ -474,6 +494,37 @@ function initials(name) {
 
 function fmtClock(ts) {
   return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+}
+
+// status -> [codicon, color, label]; delivery ticks like WhatsApp (read/played are blue).
+const TICK_ICONS = {
+  pending: ['clock', null, 'Sending'],
+  sent: ['check', null, 'Sent'],
+  delivered: ['check-all', null, 'Delivered'],
+  read: ['check-all', 'var(--ui-blue)', 'Read'],
+  played: ['check-all', 'var(--ui-blue)', 'Played']
+}
+
+function tickTitle(m) {
+  if (m.status === 'pending') {
+    return 'Sending'
+  }
+  let title = 'Sent ' + fmtClock(m.ts)
+  if (m.delivered_at) {
+    title += ' · Delivered ' + fmtClock(m.delivered_at)
+  }
+  if (m.read_at) {
+    title += (m.status === 'played' ? ' · Played ' : ' · Read ') + fmtClock(m.read_at)
+  }
+  return title
+}
+
+function StatusTicks({ status, title, style }) {
+  const tick = TICK_ICONS[status]
+  if (!tick) {
+    return null
+  }
+  return h(Codicon, { name: tick[0], title: title || tick[2], style: tick[1] ? { ...style, color: tick[1] } : style })
 }
 
 const dayStart = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
@@ -835,31 +886,6 @@ function CardBadges({ c }) {
   ]
 }
 
-function AccountFilter({ accounts, value, onChange }) {
-  return h(
-    'div',
-    { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
-    h(Chip, { active: value === null, onClick: () => onChange(null) }, 'All numbers'),
-    accounts.map(a => {
-      const st = accountState(a)
-      return h(
-        Chip,
-        {
-          key: a.id,
-          active: value === a.id,
-          title: a.label + ' · ' + (ACCOUNT_STATE_LABELS[st] || st),
-          onClick: () => onChange(value === a.id ? null : a.id)
-        },
-        h(AccountDot, { account: a }),
-        a.label,
-        st === 'connected' || st === 'demo'
-          ? null
-          : h('span', { style: { color: accountStateColor(st), fontSize: 10 } }, ACCOUNT_STATE_LABELS[st] || st)
-      )
-    })
-  )
-}
-
 // --- Conversation list ---------------------------------------------------------
 
 function ConvRow({ c, selected, onSelect, snippet }) {
@@ -908,6 +934,9 @@ function ConvRow({ c, selected, onSelect, snippet }) {
           'span',
           { style: { ...F.ellipsis, flex: '1 1 auto', fontSize: 12, color: 'var(--ui-text-secondary)' } },
           c.has_draft ? h('span', { style: { color: 'var(--ui-orange)', fontWeight: 600 } }, 'Draft · ') : null,
+          c.last_message_status && snippet === undefined
+            ? h(StatusTicks, { status: c.last_message_status, style: { marginRight: 4 } })
+            : null,
           snippet !== undefined ? snippet : previewPrefix(c) + (c.last_message_preview || '')
         ),
         c.unread_count > 0 ? h(Badge, { variant: 'solid', size: 'xs' }, String(c.unread_count)) : null
@@ -1007,8 +1036,7 @@ function SearchResults({ q, accountId, selectedId, onSelect }) {
   )
 }
 
-function ConvSidebar({ accountId, setAccountId, stateFilter, setStateFilter, selectedId, onSelect }) {
-  const accounts = useApi('accounts', '/accounts')
+function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSelect }) {
   const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
   const [mode, setMode] = useState('chats')
@@ -1039,9 +1067,6 @@ function ConvSidebar({ accountId, setAccountId, stateFilter, setStateFilter, sel
     h(
       'div',
       { style: { ...F.col, gap: 8, padding: 10, borderBottom: BORDER } },
-      accounts.data && accounts.data.accounts.length > 0
-        ? h(AccountFilter, { accounts: accounts.data.accounts, value: accountId, onChange: setAccountId })
-        : null,
       h(Input, {
         value: qInput,
         placeholder: mode === 'chats' ? 'Search name or phone' : 'Search messages',
@@ -1258,10 +1283,8 @@ function Message({ m, retried, onRetry, onMediaLoad }) {
       h('span', { key: 'h', title: 'Imported from WhatsApp history', style: { fontStyle: 'italic' } }, 'imported')
     )
   }
-  if (out && m.status === 'pending') {
-    meta.push(h(Codicon, { key: 's', name: 'clock', title: 'Sending' }))
-  } else if (out && m.status === 'sent') {
-    meta.push(h(Codicon, { key: 's', name: 'check', title: 'Sent' }))
+  if (out && m.source !== 'history' && TICK_ICONS[m.status]) {
+    meta.push(h(StatusTicks, { key: 's', status: m.status, title: tickTitle(m) }))
   } else if (failed) {
     meta.push(h('span', { key: 's', style: { color: 'var(--ui-red)', fontWeight: 600 } }, 'Failed'))
   }
@@ -2049,12 +2072,10 @@ function BoardColumn({ col, count, hidden, onOpen, onDrop }) {
   )
 }
 
-function BoardView({ onOpen }) {
-  const [accountId, setAccountId] = useState(null)
+function BoardView({ accountId, onOpen }) {
   const [includeClosed, setIncludeClosed] = useState(false)
   const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
-  const accounts = useApi('accounts', '/accounts')
   const settings = useApi('settings', '/settings')
 
   useEffect(() => ctxRef.setTimeout(() => setQ(qInput.trim()), 250), [qInput])
@@ -2097,9 +2118,6 @@ function BoardView({ onOpen }) {
         { size: 'xs', variant: includeClosed ? 'secondary' : 'outline', onClick: () => setIncludeClosed(v => !v) },
         includeClosed ? 'Hide closed' : 'Show closed'
       ),
-      accounts.data && accounts.data.accounts.length > 0
-        ? h(AccountFilter, { accounts: accounts.data.accounts, value: accountId, onChange: setAccountId })
-        : null,
       h('span', { style: T.muted }, 'Dropping a card on Muted snoozes it for ' + fmtHours(dropHours))
     ),
     gate(board, data =>
@@ -2125,8 +2143,7 @@ function BoardView({ onOpen }) {
 
 // --- Page ----------------------------------------------------------------------------------
 
-function ChatsView({ selected, onSelect }) {
-  const [accountId, setAccountId] = useState(null)
+function ChatsView({ accountId, selected, onSelect }) {
   const [stateFilter, setStateFilter] = useState('')
   const [infoOpen, setInfoOpen] = useState(() => Boolean(ctxRef.storage.get('infoOpen', false)))
 
@@ -2150,7 +2167,7 @@ function ChatsView({ selected, onSelect }) {
   return h(
     'div',
     { style: { display: 'flex', ...F.fill } },
-    h(ConvSidebar, { accountId, setAccountId, stateFilter, setStateFilter, selectedId: selected, onSelect }),
+    h(ConvSidebar, { accountId, stateFilter, setStateFilter, selectedId: selected, onSelect }),
     selected
       ? h(ChatPane, {
           key: selected,
@@ -2168,15 +2185,89 @@ function ChatsView({ selected, onSelect }) {
   )
 }
 
-function WaPage() {
-  const tab = useValue($tab)
-  const selected = useValue($selected)
+// Header number switcher (Kanban board-switcher style): "All numbers" or one WhatsApp number.
+function NumberSwitcher({ scope }) {
+  const account = useValue(scope.account)
+  const accounts = useApi('accounts', '/accounts')
+  const list = useMemo(
+    () => ((accounts.data && accounts.data.accounts) || []).filter(a => a.desired !== 'removed'),
+    [accounts.data]
+  )
+  const current = list.find(a => a.id === account) || null
+
+  // The selected number was removed: fall back to "All numbers".
+  useEffect(() => {
+    if (account !== null && accounts.data && !current) {
+      scope.account.set(null)
+    }
+  }, [account, accounts.data, current, scope])
+
+  const label = current ? current.label : 'All numbers'
+  const choose = id => {
+    scope.account.set(id)
+    scope.selected.set(null)
+  }
+
+  return h(
+    DropdownMenu,
+    null,
+    h(
+      DropdownMenuTrigger,
+      { asChild: true },
+      h(
+        Button,
+        {
+          'aria-label': 'WhatsApp number: ' + label,
+          className: 'h-full min-w-0 max-w-full gap-1.5 px-2',
+          size: 'sm',
+          variant: 'ghost'
+        },
+        h(Codicon, { name: 'device-mobile', size: '0.8125rem' }),
+        current ? h(AccountDot, { account: current }) : null,
+        h('span', { style: { ...F.ellipsis, fontSize: 12, fontWeight: 500 } }, label),
+        h(Codicon, { name: 'chevron-down', size: '0.8125rem' })
+      )
+    ),
+    h(
+      DropdownMenuContent,
+      { align: 'center' },
+      h(
+        DropdownMenuItem,
+        { onSelect: () => choose(null) },
+        'All numbers',
+        account === null ? h(Codicon, { className: 'ml-auto', name: 'check', size: '0.8rem' }) : null
+      ),
+      list.map(a => {
+        const st = accountState(a)
+        return h(
+          DropdownMenuItem,
+          { key: a.id, onSelect: () => choose(a.id) },
+          h(AccountDot, { account: a }),
+          a.label,
+          st === 'connected' || st === 'demo'
+            ? null
+            : h('span', { style: { color: accountStateColor(st), fontSize: 10 } }, ACCOUNT_STATE_LABELS[st] || st),
+          a.id === account ? h(Codicon, { className: 'ml-auto', name: 'check', size: '0.8rem' }) : null
+        )
+      })
+    )
+  )
+}
+
+function WaPage({ route, accountId }) {
+  const scope = getScope(route, accountId)
+  const tab = useValue(scope.tab)
+  const selected = useValue(scope.selected)
+  const account = useValue(scope.account)
   const health = useApi('service', '/service')
   const accounts = useApi('accounts', '/accounts')
-  const open = useCallback(id => {
-    $selected.set(id)
-    $tab.set('chats')
-  }, [])
+  const open = useCallback(
+    id => {
+      scope.selected.set(id)
+      scope.tab.set('chats')
+    },
+    [scope]
+  )
 
   const unreachable = !health.data && !accounts.data && (health.error || accounts.error)
 
@@ -2186,6 +2277,7 @@ function WaPage() {
     h(
       'div',
       { style: { ...F.row, padding: '8px 12px', borderBottom: BORDER } },
+      h(WorkspacePageHeaderControl, { id: 'hermes-whatsapp-chat:number-switcher' }, h(NumberSwitcher, { scope })),
       h(SegmentedControl, {
         options: [
           { id: 'chats', label: 'Chats' },
@@ -2193,7 +2285,7 @@ function WaPage() {
           { id: 'settings', label: 'Settings' }
         ],
         value: tab,
-        onChange: id => $tab.set(id)
+        onChange: id => scope.tab.set(id)
       }),
       h('span', { style: { flex: '1 1 auto' } }),
       unreachable
@@ -2207,8 +2299,8 @@ function WaPage() {
     ),
     h(OutdatedBanner, {}),
     h(ServiceBanner, {}),
-    tab === 'chats' ? h(ChatsView, { selected, onSelect: open }) : null,
-    tab === 'board' ? h(BoardView, { onOpen: open }) : null,
+    tab === 'chats' ? h(ChatsView, { accountId: account, selected, onSelect: open }) : null,
+    tab === 'board' ? h(BoardView, { accountId: account, onOpen: open }) : null,
     tab === 'settings' ? h('div', { style: { ...F.fill, overflowY: 'auto' } }, jsx(SettingsPage, {})) : null
   )
 }
@@ -2274,10 +2366,12 @@ function notifyConv(title, e, body) {
     body,
     activate: ROUTE,
     onActivate: () => {
+      const scope = getScope(ROUTE, null)
+      scope.account.set(null)
       if (e.conversation_id) {
-        $selected.set(e.conversation_id)
+        scope.selected.set(e.conversation_id)
       }
-      $tab.set('chats')
+      scope.tab.set('chats')
     }
   })
 }
@@ -2340,6 +2434,54 @@ function onFrame(frame) {
   if (events.length) {
     notifyEvents(events)
   }
+  if (events.some(e => typeof e.type === 'string' && e.type.startsWith('account.'))) {
+    loadNumberRoutes()
+  }
+}
+
+// --- Per-number routes ------------------------------------------------------------------------
+
+// One page route + one sidebar entry per WhatsApp number (`/wa-board-<account id>`). Registered at
+// runtime from /accounts and re-registered only when the list of numbers changes.
+let numberRoutes = { key: '', dispose: null }
+
+function syncNumberRoutes(accounts) {
+  const list = accounts
+    .filter(a => a.kind === 'whatsapp' && a.desired !== 'removed')
+    .map(a => ({ id: a.id, label: a.label }))
+  const key = JSON.stringify(list)
+  if (key === numberRoutes.key) {
+    return
+  }
+  if (numberRoutes.dispose) {
+    numberRoutes.dispose()
+  }
+  const contributions = []
+  for (const n of list) {
+    const path = ROUTE + '-' + n.id
+    contributions.push(
+      {
+        id: 'page-' + n.id,
+        area: ROUTES_AREA,
+        title: 'WhatsApp · ' + n.label,
+        data: { path },
+        render: () => jsx(WaPage, { route: path, accountId: n.id })
+      },
+      {
+        id: 'nav-' + n.id,
+        area: SIDEBAR_NAV_AREA,
+        data: { path, label: 'WhatsApp · ' + n.label, codicon: 'device-mobile' }
+      }
+    )
+  }
+  numberRoutes = { key, dispose: contributions.length ? ctxRef.registerMany(contributions) : null }
+}
+
+function loadNumberRoutes() {
+  return ctxRef.rest('/accounts').then(
+    d => syncNumberRoutes((d && d.accounts) || []),
+    () => {}
+  )
 }
 
 // --- Register ------------------------------------------------------------------------------------
@@ -2359,7 +2501,7 @@ export default {
         area: ROUTES_AREA,
         title: 'Conversations',
         data: { path: ROUTE },
-        render: () => jsx(WaPage, {})
+        render: () => jsx(WaPage, { route: ROUTE, accountId: null })
       },
       {
         id: 'nav',
@@ -2381,6 +2523,11 @@ export default {
 
     // Live updates: an accelerator over the 5s polling (a no-op on OAuth remotes).
     ctx.socket('/events', onFrame)
+
+    // One route + sidebar entry per WhatsApp number.
+    numberRoutes = { key: '', dispose: null }
+    loadNumberRoutes()
+    ctx.setInterval(loadNumberRoutes, 15000)
   }
 }
 
@@ -2395,11 +2542,12 @@ const SETTINGS_SECTIONS = [
   ['numbers', 'Numbers'],
   ['rules', 'Conversation rules'],
   ['notifications', 'Notifications'],
+  ['privacy', 'Privacy'],
   ['board', 'Board'],
   ['hours', 'Hours'],
   ['automations', 'Automations']
 ]
-const SETTINGS_SAVE_SECTIONS = ['rules', 'notifications', 'board', 'hours', 'automations']
+const SETTINGS_SAVE_SECTIONS = ['rules', 'notifications', 'privacy', 'board', 'hours', 'automations']
 
 // state -> [label, Badge variant]
 const SETTINGS_STATE_BADGE = {
@@ -3828,6 +3976,18 @@ function SettingsNotificationsForm({ draft, set }) {
   )
 }
 
+function SettingsPrivacyForm({ draft, set }) {
+  return jsx(SettingsCard, {
+    title: 'Read receipts',
+    children: jsx(SettingsToggle, {
+      checked: set_getIn(draft, ['privacy', 'send_read_receipts'], true),
+      onChange: v => set(['privacy', 'send_read_receipts'], v),
+      label: 'Send read receipts',
+      hint: 'When you open a conversation, the contact sees blue ticks on their messages, like in WhatsApp. Automations and agents never send read receipts.'
+    })
+  })
+}
+
 function SettingsBoardForm({ draft, set }) {
   const b = (k, fb) => set_getIn(draft, ['board', k], fb)
   return jsx(SettingsCard, {
@@ -4859,11 +5019,13 @@ function SettingsPage() {
         ? jsx(SettingsRulesForm, props)
         : sec === 'notifications'
           ? jsx(SettingsNotificationsForm, props)
-          : sec === 'board'
-            ? jsx(SettingsBoardForm, props)
-            : sec === 'hours'
-              ? jsx(SettingsHoursForm, props)
-              : jsx(SettingsAutomations, props)
+          : sec === 'privacy'
+            ? jsx(SettingsPrivacyForm, props)
+            : sec === 'board'
+              ? jsx(SettingsBoardForm, props)
+              : sec === 'hours'
+                ? jsx(SettingsHoursForm, props)
+                : jsx(SettingsAutomations, props)
     content = set_h(
       'div',
       { className: 'flex flex-col gap-3' },

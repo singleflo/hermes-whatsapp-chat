@@ -6,7 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import conversations, db, errors, events, media, settings
+from . import contacts, conversations, db, errors, events, media, outbound, settings
 
 NON_SUBSTANTIVE_MEDIA = {"reaction", "poll_update"}
 WA_PHONE_SUFFIX = "@s.whatsapp.net"
@@ -63,10 +63,12 @@ def _insert_message(
     ts: int,
     source: str,
     meta: str | None,
+    remote_jid: str | None,
+    read_at: int | None = None,
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta,"
+        " remote_jid, read_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             conv_id,
             account_id,
@@ -78,6 +80,8 @@ def _insert_message(
             "received" if direction == "in" else "sent",
             source,
             meta,
+            remote_jid,
+            read_at,
         ),
     )
     return cur.lastrowid or 0
@@ -154,7 +158,10 @@ def _adopt_own_jid(conn: sqlite3.Connection, account_id: int, event: dict, now: 
 def ingest_event(
     conn: sqlite3.Connection, account_id: int, event: dict, now: int, *, source: str = "live"
 ) -> int | None:
-    """Store one bridge message event. Returns the new message id; None for groups, empty jids and duplicates."""
+    """Store one bridge message event.
+
+    Returns the new message id; None for groups, system/self/broadcast chats, empty jids and duplicates.
+    """
     if _is_group(event):
         return None
     jid = canonical_jid(event)
@@ -166,16 +173,25 @@ def ingest_event(
     media_type = event.get("mediaType")
     wa_id = str(event.get("messageId") or "") or None
     meta = _meta(event)
-    name = event.get("senderName")
-    contact_name = name if not from_owner and name and name != _jid_number(jid) else None
+    remote_jid = str(event.get("chatId") or "") or None
     direction = "out" if from_owner else "in"
 
     with db.write_txn(conn):
-        account = conn.execute("SELECT wa_jid FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        account = conn.execute(
+            "SELECT id, wa_jid, phone, session_dir FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
         if account is None:
             raise errors.NotFound(f"account {account_id} not found")
         if account["wa_jid"] is None:
             _adopt_own_jid(conn, account_id, event, now)
+            account = conn.execute(
+                "SELECT id, wa_jid, phone, session_dir FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        jid = contacts.resolve_jid(account, jid)
+        if contacts.is_ignored_jid(jid, contacts.own_number(account)):
+            return None
+        raw_name = event.get("contactName") or (None if from_owner else event.get("senderName"))
+        contact_name = raw_name if raw_name and not str(raw_name).lstrip("+").isdigit() else None
         if wa_id and conn.execute(
             "SELECT 1 FROM messages WHERE account_id = ? AND wa_id = ?", (account_id, wa_id)
         ).fetchone():
@@ -183,7 +199,7 @@ def ingest_event(
         row = conn.execute(
             "SELECT * FROM conversations WHERE account_id = ? AND chat_jid = ?", (account_id, jid)
         ).fetchone()
-        common = {"wa_id": wa_id, "direction": direction, "body": body, "ts": ts, "meta": meta}
+        common = {"wa_id": wa_id, "direction": direction, "body": body, "ts": ts, "meta": meta, "remote_jid": remote_jid}
 
         if source == "history":
             if row is None:
@@ -191,8 +207,19 @@ def ingest_event(
                     conn, account_id, jid, state="closed", name=contact_name, ts=ts, now=now, unread=0,
                     last_inbound_at=None,
                 )
+            elif contact_name:
+                conn.execute(
+                    "UPDATE conversations SET contact_name = COALESCE(contact_name, ?) WHERE id = ?",
+                    (contact_name, row["id"]),
+                )
             message_id = _insert_message(
-                conn, row["id"], account_id, author="phone" if from_owner else "contact", source="history", **common
+                conn,
+                row["id"],
+                account_id,
+                author="phone" if from_owner else "contact",
+                source="history",
+                read_at=None if from_owner else ts,
+                **common,
             )
             conn.execute(
                 "UPDATE conversations SET last_message_at = MAX(COALESCE(last_message_at, 0), ?) WHERE id = ?",
@@ -292,3 +319,13 @@ def _ingest_owner(
         payload={"author": author},
     )
     return message_id
+
+
+def ingest_update(conn: sqlite3.Connection, account_id: int, item: dict, now: int) -> str:
+    """Apply one bridge ``/updates`` item. Returns ``"applied"``, ``"unmatched"`` (retry later) or ``"ignored"``."""
+    kind = item.get("type") if isinstance(item, dict) else None
+    if kind == "receipt":
+        return outbound.apply_receipt(conn, account_id, item, now)
+    if kind == "contact":
+        return contacts.apply_contact(conn, account_id, item, now)
+    return "ignored"

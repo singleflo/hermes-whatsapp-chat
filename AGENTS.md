@@ -32,7 +32,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
   - Desktop: `import … from '@hermes/plugin-sdk'`. The default export is `{id, name, defaultEnabled, register(ctx)}`. Contributions go through `ctx.registerMany` (route page at `/wa-board`, palette command `wa-board.open`, status bar, etc.).
   - Dashboard: a plain `(function(){ 'use strict'; … })()` that uses `window.__HERMES_PLUGIN_SDK__` (`SDK.React`, `SDK.components`, `SDK.fetchJSON`, `SDK.utils`) and registers through `window.__HERMES_PLUGINS__.register(PLUGIN_ID, Component)`.
   - Backend: `plugin_api.py` exposes a module-level `router = APIRouter()`. The gateway mounts it at startup. It is imported **only if** the plugin is listed in `plugins.enabled` in `~/.hermes/config.yaml`; toggling it in the desktop panel is not enough.
-- **Desktop = full UI** (Chats, Board, Settings incl. numbers/pairing, rules, notifications, board, hours, automations). **Dashboard = board + chat (thread, reply, drafts) + numbers status/QR**; settings and automations are desktop only (the dashboard shows a hint).
+- **Desktop = full UI** (Chats, Board, Settings incl. numbers/pairing, rules, notifications, privacy, board, hours, automations). Per-number views: a header number switcher (All numbers = mixed, with the number's colour dot) plus one sidebar entry/route `/wa-board-<account id>` per WhatsApp number (registered dynamically from `/accounts`, so openable in a split tile; state is per route via `getScope`). **Dashboard = board + chat (thread, reply, drafts) + numbers status/QR**, with one number selector kept in `?account=<id>`; settings and automations are desktop only (the dashboard shows a hint).
 - **Live updates:** backend `WS /events` tails the `events` table (frames `{events, cursor}`; `?since=` cursor, none = start at tail; poll interval module global `_EVENT_POLL_SECONDS`). Desktop: `ctx.socket('/events', …)` invalidates React Query and raises native notifications per the notification settings. Dashboard: a `WebSocket` from `SDK.buildWsUrl(...)` bumps a refetch tick. Both halves **always** keep a polling fallback (5s), because `ctx.socket` is a no-op on OAuth remotes.
 - **Auth for the WS:** `_ws_upgrade_authorized` (delegates to the dashboard's `_ws_auth_ok`, accepts when it is not importable, e.g. in tests); unauthorized sockets close with 1008.
 
@@ -48,6 +48,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | `accounts.py` | accounts CRUD, desired state, restart, status/QR, service heartbeat/`service_info` (`running`, `installed`, `skill_installed`, `node`; `install_command` is always `None`, kept for compatibility), session/media paths |
 | `bridge.py` | tiny HTTP client to one bridge port (`bridge_request`, raises `BridgeUnavailable`) |
 | `conversations.py` | board, list, detail, state machine, mute/takeover/escalate/read/tags, search, timers (`run_timers`) |
+| `contacts.py` | LID→phone resolution, ignored/system/self JIDs, `apply_contact` (names), `repair_lid_conversations` |
 | `outbound.py` | `send_text`, `send_media`, drafts (`create_draft`, `approve_draft`, `discard_draft`) |
 | `ingest.py` | `ingest_event`: the rules engine for inbound/owner/history messages |
 | `media.py` | media listing and `data:` URLs (path-prefix guarded) |
@@ -63,11 +64,11 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 - New accounts get `session_dir = sessions/<id>` and the lowest free port ≥ 3017 (≠ 3000). Media dir `<data>/wa-media/<id>`, uploads `<data>/uploads/<account_id>/`.
 - All timestamps are integer unix seconds.
 
-### Schema v2 and migration
+### Schema v3 and migration
 
-`PRAGMA user_version = 2`, created in `db.connect()` (WAL). Tables: `accounts`, `account_status`, `service_status`, `settings`, `conversations`, `messages`, `conversation_state_log`, `events`, `automation_rules`, `automation_runs` (+ indexes). The full DDL is `SCHEMA` in `wa_core/db.py`.
+`PRAGMA user_version = 3`, created in `db.connect()` (WAL). Tables: `accounts`, `account_status`, `service_status`, `settings`, `conversations`, `messages`, `conversation_state_log`, `events`, `automation_rules`, `automation_runs` (+ indexes). The full DDL is `SCHEMA` in `wa_core/db.py`. v2→v3 (`_migrate_v2`) rebuilds `messages` (new status values and columns `delivered_at`, `read_at`, `remote_jid`); existing inbound rows get `read_at = ts`.
 
-- `messages.author`: `contact`, `user` (sent from the UI), `phone` (typed on the linked phone), `auto_reply` (WhatsApp Business away/greeting echo), `agent:<profile|default>`, `rule:<id>`, `cli`. `status` ∈ `received|pending|sent|failed|draft|discarded`; `source` ∈ `live|history`. Media meta: `{"mediaType", "media": [{"path","mime","name","size"}]}`.
+- `messages.author`: `contact`, `user` (sent from the UI), `phone` (typed on the linked phone), `auto_reply` (WhatsApp Business away/greeting echo), `agent:<profile|default>`, `rule:<id>`, `cli`. `status` ∈ `received|pending|sent|delivered|read|played|failed|draft|discarded` (outbound ticks advance monotonically via `STATUS_RANK`; `delivered_at`/`read_at` on outbound = when the contact's phone received/read it, on inbound = when we marked it read); `remote_jid` = raw WhatsApp chat JID the message travelled on (may be `@lid`); `source` ∈ `live|history`. Media meta: `{"mediaType", "media": [{"path","mime","name","size"}]}`.
 - Migration v1→v2 runs in `connect()` in one transaction when `user_version < 2`: a v1 `conversations` table (`chat_jid` primary key) becomes account 1 (`Main`, green, port 3017, `wa-session` dir) if real conversations or `wa-session/creds.json` exist, plus a `Demo` account for `@demo.invalid` chats; conversations, messages (in→author `contact`/status `received`, out→`user`/`sent`) and the state log are copied, old tables dropped. A fresh DB gets the schema directly with no accounts.
 - Paths: data dir = `plugins.plugin_storage.plugin_data_dir('hermes-whatsapp-chat')` (guarded import) with fallback `${HERMES_HOME:-~/.hermes}/plugin-data/hermes-whatsapp-chat`; DB = `$WA_ARCHIVE_DB` or `<data>/wa_board.db`.
 
@@ -97,6 +98,13 @@ Errors are `{"detail": str}`.
 
 One JSON row, key `global`, validated by the pydantic `Settings` model with defaults: `rules` (the five inbound/outbound policies above, `auto_reply_window_seconds`, `auto_close_waiting_days`), `notifications` (`new_conversation`, `every_inbound`, `escalation`, `quiet_hours`), `board` (`urgency_hours`, `mute_presets_hours`, `drop_mute_hours`, `closed_limit`), `hours` (timezone + weekly business hours), `automations` (`enabled`, `max_runs_per_conversation_per_hour`, `history_messages_in_prompt`), `media` (`max_upload_mb`). The model is the single source of truth for defaults and bounds.
 
+`privacy` (`send_read_receipts`, default true): opening a conversation in the UI (`POST /conversations/{id}/read` only; never CLI, agents or automations) sends WhatsApp read receipts through the bridge `POST /read`.
+
+### Contacts, receipts (`wa_core/contacts.py`, `outbound.py`)
+
+- Conversations are keyed by the contact's phone JID when the account session knows the LID→phone mapping (`lid-mapping-<lid>_reverse.json` in the session dir); unmapped LIDs stay `@lid` and show "Unknown contact". System chats (`0@s.whatsapp.net`, `status@broadcast`, broadcasts, newsletters, groups) and the own-number chat are never stored. The sidecar runs `contacts.repair_lid_conversations` every 30 s (rename or merge existing LID rows, delete system/self chats). Names come from history `contactName` and bridge `contacts.upsert/update` items (`contacts.apply_contact`, never overwrites an existing name).
+- Bridge `GET /updates` (patch 0002) feeds delivery receipts and contact items to `ingest.ingest_update`; receipts that arrive before the `wa_id` is stored are retried by the sidecar for 120 s.
+
 ### Events and automations
 
 - `events.emit(conn, type, ...)` **must be called inside the caller's `write_txn`**; every core mutation emits inside its own transaction. Types: `conversation.created`, `conversation.state_changed`, `conversation.updated`, `message.in`, `message.out`, `message.draft`, `message.status`, `account.status`, `automation.run`, `settings.updated`.
@@ -124,7 +132,7 @@ Subcommands: `run`, `install`, `uninstall`, `install-skill` (the three delegate 
 
 ### Bridge patches policy
 
-`plugin/sidecar/whatsapp-bridge/` is copied verbatim from Hermes (`scripts/whatsapp-bridge`) and **never edited by hand**. Local changes are versioned patches in `plugin/sidecar/patches/*.patch` (currently `0001-history-sync.patch`: `WHATSAPP_SYNC_HISTORY=off|recent|full` and `GET /history`). Refresh with `plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]` (stages in a temp dir, applies patches in order, fails without touching the vendored copy if one does not apply, rewrites `UPSTREAM`), then `npm ci --prefix plugin/sidecar/whatsapp-bridge`. Keep patches minimal. `node_modules/` stays gitignored (the scanner on install allows ≤400 files, ≤10 MB, ≤1 MB/file, no escaping symlinks).
+`plugin/sidecar/whatsapp-bridge/` is copied verbatim from Hermes (`scripts/whatsapp-bridge`) and **never edited by hand**. Local changes are versioned patches in `plugin/sidecar/patches/*.patch` (currently `0001-history-sync.patch`: `WHATSAPP_SYNC_HISTORY=off|recent|full` and `GET /history`; `0002-receipts-contacts.patch`: `GET /updates` receipts/contacts, history `contactName`, batch `POST /read`). Refresh with `plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]` (stages in a temp dir, applies patches in order, fails without touching the vendored copy if one does not apply, rewrites `UPSTREAM`), then `npm ci --prefix plugin/sidecar/whatsapp-bridge`. Keep patches minimal. `node_modules/` stays gitignored (the scanner on install allows ≤400 files, ≤10 MB, ≤1 MB/file, no escaping symlinks).
 
 ### CLI and skill
 

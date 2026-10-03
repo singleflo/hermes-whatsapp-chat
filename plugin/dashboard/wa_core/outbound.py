@@ -16,6 +16,13 @@ WA_JID_SUFFIXES = ("@s.whatsapp.net", "@lid")
 SEND_TIMEOUT_SECONDS = 70
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
 
+# Delivery order of an outbound message; a receipt only ever moves a message up this ladder.
+STATUS_RANK = {"pending": 0, "failed": 0, "sent": 1, "delivered": 2, "read": 3, "played": 4}
+# Baileys proto.WebMessageInfo.Status -> our status (ERROR 0 / PENDING 1 carry no receipt).
+RECEIPT_STATUS = {2: "sent", 3: "delivered", 4: "read", 5: "played"}
+READ_RECEIPT_BATCH = 200
+READ_RECEIPT_TIMEOUT_SECONDS = 10
+
 
 # --- Shared steps ------------------------------------------------------------------
 
@@ -259,3 +266,87 @@ def discard_draft(conn: sqlite3.Connection, message_id: int, *, now: int) -> dic
             payload={"status": "discarded"},
         )
     return conversations.get_message(conn, message_id)
+
+
+# --- Receipts ----------------------------------------------------------------------
+
+
+def apply_receipt(conn: sqlite3.Connection, account_id: int, item: dict, now: int) -> str:
+    """Apply one bridge delivery receipt. Returns ``"applied"``, ``"unmatched"`` (no such message yet) or ``"ignored"``."""
+    code = item.get("status")
+    target = RECEIPT_STATUS.get(code) if isinstance(code, int) else None
+    wa_id = item.get("id")
+    if target is None or not isinstance(wa_id, str) or not wa_id:
+        return "ignored"
+    try:
+        ts = int(item.get("ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0
+    if not 0 < ts <= now + 86400:
+        ts = now
+    with db.write_txn(conn):
+        row = conn.execute(
+            "SELECT id, conversation_id, account_id, status, delivered_at, read_at FROM messages"
+            " WHERE account_id = ? AND wa_id = ? AND direction = 'out'",
+            (account_id, wa_id),
+        ).fetchone()
+        if row is None:
+            return "unmatched"
+        current = STATUS_RANK.get(row["status"])
+        if current is None or current >= STATUS_RANK[target]:
+            return "ignored"
+        delivered_at = row["delivered_at"] or (ts if target in ("delivered", "read", "played") else None)
+        read_at = row["read_at"] or (ts if target in ("read", "played") else None)
+        conn.execute(
+            "UPDATE messages SET status = ?, delivered_at = ?, read_at = ?, error = NULL WHERE id = ?",
+            (target, delivered_at, read_at, row["id"]),
+        )
+        events.emit(
+            conn,
+            "message.status",
+            now=now,
+            account_id=row["account_id"],
+            conversation_id=row["conversation_id"],
+            message_id=row["id"],
+            payload={"status": target},
+        )
+    return "applied"
+
+
+def _mark_read(conn: sqlite3.Connection, ids: list[int], now: int) -> None:
+    with db.write_txn(conn):
+        conn.executemany("UPDATE messages SET read_at = ? WHERE id = ?", [(now, i) for i in ids])
+
+
+def send_read_receipts(conn: sqlite3.Connection, conversation_id: int, *, now: int) -> int:
+    """Send WhatsApp read receipts (blue ticks) for the conversation's unread live inbound messages.
+
+    Only the human UI route calls this. Returns the number of messages receipted; rows that could not be
+    receipted keep ``read_at IS NULL`` and are retried on the next call.
+    """
+    try:
+        conv, account = _prepare(conn, conversation_id)
+    except errors.WaError:
+        return 0
+    rows = conn.execute(
+        "SELECT id, wa_id, remote_jid FROM messages WHERE conversation_id = ? AND direction = 'in'"
+        " AND source = 'live' AND wa_id IS NOT NULL AND read_at IS NULL ORDER BY ts, id LIMIT ?",
+        (conversation_id, READ_RECEIPT_BATCH),
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [r["id"] for r in rows]
+    if not settings.get_settings(conn).privacy.send_read_receipts:
+        _mark_read(conn, ids, now)
+        return 0
+    keys = [{"remoteJid": r["remote_jid"] or conv["chat_jid"], "id": r["wa_id"], "fromMe": False} for r in rows]
+    try:
+        status, data = bridge.bridge_request(
+            int(account["port"]), "POST", "/read", {"keys": keys}, timeout=READ_RECEIPT_TIMEOUT_SECONDS
+        )
+    except bridge.BridgeUnavailable:
+        return 0
+    if status != 200 or not isinstance(data, dict) or not data.get("success") or not data.get("marked"):
+        return 0
+    _mark_read(conn, ids, now)
+    return len(ids)

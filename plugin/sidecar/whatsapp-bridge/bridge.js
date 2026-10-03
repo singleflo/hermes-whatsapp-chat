@@ -284,6 +284,33 @@ const historyQueue = [];
 const MAX_HISTORY_QUEUE_SIZE = 50000;
 const HISTORY_DRAIN_MAX = 1000;
 
+// Delivery receipts and contact names, drained by GET /updates.
+const updatesQueue = [];
+const MAX_UPDATES_QUEUE_SIZE = 5000;
+const UPDATES_DRAIN_MAX = 1000;
+
+function pushUpdate(item) {
+  updatesQueue.push(item);
+  if (updatesQueue.length > MAX_UPDATES_QUEUE_SIZE) {
+    updatesQueue.splice(0, updatesQueue.length - MAX_UPDATES_QUEUE_SIZE);
+  }
+}
+
+function pushContact(c) {
+  if (!c) return;
+  const id = c.id || null;
+  const item = {
+    type: 'contact',
+    jid: id,
+    lid: c.lid || (id && id.endsWith('@lid') ? id : null),
+    pn: c.phoneNumber || (id && id.endsWith('@s.whatsapp.net') ? id : null),
+    name: c.name || null,
+    notify: c.notify || null,
+    verifiedName: c.verifiedName || null,
+  };
+  if (item.name || item.notify || item.verifiedName) pushUpdate(item);
+}
+
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
 //   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
@@ -530,7 +557,20 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.update', async (updates) => {
+    // Delivery/read receipts for messages we sent (peer receipts have fromMe true).
     for (const { key, update } of updates || []) {
+      if (
+        typeof update?.status === 'number' && update.status >= 2 &&
+        key?.fromMe && key?.id && /@(s\.whatsapp\.net|lid)$/.test(key.remoteJid || '')
+      ) {
+        pushUpdate({
+          type: 'receipt',
+          id: key.id,
+          chatId: key.remoteJid,
+          status: update.status,
+          ts: Number(update.messageTimestamp) || Math.floor(Date.now() / 1000),
+        });
+      }
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -579,6 +619,10 @@ async function startSocket() {
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
     }
   });
+
+  // Contact names (always on: also names conversations created from live messages).
+  sock.ev.on('contacts.upsert', (cs) => (cs || []).forEach(pushContact));
+  sock.ev.on('contacts.update', (cs) => (cs || []).forEach(pushContact));
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
@@ -858,16 +902,30 @@ async function startSocket() {
   if (SYNC_HISTORY !== 'off') {
     // History sync (initial pairing sync; Baileys emits it once per link).
     // `messages` are WAMessage objects, newest first; queued for GET /history.
-    sock.ev.on('messaging-history.set', async ({ messages, syncType, isLatest, progress }) => {
+    sock.ev.on('messaging-history.set', async ({ messages, contacts, syncType, isLatest, progress }) => {
       const botIds = Array.from(new Set([
         normalizeWhatsAppId(sock.user?.id),
         normalizeWhatsAppId(sock.user?.lid),
       ].filter(Boolean)));
+      const names = new Map();
+      for (const c of contacts || []) {
+        const name = c.name || c.notify || c.verifiedName;
+        if (name) {
+          for (const id of [c.id, c.lid, c.phoneNumber]) {
+            if (id) names.set(id, name);
+          }
+        }
+        pushContact(c);
+      }
       let queued = 0;
       for (const msg of messages || []) {
         try {
           const event = await buildHistoryEvent(msg, botIds);
           if (!event) continue;
+          event.contactName = names.get(msg.key.remoteJid)
+            || names.get(msg.key.remoteJidAlt)
+            || (!msg.key.fromMe && msg.pushName)
+            || null;
           historyQueue.push(event);
           queued += 1;
         } catch (err) {
@@ -1176,10 +1234,8 @@ app.post('/read', async (req, res) => {
     return res.status(503).json({ error: 'Not connected' });
   }
 
-  const receiptKeys = inboundReadReceiptKeys({
-    key: req.body?.key,
-    enabled: SEND_READ_RECEIPTS,
-  });
+  const rawKeys = Array.isArray(req.body?.keys) ? req.body.keys : [req.body?.key];
+  const receiptKeys = rawKeys.flatMap(key => inboundReadReceiptKeys({ key, enabled: SEND_READ_RECEIPTS }));
   if (receiptKeys.length === 0) {
     return res.json({ success: true, marked: false });
   }
@@ -1224,6 +1280,7 @@ app.get('/health', (req, res) => {
     status: connectionState,
     queueLength: messageQueue.length,
     historyQueueLength: historyQueue.length,
+    updatesQueueLength: updatesQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
@@ -1239,6 +1296,15 @@ app.get('/history', (req, res) => {
     ? Math.min(requested, HISTORY_DRAIN_MAX)
     : HISTORY_DRAIN_MAX;
   res.json(historyQueue.splice(0, limit));
+});
+
+// Delivery receipts and contact names (drained, same limit parsing as /history).
+app.get('/updates', (req, res) => {
+  const requested = parseInt(String(req.query.limit ?? ''), 10);
+  const limit = Number.isFinite(requested) && requested > 0
+    ? Math.min(requested, UPDATES_DRAIN_MAX)
+    : UPDATES_DRAIN_MAX;
+  res.json(updatesQueue.splice(0, limit));
 });
 
 // Start

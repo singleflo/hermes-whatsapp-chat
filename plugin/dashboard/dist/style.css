@@ -81,6 +81,15 @@
   color: initial;
 }
 
+.wab-ticks {
+  white-space: nowrap;
+  letter-spacing: -0.15em;
+}
+
+.wab-ticks--read {
+  color: var(--color-primary);
+}
+
 .wab-link {
   color: var(--color-foreground);
   text-decoration: underline;

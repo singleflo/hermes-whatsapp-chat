@@ -13,7 +13,7 @@
   const fetchJSON = SDK.fetchJSON
   const API = '/api/plugins/hermes-whatsapp-chat'
   // Bump together with API_VERSION in wa_core/service.py: the UI is newer than a backend that reports less.
-  const REQUIRED_API_VERSION = 3
+  const REQUIRED_API_VERSION = 4
   const RESTART_TITLE = 'Restart the Hermes dashboard to finish installing or updating WhatsApp Chat'
   const SERVICE_START_TIMEOUT_MS = 30000
 
@@ -155,7 +155,13 @@
     return fetchJSON(API + path, init)
   }
 
-  const convName = c => c.contact_name || (c.phone ? '+' + String(c.phone).replace(/^\+/, '') : c.chat_jid)
+  const convName = c =>
+    c.contact_name ||
+    (c.phone
+      ? '+' + String(c.phone).replace(/^\+/, '')
+      : /@lid$/.test(c.chat_jid || '')
+        ? 'Unknown contact'
+        : c.chat_jid)
 
   function dotClass(color) {
     return 'wab-dot wab-dot--' + (/^[a-z]+$/.test(String(color)) ? color : 'blue')
@@ -187,20 +193,41 @@
     return a
   }
 
-  function statusLabel(m) {
+  // Delivery ticks like WhatsApp: ✓ sent, ✓✓ delivered, coloured ✓✓ read/played. Imported history shows none.
+  function tickInfo(m) {
+    if (m.source === 'history') {
+      return null
+    }
+    const sent = 'Sent ' + fmtTime(m.ts)
     if (m.status === 'pending') {
-      return 'Sending…'
+      return { text: 'Sending…', cls: '', title: 'Sending' }
     }
     if (m.status === 'sent') {
-      return 'Sent'
+      return { text: '✓', cls: '', title: sent }
+    }
+    if (m.status === 'delivered' || m.status === 'read' || m.status === 'played') {
+      const read = m.status !== 'delivered'
+      return {
+        text: '✓✓',
+        cls: read ? 'wab-ticks--read' : '',
+        title:
+          sent +
+          (m.delivered_at ? ' · Delivered ' + fmtTime(m.delivered_at) : '') +
+          (read && m.read_at ? ' · ' + (m.status === 'played' ? 'Played ' : 'Read ') + fmtTime(m.read_at) : '')
+      }
     }
     if (m.status === 'failed') {
-      return 'Failed'
+      return { text: 'Failed', cls: '', title: 'Failed' }
     }
     if (m.status === 'draft') {
-      return 'Draft'
+      return { text: 'Draft', cls: '', title: 'Draft' }
     }
-    return ''
+    return null
+  }
+
+  function Ticks({ m }) {
+    const info = tickInfo(m)
+    return info ? h('span', { className: 'wab-ticks ' + info.cls, title: info.title }, info.text) : null
   }
 
   function colorLuminance(css) {
@@ -382,7 +409,6 @@
       h(
         'div',
         { className: 'wab-row wab-toolbar' },
-        h(AccountSelect, { accounts: app.accounts, value: app.accountId, onChange: app.setAccountId }),
         h(SearchForm, { placeholder: 'Search name or phone', onSearch: setQuery }),
         h(
           Button,
@@ -437,6 +463,7 @@
           { className: 'wab-grow wab-ellipsis wab-muted wab-small' },
           card.has_draft ? h('em', { className: 'wab-draft-mark' }, 'Draft · ') : null,
           card.last_message_direction === 'out' ? 'You: ' : '',
+          card.last_message_status ? [h(Ticks, { key: 'ticks', m: { status: card.last_message_status } }), ' '] : null,
           card.last_message_preview
         ),
         h(Badge, { tone: 'outline' }, stateLabel(card.state))
@@ -503,7 +530,7 @@
         { className: 'wab-msg-meta wab-muted' },
         fmtTime(m.ts),
         m.source === 'history' ? ' · imported' : '',
-        m.direction === 'out' && statusLabel(m) ? ' · ' + statusLabel(m) : ''
+        m.direction === 'out' ? [' · ', h(Ticks, { key: 'ticks', m })] : null
       ),
       failed && m.error ? h('div', { className: 'wab-error wab-small' }, m.error) : null,
       failed && m.body && canSend
@@ -848,6 +875,10 @@
     const items = list.data ? list.data.conversations : []
     const total = list.data ? list.data.total : 0
 
+    useEffect(() => {
+      setLimit(50)
+    }, [app.accountId])
+
     return h(
       'div',
       { className: 'wab-chats' },
@@ -857,14 +888,6 @@
         h(
           'div',
           { className: 'wab-list-head' },
-          h(AccountSelect, {
-            accounts: app.accounts,
-            value: app.accountId,
-            onChange: v => {
-              app.setAccountId(v)
-              setLimit(50)
-            }
-          }),
           h(SearchForm, {
             placeholder: 'Search name or phone',
             onSearch: v => {
@@ -1470,7 +1493,7 @@
   function App() {
     const [tab, setTab] = useState('board')
     const [selectedId, setSelectedId] = useState(null)
-    const [accountId, setAccountId] = useState('')
+    const [accountId, setAccountId] = useState(() => new URLSearchParams(window.location.search).get('account') || '')
     const [tick, setTick] = useState(0)
     const { showToast, toast } = useToast()
     const accounts = useApi('/accounts', tick)
@@ -1486,6 +1509,34 @@
       },
       []
     )
+
+    // Keep the selected number in ?account=<id> (the host manages its own params such as `profile`).
+    useEffect(() => {
+      const params = new URLSearchParams(window.location.search)
+      if (accountId) {
+        params.set('account', accountId)
+      } else {
+        params.delete('account')
+      }
+      const query = params.toString()
+      if (query !== window.location.search.replace(/^\?/, '')) {
+        window.history.replaceState(
+          window.history.state,
+          '',
+          window.location.pathname + (query ? '?' + query : '') + window.location.hash
+        )
+      }
+    }, [accountId])
+
+    // Forget a selected number that no longer exists.
+    useEffect(() => {
+      if (accounts.data && accountId) {
+        const known = (accounts.data.accounts || []).some(a => String(a.id) === String(accountId))
+        if (!known) {
+          setAccountId('')
+        }
+      }
+    }, [accounts.data, accountId])
 
     useEffect(() => {
       let disposed = false
@@ -1616,6 +1667,9 @@
           TABS.map(([id, label]) =>
             h(Button, { key: id, size: 'sm', ghost: tab !== id, onClick: () => setTab(id) }, label)
           ),
+          tab !== 'numbers'
+            ? h(AccountSelect, { accounts: accountList, value: accountId, onChange: setAccountId })
+            : null,
           serviceKnown
             ? h(
                 Badge,

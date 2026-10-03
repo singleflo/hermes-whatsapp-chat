@@ -57,6 +57,7 @@ PAIR_STALE_SECONDS = 60.0  # no QR event from the pairing process for this long:
 PAIR_EXIT_GRACE_SECONDS = 15.0  # pairing process lingering after "connected"
 TIMERS_EVERY_SECONDS = 30.0
 MAX_PENDING = 5000
+RECEIPT_RETRY_SECONDS = 120.0  # a receipt may beat the backend storing the wa_id returned by /send
 HISTORY_INGEST_PER_TICK = 300
 HTTP_TIMEOUT = 5.0
 AUTOMATION_THREADS = 2
@@ -195,6 +196,7 @@ def bridge_env(account: dict) -> dict[str, str]:
         "HERMES_DOCUMENT_CACHE_DIR": str(media / "document"),
         "HERMES_AUDIO_CACHE_DIR": str(media / "audio"),
         "WHATSAPP_SYNC_HISTORY": str(account.get("history_mode") or "recent"),
+        "WHATSAPP_SEND_READ_RECEIPTS": "true",  # bridge gate; the privacy setting decides whether /read is called
     }
 
 
@@ -228,6 +230,9 @@ class Runner:
         self.history_supported = True
         self.live_pending: deque[dict] = deque()
         self.history_pending: deque[dict] = deque()
+        self.updates_supported = True
+        self.updates_pending: deque[dict] = deque()
+        self.unmatched: deque[tuple[float, dict]] = deque()
         # pairing
         self.events: queue.Queue = queue.Queue()
         self.qr: str | None = None
@@ -310,9 +315,45 @@ class Runner:
             pending.popleft()
             done += 1
 
+    def _apply_updates(self, conn: sqlite3.Connection) -> None:
+        # A delivery receipt can arrive before the backend stored the wa_id returned by /send: retry briefly.
+        if self.unmatched:
+            mono = time.monotonic()
+            retry, self.unmatched = self.unmatched, deque()
+            for seen_at, item in retry:
+                if mono - seen_at >= RECEIPT_RETRY_SECONDS:
+                    continue
+                try:
+                    result = core.ingest.ingest_update(conn, self.id, item, int(time.time()))
+                except sqlite3.Error as exc:
+                    log(f"account {self.id}: db error, keeping receipt for retry: {exc}")
+                    self.unmatched.append((seen_at, item))
+                    continue
+                except Exception as exc:
+                    log(f"account {self.id}: dropping malformed update: {exc}")
+                    continue
+                if result == "unmatched":
+                    self.unmatched.append((seen_at, item))
+        while self.updates_pending:
+            item = self.updates_pending[0]
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError(f"not an object: {type(item).__name__}")
+                result = core.ingest.ingest_update(conn, self.id, item, int(time.time()))
+            except sqlite3.Error as exc:
+                log(f"account {self.id}: db error, keeping {len(self.updates_pending)} updates pending: {exc}")
+                return
+            except Exception as exc:
+                log(f"account {self.id}: dropping malformed update: {exc}")
+                result = "ignored"
+            if result == "unmatched":
+                self.unmatched.append((time.monotonic(), item))
+            self.updates_pending.popleft()
+
     def drain(self, conn: sqlite3.Connection) -> None:
         self._ingest(conn, self.live_pending, len(self.live_pending))
         self._ingest(conn, self.history_pending, HISTORY_INGEST_PER_TICK)
+        self._apply_updates(conn)
 
     def _extend(self, pending: deque[dict], events: list, label: str) -> None:
         pending.extend(events)
@@ -332,6 +373,8 @@ class Runner:
             self.stop(mono)
             self.live_pending.clear()
             self.history_pending.clear()
+            self.updates_pending.clear()
+            self.unmatched.clear()
             if self.dying:
                 return {"state": "stopped"}
             self._wipe_session(account)
@@ -547,6 +590,7 @@ class Runner:
             self.spawned_at = mono
             self.unreachable_since = mono
             self.history_supported = True
+            self.updates_supported = True
             log(f"account {self.id}: bridge started on port {account['port']} (pid {self.proc.pid})")
             return {"state": "starting", "pid": self.proc.pid, "error": self.error}
         return self._poll_bridge(account, mono)
@@ -580,6 +624,12 @@ class Runner:
                     self.history_supported = False  # unpatched bridge: no history endpoint
                 elif status == 200 and isinstance(events, list):
                     self._extend(self.history_pending, events, "history")
+            if self.updates_supported:
+                status, items = core.bridge.bridge_request(port, "GET", "/updates?limit=1000", timeout=HTTP_TIMEOUT)
+                if status == 404:
+                    self.updates_supported = False  # bridge without patch 0002: no receipts/contacts
+                elif status == 200 and isinstance(items, list):
+                    self._extend(self.updates_pending, items, "update")
             status, health = core.bridge.bridge_request(port, "GET", "/health", timeout=HTTP_TIMEOUT)
         except (core.bridge.BridgeUnavailable, OSError):
             if self.unreachable_since is None:
@@ -716,6 +766,15 @@ class Supervisor:
                 core.conversations.run_timers(conn, now)
             except sqlite3.Error as exc:
                 log(f"timers: db error: {exc}")
+            for account in rows:
+                if account["desired"] == "removed":
+                    continue
+                try:
+                    core.contacts.repair_lid_conversations(conn, account["id"], now)
+                except sqlite3.Error as exc:
+                    log(f"repair: db error: {exc}")
+                except Exception as exc:
+                    log(f"account {account['id']}: repair failed: {exc!r}")
         self._automations()
 
     def _finish(self, runners: list[Runner]) -> None:

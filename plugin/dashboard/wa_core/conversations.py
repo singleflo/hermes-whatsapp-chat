@@ -33,6 +33,7 @@ _LAST_ID = (
 _CARD_SELECT = (
     "SELECT c.*, a.label AS account_label, a.color AS account_color,"
     " lm.body AS lm_body, lm.direction AS lm_direction, lm.author AS lm_author, lm.meta AS lm_meta,"
+    " lm.status AS lm_status, lm.source AS lm_source,"
     " EXISTS(SELECT 1 FROM messages d WHERE d.conversation_id = c.id AND d.status = 'draft') AS has_draft"
     " FROM conversations c LEFT JOIN accounts a ON a.id = c.account_id"
     f" LEFT JOIN messages lm ON lm.id = {_LAST_ID}"
@@ -95,6 +96,7 @@ def _card(row: sqlite3.Row, now: int, urgency_hours: int) -> dict[str, Any]:
         "last_message_preview": _preview(row),
         "last_message_direction": row["lm_direction"],
         "last_message_author": row["lm_author"],
+        "last_message_status": row["lm_status"] if row["lm_direction"] == "out" and row["lm_source"] == "live" else None,
         "last_message_at": last_at,
         "age_seconds": age,
         "unread_count": row["unread_count"],
@@ -115,6 +117,8 @@ def message_dict(row: sqlite3.Row) -> dict[str, Any]:
         "body": row["body"],
         "ts": row["ts"],
         "status": row["status"],
+        "delivered_at": row["delivered_at"],
+        "read_at": row["read_at"],
         "source": row["source"],
         "wa_id": row["wa_id"],
         "error": row["error"],
