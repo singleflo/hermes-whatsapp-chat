@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Repository of `hermes-whatsapp-chat` v2, a Hermes plugin **installed from git with no terminal steps** (`singleflo/hermes-whatsapp-chat#plugin`): a multi-number WhatsApp chat (desktop UI + web dashboard) with a kanban board, conversation rules and an automation/dispatcher layer, shipped as **one unified Hermes plugin** (desktop UI + web dashboard UI + Python FastAPI backend) plus an **independent WhatsApp channel** (`plugin/sidecar/`: vendored Baileys bridge, one per number, supervised by a LaunchAgent service; never Hermes' native WhatsApp). The plugin owns its SQLite DB, renders conversations, applies the rules, sends replies and runs automations. Hermes itself can operate the chat through a CLI (`plugin/scripts/wa.py`, wrapped as `<data>/bin/wa`) and a skill (template `plugin/skill/whatsapp-chat/`). Everything needed at runtime lives under `plugin/`; the repo root holds dev-only files.
+Repository of `hermes-whatsapp-chat` v2, a Hermes plugin **installed from git with no terminal steps** (`singleflo/hermes-whatsapp-chat#plugin`): a multi-number WhatsApp chat (desktop UI + web dashboard) with a kanban board, conversation rules and an automation/dispatcher layer, shipped as **one unified Hermes plugin** (desktop UI + web dashboard UI + Python FastAPI backend) plus an **independent WhatsApp channel** (`plugin/sidecar/`: vendored Baileys bridge, one per number, supervised by a self-installing background service on macOS, Linux and Windows; never Hermes' native WhatsApp). The plugin owns its SQLite DB, renders conversations, applies the rules, sends replies and runs automations. Hermes itself can operate the chat through a CLI (`plugin/scripts/wa.py`, wrapped as `<data>/bin/wa`) and a skill (template `plugin/skill/whatsapp-chat/`). Everything needed at runtime lives under `plugin/`; the repo root holds dev-only files.
 
 `README.md` is the user-facing presentation (install, usage, architecture). `docs/` is the original build kit (Hermes SDK notes, kanban case study, TDD notes); `docs/08-spec-wa-board.md` is the v1 spec and is **superseded** by this file and the code.
 
@@ -16,11 +16,11 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
               └──────────────┬──────────────────────┘
                              ▼  /api/plugins/hermes-whatsapp-chat/
         plugin/dashboard/plugin_api.py  (thin routes + WS /events; exposes module attr `core`)
-                             │ core = plugin/dashboard/wa_core/ package (incl. service.py: launchers, LaunchAgent, skill)
+                             │ core = plugin/dashboard/wa_core/ package (incl. service.py: launchers, background service, skill)
                              ▼
         SQLite DB  <data>/wa_board.db   ◀── control plane: desired state, status, QR, heartbeat
                              ▲
-        plugin/sidecar/wa_channel.py (LaunchAgent it.fl1.hermes-whatsapp-chat.channel, reconcile every 1 s)
+        plugin/sidecar/wa_channel.py (LaunchAgent / systemd user unit / Windows supervise.py, reconcile every 1 s)
           ├─ one Baileys bridge per account (own port + session dir)  ──▶ WhatsApp
           ├─ QR pairing subprocess (node bridge.js --pair-only --pair-json)
           ├─ npm bootstrap of bridge node_modules when missing (log: <data>/logs/npm.log)
@@ -55,7 +55,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | `events.py` | `emit()`: inserts an `events` row and enqueues matching automation runs |
 | `automations.py` | rule matching, run queue, executor (`process_due`), action types |
 | `automations_api.py` | `router` with the automation routes, included by `plugin_api.py` |
-| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`, `install_skill`/`uninstall_skill`, `service_installed`, `skill_installed`, `find_node`. All subprocess calls go through `_run(argv)` (test seam) |
+| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`/`ensure_service`, `install_skill`/`uninstall_skill`, `service_installed`, `auto_install_enabled`, `linger_enabled`, `skill_installed`, `find_node`, `API_VERSION` (5). Subprocess calls go through `_run(argv, env=None)`, the Windows start through `_spawn` (test seams) |
 
 ### Multi-account model
 
@@ -116,19 +116,23 @@ One JSON row, key `global`, validated by the pydantic `Settings` model with defa
 
 The UI buttons (**Install service**, **Reinstall**, **Uninstall service**, **Install skill**, **Remove skill**) call the `/service/*` and `/skill/*` routes, which call `service.py`; the sidecar subcommands `install`, `uninstall`, `install-skill` delegate to the same functions (dev CLI = UI behaviour). Everything is derived at runtime from file locations (`plugin_dir()` = parents of `service.py`: `wa_core` → `dashboard` → plugin dir), never hardcoded and never the repo root.
 
-- **Runtime interpreter.** Hermes' runtime Python is not a plain venv, and the dashboard backend's own `sys.executable` + `sys.path` is the only interpreter known to have fastapi/pydantic. `write_launchers` therefore writes `<data>/bin/hwc-python` (0755): a shell script that exports `PYTHONPATH` (the installing process's existing `sys.path` dirs, shell-quoted) and `HERMES_HOME`, then `exec`s that `sys.executable`. `<data>/bin/wa` runs `hwc-python <plugin>/scripts/wa.py "$@"`. There is no repo `.venv` at runtime and no repo checkout. **Install service** must therefore run inside the dashboard backend (or be reinstalled after a Hermes update replaces the interpreter).
-- **LaunchAgent.** `install_service` writes `~/Library/LaunchAgents/it.fl1.hermes-whatsapp-chat.channel.plist` (ProgramArguments `[<data>/bin/hwc-python, <plugin>/sidecar/wa_channel.py, run]`, env `WA_NODE`, `HERMES_HOME`, `PATH` with the node dir first, `WA_ARCHIVE_DB` if set; WorkingDirectory = plugin dir; RunAtLoad, KeepAlive, ThrottleInterval 10; logs to `<data>/logs/channel.log`), then `launchctl bootout` (ignored) and `launchctl bootstrap`. Missing node or a launchctl failure raises `Unavailable`. `find_node` checks `WA_NODE`, then `PATH` plus `~/.local/bin`, `~/.hermes/node/bin`, `/opt/homebrew/bin`, `/usr/local/bin` (LaunchAgents get a minimal PATH).
+- **Runtime interpreter.** Hermes' runtime Python is not a plain venv, and the dashboard backend's own `sys.executable` + `sys.path` is the only interpreter known to have fastapi/pydantic. `write_launchers` therefore writes `<data>/bin/hwc-python` (0755): a shell script that exports `PYTHONPATH` (the installing process's existing `sys.path` dirs, shell-quoted) and `HERMES_HOME`, then `exec`s that `sys.executable`. `<data>/bin/wa` runs `hwc-python <plugin>/scripts/wa.py "$@"`. There is no repo `.venv` at runtime and no repo checkout. The install runs inside the Hermes backend (automatically at start, see "Install / update lifecycle").
+- **Platform dispatch.** `_platform()` (= `sys.platform`, test seam) selects the backend: `darwin` launchd, `linux*` systemd, `win32` Windows; anything else → `Unavailable("The background service needs macOS, Linux (systemd) or Windows")` (`ensure_service` → `"unsupported"`). `service_installed()` = plist / unit / startup entry exists. `GET /service` also reports `platform`, `linger` (Linux: `/var/lib/systemd/linger/<user>` exists, else `None`) and `auto_install` (no opt-out file). File locks (`_acquire_lock`/`_release_lock`) branch on the real `sys.platform` (`msvcrt` / `fcntl`).
+- **macOS (LaunchAgent).** `install_service` writes `~/Library/LaunchAgents/it.fl1.hermes-whatsapp-chat.channel.plist` (ProgramArguments `[<data>/bin/hwc-python, <plugin>/sidecar/wa_channel.py, run]`, env `WA_NODE`, `HERMES_HOME`, `PATH` with the node dir first, `WA_ARCHIVE_DB` if set; WorkingDirectory = plugin dir; RunAtLoad, KeepAlive, ThrottleInterval 10; logs to `<data>/logs/channel.log`), then `launchctl bootout` (ignored) and `launchctl bootstrap`. Missing node or a launchctl failure raises `Unavailable`. `find_node` checks `WA_NODE`, then `PATH` plus `~/.local/bin`, `~/.hermes/node/bin`, Hermes-managed `<hermes home>/tools/node-*` (`bin/` or the root dir), `/opt/homebrew/bin`, `/usr/local/bin` (services get a minimal PATH).
+- **Linux (systemd user unit).** `~/.config/systemd/user/hermes-whatsapp-chat-channel.service` (quoted values, `%` → `%%`; `Restart=always`, `RestartSec=10`, `WantedBy=default.target`, logs appended to `channel.log`), then `loginctl enable-linger <user>` when lingering is off (ignored), `systemctl --user daemon-reload`, `enable`, `restart`. `systemctl` runs with `_systemd_env()`, which repairs `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` from `/run/user/<uid>` so it works from a backend started over SSH. No systemd → `Unavailable`. Uninstall: `disable --now`, delete the unit, `daemon-reload`.
+- **Windows (Startup-folder launcher).** `hwc-python.cmd` / `wa.cmd` replace the POSIX launchers (`%` doubled; `python.exe` rather than `pythonw.exe` so node children share one hidden console). The service is `%APPDATA%\...\Startup\hermes-whatsapp-chat-channel.vbs` (UTF-16, CRLF): sets the environment and runs `python.exe supervise.py wa_channel.py <data>` hidden through `wscript.exe`. `supervise.py` (stdlib only) holds `<data>/bin/channel.lock`, appends output to `channel.log` and respawns `wa_channel.py run` after 10 s unless it exits 3. Stop = write `<data>/bin/channel.stop`, wait (≤20 s) until the channel lock is free, delete the marker; start = detached `wscript.exe //B //Nologo <entry>` (`CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB`, retried without breakaway). No Windows host is available here: covered by tests only.
+- **Opt-out.** Uninstall writes `<data>/service-disabled`; `ensure_service` then never reinstalls until **Install service** deletes it.
 - **Skill.** `install_skill` renders `plugin/skill/whatsapp-chat/SKILL.md`, replacing the token `{{WA_CLI}}` with the absolute `<data>/bin/wa`, into `<hermes home>/skills/whatsapp-chat/SKILL.md`. Never hardcode absolute command paths in the template; use `{{WA_CLI}}`. The `{wa_cli}` automation template is also `<data>/bin/wa` (launchers are written lazily if missing).
 
 ### Sidecar (`plugin/sidecar/wa_channel.py`)
 
-One supervisor loop (every 1 s) per LaunchAgent `it.fl1.hermes-whatsapp-chat.channel`: writes the service heartbeat, reconciles each `kind='whatsapp'` account by `desired` (running: not paired → pairing subprocess, QR rendered with `segno` into `account_status.qr_svg`; paired → bridge process `node bridge.js --session <path> --mode bot --port <port>`; stopped → stop; logged_out → stop + delete session; removed → stop + delete + `finalize_removed`), restarts on `restart_requested_at`, polls each bridge's `/messages` and `/history` into `core.ingest`, reads `/health`, runs timers every 30 s and `automations.process_due` on a 2-thread pool so ingest never blocks. The UI treats a heartbeat older than 15 s as "service not running". The control plane is the DB: **no HTTP port for control**.
+One supervisor loop (every 1 s) per service (LaunchAgent `it.fl1.hermes-whatsapp-chat.channel`, systemd user unit `hermes-whatsapp-chat-channel.service`, or the Windows Startup launcher): writes the service heartbeat, reconciles each `kind='whatsapp'` account by `desired` (running: not paired → pairing subprocess, QR rendered with `segno` into `account_status.qr_svg`; paired → bridge process `node bridge.js --session <path> --mode bot --port <port>`; stopped → stop; logged_out → stop + delete session; removed → stop + delete + `finalize_removed`), restarts on `restart_requested_at`, polls each bridge's `/messages` and `/history` into `core.ingest`, reads `/health`, runs timers every 30 s and `automations.process_due` on a 2-thread pool so ingest never blocks. The UI treats a heartbeat older than 15 s as "service not running". The control plane is the DB: **no HTTP port for control**. `wa_channel.py` must import on every OS (no `os.getuid()` at import outside macOS).
 
 - **Plugin dir** is derived from `__file__` (`Path(__file__).resolve().parents[1]`); it loads `<plugin>/dashboard/plugin_api.py` by path.
 - **Vendored segno.** `plugin/sidecar/_vendor/segno/` (segno 1.6.6, BSD, LICENSE inside) so no Python dependency is needed. `wa_channel.py` inserts `<plugin>/sidecar/_vendor` at `sys.path[0]` before importing segno; nothing else may import it that way. Do not edit the vendored copy.
 - **npm bootstrap.** Hermes updates re-clone the plugin folder, so `node_modules` is never shipped (gitignored). On start and on each precondition recheck, if `whatsapp-bridge/node_modules` is missing the sidecar runs `npm ci --omit=dev --no-audit --no-fund` in the bridge dir, using the npm next to the node binary (`Path(node).resolve().parent / "npm"`, fallback `which npm`), logging to `<data>/logs/npm.log`. While it runs, accounts show state `starting` with no error; on failure accounts show `error` "Bridge dependencies failed to install (see logs/npm.log)".
 
-Subcommands: `run`, `install`, `uninstall`, `install-skill` (the three delegate to `core.service`), `status` (service + accounts). Pairing is in the UI; there is no `pair` subcommand.
+Subcommands: `run`, `install`, `uninstall`, `install-skill` (the three delegate to `core.service`), `status` (service + accounts). Pairing is in the UI; there is no `pair` subcommand. `run` exits with `STOP_EXIT` (3) when stopped (Windows stop marker) or uninstalled: `supervise.py` does not restart on 3.
 
 ### Bridge patches policy
 
@@ -154,7 +158,7 @@ Use only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI (
 | Path | Purpose |
 |---|---|
 | `plugin/` | Everything installed by Hermes as `~/.hermes/plugins/hermes-whatsapp-chat/`: `plugin.yaml`, `__init__.py` (no-op register), `dashboard/{manifest.json, plugin_api.py, wa_core/, dist/{index.js,style.css}}`, `desktop/plugin.js`, `sidecar/`, `scripts/`, `skill/` |
-| `plugin/sidecar/` | Independent WhatsApp channel: `wa_channel.py`, `whatsapp-bridge/` (vendored Baileys bridge, see `UPSTREAM`), `patches/`, `update_bridge.sh`, `_vendor/segno/` (vendored QR library) |
+| `plugin/sidecar/` | Independent WhatsApp channel: `wa_channel.py`, `supervise.py` (Windows keep-alive), `whatsapp-bridge/` (vendored Baileys bridge, see `UPSTREAM`), `patches/`, `update_bridge.sh`, `_vendor/segno/` (vendored QR library) |
 | `plugin/scripts/wa.py` | CLI for Hermes agents and humans |
 | `plugin/scripts/seed_demo.py` | Demo data in a `kind='demo'` account (`--reset` / `--remove`); demo chats are `@demo.invalid` |
 | `plugin/skill/whatsapp-chat/` | Skill **template** teaching agents the CLI (`{{WA_CLI}}` token; rendered by Install skill) |
@@ -190,7 +194,7 @@ ln -s "$PWD/plugin/desktop/plugin.js" $P/desktop/plugin.js
 hermes plugins enable hermes-whatsapp-chat
 hermes gateway restart                             # backend routes mount only at startup
 
-# Channel service (LaunchAgent): normally the UI button Settings → Numbers → Install service
+# Channel service (LaunchAgent / systemd user unit / Windows Startup launcher): installs itself at the first Hermes start; the UI buttons Settings → Numbers → Install/Reinstall/Uninstall service drive it
 uv run python plugin/sidecar/wa_channel.py install        # same code path; start now and at login
 uv run python plugin/sidecar/wa_channel.py status         # service heartbeat + per-account state
 uv run python plugin/sidecar/wa_channel.py install-skill
@@ -287,7 +291,7 @@ The JS halves are hand-written files that load as-is; there is no build step.
   - `WA_NODE` (Node binary for the sidecar)
   - `WA_HERMES_BIN` (`hermes` binary used by Hermes automations)
   - `HERMES_PROFILE` (author of CLI-written messages: `agent:<profile>`)
-  - `install` (UI **Install service**) stores `WA_NODE`, `WA_ARCHIVE_DB` and `HERMES_HOME` in the LaunchAgent environment and `HERMES_HOME` in `hwc-python`; re-install after changing them.
+  - `install` (UI **Install service**) stores `WA_NODE`, `WA_ARCHIVE_DB` and `HERMES_HOME` in the service environment (plist / unit / Startup `.vbs`) and `HERMES_HOME` in `hwc-python`; re-install after changing them (the backend also rewrites them at every Hermes start).
 
 ## Testing & QA
 
@@ -308,5 +312,5 @@ The JS halves are hand-written files that load as-is; there is no build step.
 ### Install / update lifecycle
 
 - Hermes mounts plugin backend routes **only at startup**: after install, reinstall or `hermes plugins update` the old backend keeps running until Hermes restarts. `API_VERSION` (`wa_core/service.py`, exposed in `/health` and `/service`) is checked by both UIs against `REQUIRED_API_VERSION`; a mismatch shows "Restart Hermes…" and disables service/skill buttons. Bump both on any route change.
-- On every backend import (Hermes start) `service.ensure_service` runs in a daemon thread (skipped with `HWC_NO_AUTOSTART=1` and when loaded as `hwc_plugin_api` by the sidecar/CLI): it rewrites launchers + plist and restarts the service if anything changed or its heartbeat is stale. "Reinstall" always restarts.
-- The sidecar fingerprints its own plugin code every 5 s: changed or reappeared → graceful exit (launchd restarts it on the new code); `plugin.yaml` missing for 120 s → the plugin was removed, so it deletes its plist and boots itself out (plugin-data is kept).
+- On every backend import (Hermes start) `service.ensure_service` runs in a daemon thread (skipped with `HWC_NO_AUTOSTART=1` and when loaded as `hwc_plugin_api` by the sidecar/CLI). It holds a file lock (`<data>/bin/service.lock`, `"busy"` when another Hermes process has it) and: not installed → **installs and starts the service by itself** (`"installed"`), unless the user uninstalled it (`<data>/service-disabled` exists → `"disabled"`) or the platform is unsupported (`"unsupported"`); installed → rewrites launchers + service file and restarts the service if anything changed or its heartbeat is stale (`"ok"`/`"restarted"`); failures → `"error"`. **Install service** deletes the opt-out file, **Uninstall service** writes it. "Reinstall" always restarts. Hermes has no post-install hook, so "installs itself" means the first backend start after install.
+- The sidecar fingerprints its own plugin code every 5 s: changed or reappeared → graceful exit (launchd/systemd restart it on the new code; `supervise.py` on Windows); `plugin.yaml` missing for 120 s → the plugin was removed, so it deletes its service definition (plist / unit / Startup entry), unloads itself and exits with `STOP_EXIT` 3 (plugin-data is kept; this never writes the opt-out file).

@@ -13,7 +13,7 @@
   const fetchJSON = SDK.fetchJSON
   const API = '/api/plugins/hermes-whatsapp-chat'
   // Bump together with API_VERSION in wa_core/service.py: the UI is newer than a backend that reports less.
-  const REQUIRED_API_VERSION = 4
+  const REQUIRED_API_VERSION = 5
   const RESTART_TITLE = 'Restart the Hermes dashboard to finish installing or updating WhatsApp Chat'
   const SERVICE_START_TIMEOUT_MS = 30000
 
@@ -1327,7 +1327,7 @@
         h(
           'div',
           { className: 'wab-muted wab-small' },
-          'The background process that keeps your numbers connected and delivers messages. It starts at login and restarts if it stops.'
+          'The background process that keeps your numbers connected and delivers messages. It starts automatically and restarts if it stops.'
         ),
         h(
           'div',

@@ -336,5 +336,8 @@ def service_info(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
         "installed": service.service_installed(),
         "skill_installed": service.skill_installed(),
         "node": service.find_node(),
+        "platform": service._platform(),
+        "linger": service.linger_enabled(),
+        "auto_install": service.auto_install_enabled(),
         "install_command": None,  # kept for compatibility; the UI installs the service itself
     }

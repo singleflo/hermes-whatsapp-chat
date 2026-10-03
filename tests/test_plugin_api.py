@@ -9,6 +9,7 @@ timers, status reports). Only the WhatsApp bridge (an external process) is faked
 from __future__ import annotations
 
 import base64
+import getpass
 import importlib.util
 import json
 import os
@@ -320,19 +321,24 @@ def svc(core, tmp_path, monkeypatch):
     results: list = []
     node = tmp_path / "nodebin" / "node"
 
-    def fake_run(argv):
+    envs: list[dict | None] = []
+
+    def fake_run(argv, env=None):
         calls.append(list(argv))
+        envs.append(env)
         result = results.pop(0) if results else completed(argv)
         if isinstance(result, Exception):
             raise result
         return result
 
     monkeypatch.setattr(core.service, "_run", fake_run)
+    monkeypatch.setattr(core.service, "_platform", lambda: "darwin")
     monkeypatch.setattr(core.service, "_sleep", lambda seconds: None)
     monkeypatch.setattr(core.service, "find_node", lambda: str(node))
     data = core.db.data_dir()
     return SimpleNamespace(
         calls=calls,
+        envs=envs,
         results=results,
         node=node,
         data=data,
@@ -499,15 +505,15 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
 
 
 def test_health_and_service_report_api_version(client, core):
-    assert core.service.API_VERSION == 4
-    assert client.get(f"{PREFIX}/health").json()["api_version"] == 4
-    assert client.get(f"{PREFIX}/service").json()["api_version"] == 4
+    assert core.service.API_VERSION == 5
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 5
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 5
 
 
 def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["api_version"]) == (False, 4)
+    assert (body["ok"], body["api_version"]) == (False, 5)
 
 
 def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):
@@ -526,9 +532,43 @@ def _bootout_bootstrap(core, svc):
     ]
 
 
-def test_ensure_service_is_absent_without_plist(core, svc):
-    assert core.service.ensure_service(now=int(time.time())) == "absent"
+def test_ensure_service_installs_a_missing_service_at_first_start(core, svc):
+    assert core.service.ensure_service(now=int(time.time())) == "installed"
+    assert svc.plist.exists() and svc.py.exists()
+    assert svc.calls == _bootout_bootstrap(core, svc)
+
+
+def test_ensure_service_does_not_reinstall_after_an_explicit_uninstall(client, core, svc):
+    assert client.post(f"{PREFIX}/service/uninstall").status_code == 200
+    assert (svc.data / "service-disabled").read_text() == "uninstalled from the UI or CLI\n"
+    svc.calls.clear()
+    assert core.service.ensure_service(now=int(time.time())) == "disabled"
     assert svc.calls == [] and not svc.py.exists() and not svc.plist.exists()
+
+
+def test_install_service_turns_automatic_install_back_on(client, core, svc):
+    client.post(f"{PREFIX}/service/uninstall")
+    assert client.get(f"{PREFIX}/service").json()["auto_install"] is False
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert not (svc.data / "service-disabled").exists()
+    assert client.get(f"{PREFIX}/service").json()["auto_install"] is True
+
+
+def test_ensure_service_is_busy_while_another_process_holds_the_service_lock(core, svc):
+    lock = core.service._acquire_lock(svc.data / "bin" / "service.lock")
+    assert lock is not None
+    try:
+        assert core.service.ensure_service(now=int(time.time())) == "busy"
+    finally:
+        core.service._release_lock(lock)
+    assert svc.calls == [] and not svc.plist.exists()
+    assert core.service.ensure_service(now=int(time.time())) == "installed"  # the lock was released
+
+
+def test_ensure_service_reports_error_when_the_first_install_has_no_node(core, svc, monkeypatch):
+    monkeypatch.setattr(core.service, "find_node", lambda: None)
+    assert core.service.ensure_service(now=int(time.time())) == "error"
+    assert svc.calls == [] and not svc.plist.exists()
 
 
 def test_ensure_service_is_ok_when_files_identical_and_heartbeat_fresh(client, core, db, svc):
@@ -593,6 +633,265 @@ def test_service_install_kickstarts_when_bootstrap_says_already_loaded(client, c
     svc.results[:] = [completed([], 3), *_bootstrap_failures(core), completed([], 0)]
     assert client.post(f"{PREFIX}/service/install").status_code == 200
     assert svc.calls[-1] == ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{core.service.LABEL}"]
+
+
+# --- Linux (systemd user unit) ---------------------------------------------------------
+
+
+@pytest.fixture
+def linux(core, svc, tmp_path, monkeypatch):
+    monkeypatch.setattr(core.service, "_platform", lambda: "linux")
+    linger = tmp_path / "linger"
+    linger.mkdir()
+    (linger / getpass.getuser()).write_text("")
+    monkeypatch.setattr(core.service, "_LINGER_DIR", linger)
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    svc.linger = linger
+    svc.runtime = runtime
+    svc.unit = tmp_path / "fake-home" / ".config" / "systemd" / "user" / core.service.UNIT_NAME
+    return svc
+
+
+def _systemctl_calls(core, *rest):
+    unit = core.service.UNIT_NAME
+    table = {"reload": ["daemon-reload"], "enable": ["enable", unit], "restart": ["restart", unit]}
+    return [["systemctl", "--user", *table[name]] for name in rest]
+
+
+def test_linux_install_writes_the_unit_and_runs_systemctl_in_order(client, core, linux, tmp_path, monkeypatch):
+    monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path / "wa%board.db"))
+    body = client.post(f"{PREFIX}/service/install").json()
+    assert (body["installed"], body["platform"], body["linger"]) == (True, "linux", True)
+
+    lines = linux.unit.read_text().splitlines()
+    assert lines[0] == "[Unit]" and "[Service]" in lines and "[Install]" in lines
+    assert f'ExecStart="{linux.py}" "{PLUGIN_DIR / "sidecar" / "wa_channel.py"}" run' in lines
+    assert f'WorkingDirectory="{PLUGIN_DIR}"' in lines
+    assert f'Environment="WA_NODE={linux.node}"' in lines
+    assert f'Environment="HERMES_HOME={tmp_path / "home"}"' in lines
+    assert f'Environment="PATH={linux.node.parent}:/usr/local/bin:/usr/bin:/bin"' in lines
+    assert f'Environment="WA_ARCHIVE_DB={tmp_path / "wa%%board.db"}"' in lines
+    assert "Restart=always" in lines and "WantedBy=default.target" in lines
+    log = linux.data / "logs" / "channel.log"
+    assert f"StandardOutput=append:{log}" in lines and f"StandardError=append:{log}" in lines
+
+    assert linux.calls == _systemctl_calls(core, "reload", "enable", "restart")
+    assert all(env is not None and env["XDG_RUNTIME_DIR"] == str(linux.runtime) for env in linux.envs)
+
+
+def test_linux_systemd_env_adds_the_session_bus_of_the_runtime_dir(core, linux):
+    (linux.runtime / "bus").write_text("")
+    env = core.service._systemd_env()
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={linux.runtime / 'bus'}"
+
+
+def test_linux_restart_failure_is_503_naming_the_command(client, core, linux):
+    linux.results[:] = [completed([]), completed([]), completed([], 1, "Unit not found")]
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and r.json()["detail"] == "systemctl restart failed: Unit not found"
+
+
+def test_linux_without_systemctl_is_503_needing_systemd(client, linux):
+    linux.results[:] = [FileNotFoundError("systemctl")]
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "needs systemd on Linux" in r.json()["detail"]
+
+
+def test_linux_install_enables_lingering_when_it_is_off(client, core, linux):
+    (linux.linger / getpass.getuser()).unlink()
+    assert client.get(f"{PREFIX}/service").json()["linger"] is False
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert linux.calls[0] == ["loginctl", "enable-linger", getpass.getuser()]
+    assert linux.calls[1:] == _systemctl_calls(core, "reload", "enable", "restart")
+
+
+def test_linux_uninstall_disables_removes_the_unit_and_opts_out(client, core, linux):
+    client.post(f"{PREFIX}/service/install")
+    assert linux.unit.exists()
+    linux.calls.clear()
+    body = client.post(f"{PREFIX}/service/uninstall").json()
+    assert body["installed"] is False and body["auto_install"] is False and not linux.unit.exists()
+    assert linux.calls == [["systemctl", "--user", "disable", "--now", core.service.UNIT_NAME], *_systemctl_calls(core, "reload")]
+    assert (linux.data / "service-disabled").exists()
+
+
+def test_linux_first_start_installs_the_unit_and_starts_it(core, linux):
+    assert core.service.ensure_service(now=int(time.time())) == "installed"
+    assert linux.unit.exists()
+    assert linux.calls == _systemctl_calls(core, "reload", "enable", "restart")
+
+
+def test_service_info_reports_platform_linger_and_auto_install(client, core, svc):
+    body = client.get(f"{PREFIX}/service").json()
+    assert (body["platform"], body["linger"], body["auto_install"]) == ("darwin", None, True)
+
+
+# --- Windows (Startup-folder launcher + supervisor) ----------------------------------------
+
+
+@pytest.fixture
+def windows(core, svc, tmp_path, monkeypatch):
+    monkeypatch.setattr(core.service, "_platform", lambda: "win32")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    held: set[str] = set()
+    spawns: list[tuple[list[str], int]] = []
+    spawn_errors: list[Exception] = []
+
+    def fake_spawn(argv, flags):
+        spawns.append((list(argv), flags))
+        if spawn_errors:
+            raise spawn_errors.pop(0)
+
+    monkeypatch.setattr(core.service, "_spawn", fake_spawn)
+    monkeypatch.setattr(core.service, "_acquire_lock", lambda path: None if path.name in held else object())
+    monkeypatch.setattr(core.service, "_release_lock", lambda handle: None)
+    svc.held = held
+    svc.spawns = spawns
+    svc.spawn_errors = spawn_errors
+    svc.py = svc.data / "bin" / "hwc-python.cmd"
+    svc.wa = svc.data / "bin" / "wa.cmd"
+    svc.entry = tmp_path / "appdata" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "hermes-whatsapp-chat-channel.vbs"
+    svc.marker = svc.data / "bin" / "channel.stop"
+    return svc
+
+
+def _set_value(lines, name):
+    (line,) = [l for l in lines if l.startswith(f'set "{name}=')]
+    return line[len(f'set "{name}=') : -1]
+
+
+def test_windows_install_writes_cmd_launchers_with_doubled_percent(client, windows, tmp_path, monkeypatch):
+    odd = tmp_path / "p%ct"
+    odd.mkdir()
+    monkeypatch.setattr(sys, "path", [*sys.path, str(odd)])
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+
+    assert windows.py.read_bytes().startswith(b"@echo off\r\n")
+    lines = windows.py.read_text().splitlines()
+    entries = _set_value(lines, "PYTHONPATH").split(";")
+    assert str(odd).replace("%", "%%") in entries
+    assert all(e in [p.replace("%", "%%") for p in sys.path] for e in entries)
+    assert _set_value(lines, "HERMES_HOME") == str(tmp_path / "home")
+    assert lines[-1] == f'"{sys.executable}" %*'
+
+    assert windows.wa.read_text().splitlines() == [
+        "@echo off",
+        "rem Generated by hermes-whatsapp-chat: the WhatsApp chat CLI.",
+        f'call "{windows.py}" "{PLUGIN_DIR / "scripts" / "wa.py"}" %*',
+    ]
+
+
+def test_windows_install_writes_the_utf16_startup_entry_and_spawns_it_hidden(client, core, windows, tmp_path):
+    body = client.post(f"{PREFIX}/service/install").json()
+    assert (body["installed"], body["platform"], body["linger"]) == (True, "win32", None)
+
+    raw = windows.entry.read_bytes()
+    assert raw[:2] == b"\xff\xfe"
+    text = raw.decode("utf-16")
+    assert "\r\n" in text and "\n" not in text.replace("\r\n", "")
+    lines = text.split("\r\n")
+    assert lines[0].startswith("' Generated by hermes-whatsapp-chat")
+    assert lines[1] == "Option Explicit"
+    assert any(l.startswith('env("PYTHONPATH") = "') for l in lines)
+    assert f'env("HERMES_HOME") = "{tmp_path / "home"}"' in lines
+    assert f'env("WA_NODE") = "{windows.node}"' in lines
+    assert f'env("PATH") = "{windows.node.parent};" & env("PATH")' in lines
+    assert f'env("WA_ARCHIVE_DB") = "{tmp_path / "wa_board.db"}"' in lines
+    sidecar = PLUGIN_DIR / "sidecar"
+    command = subprocess.list2cmdline([sys.executable, str(sidecar / "supervise.py"), str(sidecar / "wa_channel.py"), str(windows.data)])
+    assert f'sh.Run "{command.replace(chr(34), chr(34) * 2)}", 0, False' in lines
+
+    assert windows.spawns == [(["wscript.exe", "//B", "//Nologo", str(windows.entry)], 0x09000200)]
+    assert windows.calls == [] and not windows.marker.exists()
+
+
+def test_windows_start_retries_without_breakaway_when_the_job_forbids_it(client, windows):
+    windows.spawn_errors[:] = [OSError("breakaway not permitted")]
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert [flags for _, flags in windows.spawns] == [0x09000200, 0x08000200]
+
+
+def test_windows_start_failure_is_503(client, windows):
+    windows.spawn_errors[:] = [OSError("blocked"), OSError("blocked by policy")]
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "blocked by policy" in r.json()["detail"]
+
+
+def test_windows_reload_with_a_channel_that_will_not_stop_is_503_and_clears_the_marker(client, windows):
+    windows.held.add("channel.lock")
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "did not stop within 20 s" in r.json()["detail"]
+    assert not windows.marker.exists() and windows.spawns == []
+
+
+def test_windows_uninstall_stops_the_channel_removes_the_entry_and_opts_out(client, windows):
+    client.post(f"{PREFIX}/service/install")
+    assert windows.entry.exists()
+    body = client.post(f"{PREFIX}/service/uninstall").json()
+    assert body["installed"] is False and body["auto_install"] is False and not windows.entry.exists()
+    assert len(windows.spawns) == 1 and not windows.marker.exists()
+    assert (windows.data / "service-disabled").exists()
+
+
+def test_windows_first_start_installs_and_starts_the_entry(core, windows):
+    assert core.service.ensure_service(now=int(time.time())) == "installed"
+    assert windows.entry.exists() and len(windows.spawns) == 1
+
+
+def test_windows_wa_command_is_a_command_line_path(core, windows):
+    assert core.service.wa_command() == subprocess.list2cmdline([str(windows.wa)])
+    assert windows.wa.is_file()
+
+
+# --- Unsupported platform ------------------------------------------------------------------
+
+
+def test_unsupported_platform_install_is_503_and_first_start_is_unsupported(client, core, svc, monkeypatch):
+    monkeypatch.setattr(core.service, "_platform", lambda: "freebsd14")
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "macOS, Linux (systemd) or Windows" in r.json()["detail"]
+    assert core.service.ensure_service(now=int(time.time())) == "unsupported"
+    assert svc.calls == [] and not svc.py.exists()
+
+
+# --- supervise.py (Windows keep-alive) -------------------------------------------------
+
+SUPERVISE_FILE = REPO_ROOT / "plugin" / "sidecar" / "supervise.py"
+
+
+def test_supervise_respawns_until_the_channel_exits_with_the_stop_code():
+    sup = _load("hwc_supervise_test", SUPERVISE_FILE)
+    codes = [0, 1, 3]
+    spawned: list[int] = []
+    sleeps: list[float] = []
+
+    def spawn():
+        spawned.append(1)
+        return codes.pop(0)
+
+    sup.run_loop(spawn, lambda: False, sleeps.append)
+    assert len(spawned) == 3 and sleeps == [1] * (2 * sup.RESTART_DELAY_SECONDS)
+
+
+def test_supervise_stops_during_the_restart_delay_without_spawning_again():
+    sup = _load("hwc_supervise_test", SUPERVISE_FILE)
+    spawned: list[int] = []
+    sleeps: list[float] = []
+
+    def spawn():
+        spawned.append(1)
+        return 1
+
+    sup.run_loop(spawn, lambda: len(sleeps) >= 3, sleeps.append)
+    assert len(spawned) == 1 and len(sleeps) == 3
+
+
+def test_supervise_does_not_spawn_when_a_stop_is_already_requested():
+    sup = _load("hwc_supervise_test", SUPERVISE_FILE)
+    sup.run_loop(lambda: pytest.fail("spawned"), lambda: True, lambda seconds: None)
 
 
 @pytest.fixture
@@ -678,12 +977,80 @@ def test_sidecar_self_uninstall_deletes_plist_and_boots_out_last(supervisor, cha
     data.parent.mkdir()
     data.write_text("data")
     calls = []
+    monkeypatch.setattr(channel, "PLATFORM", "darwin")
+    monkeypatch.setattr(channel, "IS_WINDOWS", False)
     monkeypatch.setattr(channel, "PLIST_PATH", plist)
     monkeypatch.setattr(channel, "BOOTOUT_TARGET", "gui/501/label")
     monkeypatch.setattr(channel.subprocess, "run", lambda argv, **kw: calls.append((list(argv), plist.exists())))
     supervisor._uninstall_self()
     assert not plist.exists() and data.exists()
     assert calls == [(["launchctl", "bootout", "gui/501/label"], False)]
+
+
+def test_sidecar_self_uninstall_on_linux_removes_unit_then_stops_it_last(supervisor, channel, tmp_path, monkeypatch):
+    unit = tmp_path / "systemd" / "x.service"
+    unit.parent.mkdir()
+    unit.write_text("unit")
+    calls = []
+    monkeypatch.setattr(channel, "PLATFORM", "linux")
+    monkeypatch.setattr(channel, "IS_WINDOWS", False)
+    monkeypatch.setattr(channel, "UNIT_PATH", unit)
+    monkeypatch.setattr(
+        channel.subprocess, "run", lambda argv, **kw: calls.append((list(argv), unit.exists(), kw["env"]))
+    )
+    supervisor._uninstall_self()
+    name = channel.core.service.UNIT_NAME
+    assert [(c[0], c[1]) for c in calls] == [
+        (["systemctl", "--user", "disable", name], False),
+        (["systemctl", "--user", "daemon-reload"], False),
+        (["systemctl", "--user", "stop", "--no-block", name], False),
+    ]
+    assert all(isinstance(c[2], dict) for c in calls)
+
+
+def test_sidecar_self_uninstall_on_windows_deletes_the_startup_entry_only(supervisor, channel, tmp_path, monkeypatch):
+    entry = tmp_path / "Startup" / "x.vbs"
+    entry.parent.mkdir()
+    entry.write_text("vbs")
+    calls = []
+    monkeypatch.setattr(channel, "PLATFORM", "win32")
+    monkeypatch.setattr(channel, "IS_WINDOWS", True)
+    monkeypatch.setattr(channel, "STARTUP_ENTRY", entry)
+    monkeypatch.setattr(channel.subprocess, "run", lambda argv, **kw: calls.append(list(argv)))
+    supervisor._uninstall_self()
+    assert not entry.exists() and calls == []
+
+
+def test_sidecar_run_exit_code_is_3_when_stopped_or_uninstalled(channel, monkeypatch):
+    monkeypatch.setattr(channel.signal, "signal", lambda *args: None)
+
+    class Stub(channel.Supervisor):
+        node_error = None
+        deps_error = None
+
+        def __init__(self, action):
+            self.exit_action = action
+            self.stop_event = channel.threading.Event()
+            self.stop_event.set()
+            self.pool = channel.ThreadPoolExecutor(max_workers=1)
+            self.runners = {}
+            self.conn = None
+
+        def _uninstall_self(self):
+            pass
+
+    assert [Stub(a).run() for a in ("stopped", "uninstall", "restart", None)] == [3, 3, 0, 0]
+
+
+def test_sidecar_tick_on_windows_stops_when_the_stop_marker_exists(supervisor, channel, tmp_path, monkeypatch):
+    marker = tmp_path / "channel.stop"
+    marker.write_text("stop")
+    monkeypatch.setattr(channel, "IS_WINDOWS", True)
+    monkeypatch.setattr(channel, "STOP_MARKER", marker)
+    supervisor.stop_event = channel.threading.Event()
+    supervisor.tick()
+    assert supervisor.exit_action == "stopped" and supervisor.stop_event.is_set()
+    assert marker.exists()  # left for the backend that requested the stop
 
 
 # --- Migration v1 -> v2 -----------------------------------------------------------

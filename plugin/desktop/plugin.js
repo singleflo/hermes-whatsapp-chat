@@ -53,14 +53,15 @@ let ctxRef = null
 
 // Per-route UI state (also driven by notification clicks): the main page, every per-number
 // page and every split tile keep their own tab, selected conversation and number filter.
-// `account` is the WhatsApp number id, or null for "All numbers".
+// `account` is the WhatsApp number id, or null for "All numbers". Scopes are per Hermes connection.
 const scopes = new Map()
 
-function getScope(route, accountId) {
-  let scope = scopes.get(route)
+function getScope(conn, route, accountId) {
+  const key = conn + '\0' + route
+  let scope = scopes.get(key)
   if (!scope) {
     scope = { tab: atom('chats'), selected: atom(null), account: atom(accountId) }
-    scopes.set(route, scope)
+    scopes.set(key, scope)
   }
   return scope
 }
@@ -79,13 +80,14 @@ const $restart = atom(null)
 //   fmtAge(seconds)         "now" / "5m" / "3h" / "2d"
 //   fmtTime(unixSeconds)    viewer-locale short date + time
 //   refresh()               invalidates every [ID, …] query (returns a promise)
-//   useApi(key, path, opts) useQuery wrapper, refetches every POLL_MS
+//   useApi(key, path, opts) useQuery wrapper, refetches every POLL_MS; keys are [ID, connection scope, …] and
+//                           fetch only while that scope is the active Hermes connection (connScope/useConnScope)
 //   STATE_LABELS            conversation state id → label
 //   ACCOUNT_COLORS          account color name → var(--ui-*) css color
 //   AccountDot({account})   colored dot for an account (Account or conversation Card)
 //   ServiceBanner()         "WhatsApp service not installed / not running / restarting" + Install / Reinstall button
-//   OutdatedBanner()        "Restart Hermes…" when /health api_version < REQUIRED_API_VERSION
-//   useBackendOutdated()    true while the running backend is older than this UI
+//   BackendBanner()         "WhatsApp Chat is not loaded on this Hermes" / "older backend": quit and reopen Hermes
+//   useBackendState()       'ok' | 'missing' (/health 404 on the active Hermes) | 'outdated' (api_version too low)
 //   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes;
 //                           'install' then waits for a fresh heartbeat (progress in $restart)
 //   SERVICE_LOG_HINT        where the service writes its log (shown on errors)
@@ -110,6 +112,25 @@ function rest(path, opts) {
 }
 
 const refresh = () => queryClient.invalidateQueries({ queryKey: [ID] })
+
+const LOCAL_SCOPE = 'local'
+
+// Cache scope of the active Hermes connection (bundled kanban's pattern): a switch is a clean cache miss.
+function connScope() {
+  return host.state.connectionId.get() ?? LOCAL_SCOPE
+}
+
+function useConnScope() {
+  return useValue(host.state.connectionId) ?? LOCAL_SCOPE
+}
+
+// Fetch only while the key's scope is where a request issued now is routed (host.activeConnectionId, older
+// builds without it: the published connection id).
+const routedToScope = query => {
+  const routed =
+    typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : host.state.connectionId.get()
+  return query.queryKey[1] === (routed ?? LOCAL_SCOPE)
+}
 
 // ctx.rest errors read "409: {"detail": ...}".
 function errorText(err) {
@@ -192,9 +213,9 @@ function useApi(key, path, opts) {
   const { enabled = true, ...restOpts } = opts || {}
   const hasOpts = Object.keys(restOpts).length > 0
   return useQuery({
-    queryKey: [ID, ...[].concat(key), path],
+    queryKey: [ID, useConnScope(), ...[].concat(key), path],
     queryFn: () => ctxRef.rest(path, hasOpts ? restOpts : undefined),
-    enabled,
+    enabled: query => enabled && routedToScope(query),
     refetchInterval: POLL_MS
   })
 }
@@ -217,25 +238,28 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 4
+const REQUIRED_API_VERSION = 5
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
-  'The plugin was updated but Hermes is still running the previous backend. Quit Hermes (⌘Q) and open it again.'
+  'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
+const MISSING_TITLE = 'WhatsApp Chat is not loaded on this Hermes'
+const MISSING_BODY =
+  'Install and enable WhatsApp Chat on this Hermes from the Plugins page, then quit Hermes and open it again: Hermes loads plugin backends only when it starts.'
 
-// True when the running backend is older than this UI: /health lacks api_version, reports a lower one,
-// or the route does not exist at all (404, plugin routes are mounted only at Hermes startup).
-function useBackendOutdated() {
+// 'missing': the plugin routes do not exist on the active Hermes (404, plugin routes are mounted only at Hermes
+// startup). 'outdated': /health lacks api_version or reports a lower one than this UI needs. Else 'ok'.
+function useBackendState() {
   const q = useApi('health', '/health')
   if (!q.data) {
-    return errorStatus(q.error) === 404
+    return errorStatus(q.error) === 404 ? 'missing' : 'ok'
   }
   const v = q.data.api_version
-  return typeof v !== 'number' || v < REQUIRED_API_VERSION
+  return typeof v !== 'number' || v < REQUIRED_API_VERSION ? 'outdated' : 'ok'
 }
 
-function OutdatedBanner() {
-  const outdated = useBackendOutdated()
-  if (!outdated) {
+function BackendBanner() {
+  const state = useBackendState()
+  if (state === 'ok') {
     return null
   }
   return h(
@@ -249,8 +273,8 @@ function OutdatedBanner() {
         background: 'color-mix(in srgb, var(--ui-red) 10%, transparent)'
       }
     },
-    h('div', { style: { fontWeight: 600 } }, RESTART_TITLE),
-    h('div', { style: T.muted }, RESTART_BODY)
+    h('div', { style: { fontWeight: 600 } }, state === 'missing' ? MISSING_TITLE : RESTART_TITLE),
+    h('div', { style: T.muted }, state === 'missing' ? MISSING_BODY : RESTART_BODY)
   )
 }
 
@@ -312,9 +336,9 @@ function useServiceAction() {
 function ServiceBanner() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
-  const outdated = useBackendOutdated()
+  const state = useBackendState()
   const restart = useValue($restart)
-  if (!q.data || q.data.running || outdated) {
+  if (!q.data || q.data.running || state !== 'ok') {
     return null
   }
   const installed = q.data.installed !== false
@@ -1106,10 +1130,11 @@ function MediaItem({ msg, item, auto, onLoad }) {
   const kind = mediaKind(item)
   const [open, setOpen] = useState(Boolean(auto) && kind === 'image')
   const [busy, setBusy] = useState(false)
+  const scope = useConnScope()
   const q = useQuery({
-    queryKey: ['hwc-media', msg.id, item.index],
+    queryKey: ['hwc-media', scope, msg.id, item.index],
     queryFn: () => ctxRef.rest('/messages/' + msg.id + '/media/' + item.index),
-    enabled: open && item.available && kind !== 'document',
+    enabled: query => open && item.available && kind !== 'document' && routedToScope(query),
     staleTime: Infinity,
     gcTime: 300000,
     retry: false
@@ -2255,7 +2280,7 @@ function NumberSwitcher({ scope }) {
 }
 
 function WaPage({ route, accountId }) {
-  const scope = getScope(route, accountId)
+  const scope = getScope(useConnScope(), route, accountId)
   const tab = useValue(scope.tab)
   const selected = useValue(scope.selected)
   const account = useValue(scope.account)
@@ -2297,7 +2322,7 @@ function WaPage({ route, accountId }) {
         h(Codicon, { name: 'refresh' })
       )
     ),
-    h(OutdatedBanner, {}),
+    h(BackendBanner, {}),
     h(ServiceBanner, {}),
     tab === 'chats' ? h(ChatsView, { accountId: account, selected, onSelect: open }) : null,
     tab === 'board' ? h(BoardView, { accountId: account, onOpen: open }) : null,
@@ -2349,14 +2374,16 @@ function StatusChip() {
 
 // --- Live events ------------------------------------------------------------------------------
 
+// { scope, at, value }: reused only while the active connection is the one it was fetched from.
 let settingsCache = null
 
 async function getSettings() {
-  if (settingsCache && Date.now() - settingsCache.at < 30000) {
+  const scope = connScope()
+  if (settingsCache && settingsCache.scope === scope && Date.now() - settingsCache.at < 30000) {
     return settingsCache.value
   }
   const value = await ctxRef.rest('/settings')
-  settingsCache = { at: Date.now(), value }
+  settingsCache = { scope, at: Date.now(), value }
   return value
 }
 
@@ -2366,7 +2393,7 @@ function notifyConv(title, e, body) {
     body,
     activate: ROUTE,
     onActivate: () => {
-      const scope = getScope(ROUTE, null)
+      const scope = getScope(connScope(), ROUTE, null)
       scope.account.set(null)
       if (e.conversation_id) {
         scope.selected.set(e.conversation_id)
@@ -2480,10 +2507,30 @@ function syncNumberRoutes(accounts) {
 }
 
 function loadNumberRoutes() {
+  const scope = connScope()
   return ctxRef.rest('/accounts').then(
-    d => syncNumberRoutes((d && d.accounts) || []),
+    d => {
+      if (scope === connScope()) {
+        syncNumberRoutes((d && d.accounts) || [])
+      }
+    },
     () => {}
   )
+}
+
+// The /events socket of the active connection. `generation` drops frames of a socket that was replaced.
+let liveEvents = { close: null, generation: 0 }
+
+function openEvents() {
+  if (liveEvents.close) {
+    liveEvents.close()
+  }
+  const generation = ++liveEvents.generation
+  liveEvents.close = ctxRef.socket('/events', frame => {
+    if (generation === liveEvents.generation) {
+      onFrame(frame)
+    }
+  })
 }
 
 // --- Register ------------------------------------------------------------------------------------
@@ -2523,13 +2570,37 @@ export default {
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 140, render: () => jsx(StatusChip, {}) }
     ])
 
-    // Live updates: an accelerator over the 5s polling (a no-op on OAuth remotes).
-    ctx.socket('/events', onFrame)
+    // Live updates: an accelerator over the 5s polling (a no-op on OAuth remotes). Follows the active connection.
+    openEvents()
+    ctx.onDispose(() => {
+      liveEvents.generation++
+      if (liveEvents.close) {
+        liveEvents.close()
+      }
+    })
 
     // One route + sidebar entry per WhatsApp number.
     numberRoutes = { key: '', dispose: null }
     loadNumberRoutes()
     ctx.setInterval(loadNumberRoutes, 15000)
+
+    // A connection switch reopens the socket and re-registers the number routes of the new host.
+    let lastScope = connScope()
+    const unlisten = host.state.connectionId.listen(next => {
+      const scope = next ?? LOCAL_SCOPE
+      if (scope === lastScope) {
+        return
+      }
+      lastScope = scope
+      settingsCache = null
+      if (numberRoutes.dispose) {
+        numberRoutes.dispose()
+      }
+      numberRoutes = { key: '', dispose: null }
+      openEvents()
+      loadNumberRoutes()
+    })
+    ctx.onDispose(unlisten)
   }
 }
 
@@ -3400,9 +3471,11 @@ function SettingsAccountRow({ account, onPair }) {
 }
 
 function SettingsPairing({ accountId, onClose }) {
+  const scope = useConnScope()
   const q = useQuery({
-    queryKey: [ID, 'pairing', accountId],
+    queryKey: [ID, scope, 'pairing', accountId],
     queryFn: () => rest('/accounts'),
+    enabled: routedToScope,
     refetchInterval: 2000
   })
   const [auto, setAuto] = useState(false)
@@ -3581,7 +3654,7 @@ function SettingsKeyValue({ label, value, warn }) {
 function SettingsServiceCard() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
-  const outdated = useBackendOutdated()
+  const state = useBackendState()
   const restart = useValue($restart)
   const [confirm, setConfirm] = useState(false)
   const s = q.data
@@ -3595,8 +3668,8 @@ function SettingsServiceCard() {
   }
   const installed = s.installed !== false
   const restarting = restart === 'restarting'
-  const locked = busy !== null || restarting || outdated
-  const lockTitle = outdated ? RESTART_TITLE : undefined
+  const locked = busy !== null || restarting || state !== 'ok'
+  const lockTitle = state === 'missing' ? MISSING_TITLE : state === 'outdated' ? RESTART_TITLE : undefined
   const badge = s.running
     ? ['success', 'Running']
     : installed
@@ -3605,7 +3678,7 @@ function SettingsServiceCard() {
   const nodeKnown = Object.prototype.hasOwnProperty.call(s, 'node')
   return jsx(SettingsCard, {
     title: 'Service',
-    desc: 'The background process that keeps your numbers connected and delivers messages. It starts at login and restarts if it stops.',
+    desc: 'The background process that keeps your numbers connected and delivers messages. It starts automatically and restarts if it stops.',
     children: set_h(
       'div',
       { className: 'flex flex-col gap-2' },
@@ -3651,7 +3724,21 @@ function SettingsServiceCard() {
             set_h('code', { style: CODE }, SERVICE_LOG_HINT)
           )
         : null,
-      outdated ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, RESTART_TITLE) : null,
+      s.platform && String(s.platform).startsWith('linux') && s.linger === false
+        ? set_h(
+            'div',
+            { className: 'text-xs', style: { color: 'var(--ui-orange)' } },
+            'Lingering is off for this user: the service stops when the user logs out of this machine.'
+          )
+        : null,
+      s.auto_install === false && !installed
+        ? set_h(
+            'div',
+            { className: 'text-xs', style: set_muted },
+            'Automatic install is off because the service was uninstalled here. Install service turns it back on.'
+          )
+        : null,
+      lockTitle ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, lockTitle) : null,
       confirm
         ? jsx(SettingsConfirm, {
             message:
@@ -3694,13 +3781,13 @@ function SettingsServiceCard() {
 function SettingsSkillCard() {
   const q = useApi('service', '/service')
   const [busy, run] = useServiceAction()
-  const outdated = useBackendOutdated()
+  const state = useBackendState()
   const s = q.data
   if (!s) {
     return null
   }
   const installed = Boolean(s.skill_installed)
-  const lockTitle = outdated ? RESTART_TITLE : undefined
+  const lockTitle = state === 'missing' ? MISSING_TITLE : state === 'outdated' ? RESTART_TITLE : undefined
   return jsx(SettingsCard, {
     title: 'Hermes skill',
     desc: 'Lets Hermes agents list, read and answer your WhatsApp conversations. Installed into the Hermes skills folder.',
@@ -3715,7 +3802,7 @@ function SettingsSkillCard() {
           children: installed ? 'Installed' : 'Not installed'
         })
       ),
-      outdated ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, RESTART_TITLE) : null,
+      lockTitle ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, lockTitle) : null,
       set_h(
         'div',
         { className: 'flex flex-wrap gap-2' },
@@ -3723,7 +3810,7 @@ function SettingsSkillCard() {
           size: 'sm',
           variant: installed ? 'secondary' : 'default',
           loading: busy === 'skill-install',
-          disabled: busy !== null || outdated,
+          disabled: busy !== null || state !== 'ok',
           title: lockTitle,
           onClick: () => run('skill-install', '/skill/install', 'Hermes skill installed'),
           children: installed ? 'Reinstall skill' : 'Install skill'
@@ -3733,7 +3820,7 @@ function SettingsSkillCard() {
               size: 'sm',
               variant: 'outline',
               loading: busy === 'skill-remove',
-              disabled: busy !== null || outdated,
+              disabled: busy !== null || state !== 'ok',
               title: lockTitle,
               onClick: () => run('skill-remove', '/skill/uninstall', 'Hermes skill removed'),
               children: 'Remove skill'

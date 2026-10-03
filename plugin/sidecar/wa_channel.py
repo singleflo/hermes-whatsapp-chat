@@ -1,15 +1,16 @@
 """Independent WhatsApp channel (supervisor) for hermes-whatsapp-chat.
 
-One LaunchAgent supervises one vendored Baileys bridge per WhatsApp account. The SQLite DB
+One service (LaunchAgent on macOS, systemd user unit on Linux, sign-in launcher on Windows) supervises
+one vendored Baileys bridge per WhatsApp account. The SQLite DB
 is the control plane: the UI writes the desired state, this service reconciles it every
 second and writes status, QR codes and a heartbeat back. Never touches Hermes' native WhatsApp.
 The bridge's npm dependencies are installed on first start (npm ci, log in logs/npm.log).
 
-    wa_channel.py install        # LaunchAgent: start now and at login (same as the plugin UI)
+    wa_channel.py install        # start now and at login (same as the plugin UI)
     wa_channel.py uninstall
     wa_channel.py status         # service + accounts
     wa_channel.py install-skill  # render the Hermes skill into <hermes home>/skills/
-    wa_channel.py run            # what launchd runs
+    wa_channel.py run            # what the service runs
 
 Run it with the plugin backend's Python (<data>/bin/hwc-python). Pairing (QR) happens in
 the plugin UI, not here.
@@ -78,8 +79,14 @@ api = _load_api()
 core = api.core
 
 # Precomputed so the self-uninstall still works after the plugin dir (and its code) is gone.
+PLATFORM = core.service._platform()
+IS_WINDOWS = PLATFORM == "win32"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{core.service.LABEL}.plist"
-BOOTOUT_TARGET = f"gui/{os.getuid()}/{core.service.LABEL}"
+BOOTOUT_TARGET = f"gui/{os.getuid()}/{core.service.LABEL}" if PLATFORM == "darwin" else ""
+UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / core.service.UNIT_NAME
+STARTUP_ENTRY = core.service.windows_startup_entry() if IS_WINDOWS else None
+STOP_MARKER = core.service.stop_marker_path()
+STOP_EXIT = 3  # exit code that tells the Windows supervisor (supervise.py) not to restart us
 
 
 def code_fingerprint(plugin_dir: Path) -> tuple[Any, ...] | None:
@@ -132,8 +139,10 @@ def bridge_deps_ready() -> bool:
 def install_bridge_deps(node: str) -> bool:
     """`npm ci` in the bridge dir with the npm next to the node binary; output goes to logs/npm.log."""
     node_bin = Path(node).resolve().parent
-    sibling = node_bin / "npm"
-    npm = str(sibling) if sibling.is_file() else shutil.which("npm")
+    npm = next(
+        (str(c) for c in (node_bin / "npm.cmd", node_bin / "npm") if c.is_file()),
+        shutil.which("npm"),
+    )
     logs = core.db.data_dir() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PATH": os.pathsep.join([str(node_bin), os.environ.get("PATH", "")])}
@@ -726,6 +735,11 @@ class Supervisor:
             self.slots[i] = self.pool.submit(core.automations.process_due, core.db.connect, int(time.time()))
 
     def tick(self) -> None:
+        if IS_WINDOWS and STOP_MARKER.exists():  # Windows stop request (no launchctl/systemctl to ask)
+            log("stop requested")
+            self.exit_action = "stopped"
+            self.stop_event.set()
+            return
         mono = time.monotonic()
         now = int(time.time())
         conn = self._connection()
@@ -815,8 +829,31 @@ class Supervisor:
         return False
 
     def _uninstall_self(self) -> None:
-        """The plugin was removed: delete the LaunchAgent plist and unload the service (kills this process,
-        so it is the last action). Plugin data is never touched. Uses only precomputed paths/values."""
+        """The plugin was removed: delete the service definition and unload the service (on macOS/Linux this
+        kills this process, so it is the last action; on Windows the exit code stops the supervisor).
+        Plugin data is never touched. Uses only precomputed paths/values."""
+        if IS_WINDOWS:
+            try:
+                if STARTUP_ENTRY is not None:
+                    STARTUP_ENTRY.unlink(missing_ok=True)
+            except OSError as exc:
+                log(f"could not delete {STARTUP_ENTRY}: {exc}")
+            return
+        if PLATFORM.startswith("linux"):
+            try:
+                UNIT_PATH.unlink(missing_ok=True)
+            except OSError as exc:
+                log(f"could not delete {UNIT_PATH}: {exc}")
+            env = core.service._systemd_env()
+            unit = core.service.UNIT_NAME
+            for args in (["disable", unit], ["daemon-reload"], ["stop", "--no-block", unit]):
+                try:
+                    subprocess.run(
+                        ["systemctl", "--user", *args], env=env, capture_output=True, timeout=30, check=False
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log(f"systemctl {args[0]} failed: {exc}")
+            return
         try:
             PLIST_PATH.unlink(missing_ok=True)
         except OSError as exc:
@@ -861,7 +898,7 @@ class Supervisor:
         self._drop_connection()
         if self.exit_action == "uninstall":
             self._uninstall_self()
-        return 0
+        return STOP_EXIT if self.exit_action in ("stopped", "uninstall") else 0
 
 
 # --- subcommands -----------------------------------------------------------------------
@@ -879,8 +916,8 @@ def _service_call(fn: Any, **kwargs: Any) -> dict:
 
 
 def cmd_install() -> int:
-    _service_call(core.service.install_service, now=int(time.time()))
-    print(f"installed {core.service.plist_path()}")
+    result = _service_call(core.service.install_service, now=int(time.time()))
+    print(f"installed {result['path']}")
     return 0
 
 
