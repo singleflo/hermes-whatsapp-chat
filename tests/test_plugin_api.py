@@ -505,15 +505,15 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
 
 
 def test_health_and_service_report_api_version(client, core):
-    assert core.service.API_VERSION == 8
-    assert client.get(f"{PREFIX}/health").json()["api_version"] == 8
-    assert client.get(f"{PREFIX}/service").json()["api_version"] == 8
+    assert core.service.API_VERSION == 9
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 9
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 9
 
 
 def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["api_version"]) == (False, 8)
+    assert (body["ok"], body["api_version"]) == (False, 9)
 
 
 def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):

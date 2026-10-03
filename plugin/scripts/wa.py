@@ -10,6 +10,12 @@ Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher writte
     tag ID +a -b
     takeover ID | handback ID
     search QUERY [--account ID]
+    check PHONE [PHONE ...] [--account ID|LABEL] [--json]
+                              is the number on WhatsApp? exit 0 all are, 2 when one is not
+    send-to PHONE TEXT [--account ID|LABEL] [--name NAME] [--json]
+                              send a first message to a number (creates the conversation); exit 2 not on WhatsApp
+    draft-to PHONE TEXT [--account ID|LABEL] [--name NAME] [--json]
+                              same, but store a draft for a human to approve
     jev show [--json]                         Jev exit conditions, their rules and the rules document
     jev on | jev off                          turn Jev classification on or off
     jev generate [FILE|-] [--no-check] [--apply] [--json]
@@ -19,7 +25,7 @@ Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher writte
     jev test TEXT | jev test --conversation ID [--json]
 
 Author of send/draft/state changes: agent:$HERMES_PROFILE when set, else cli.
-Exit codes: 0 ok, 1 error (message on stderr). `--json` prints machine-readable output.
+Exit codes: 0 ok, 1 error (message on stderr), 2 a number is not on WhatsApp. `--json` prints machine-readable output.
 """
 
 from __future__ import annotations
@@ -210,6 +216,64 @@ def cmd_handback(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     emit(args, s, summary_text(s))
 
 
+# --- new chat --------------------------------------------------------------------------
+
+
+def resolve_account(conn: sqlite3.Connection, value: str | None) -> int | None:
+    """``--account`` takes the numeric id or the label shown by ``wa list`` (case-insensitive)."""
+    if value is None:
+        return None
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    for account in core.accounts.list_accounts(conn):
+        if account["label"].casefold() == text.casefold():
+            return account["id"]
+    raise core.errors.NotFound(f"unknown account: {value}")
+
+
+def cmd_check(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    res = core.newchat.check_numbers(conn, args.phones, resolve_account(conn, args.account))
+    lines = []
+    for r in res["results"]:
+        if r["exists"]:
+            line = f"{r['phone']}  on WhatsApp  ({r['jid']})"
+            if r["conversation_id"]:
+                line += f"  conversation #{r['conversation_id']}"
+        else:
+            line = f"{r['phone']}  NOT on WhatsApp"
+        lines.append(line + ("  (this number)" if r["self"] else ""))
+    emit(args, res, "\n".join(lines))
+    return 0 if all(r["exists"] for r in res["results"]) else 2
+
+
+def _start(conn: sqlite3.Connection, args: argparse.Namespace, mode: str) -> dict:
+    who = author()
+    return core.newchat.start_conversation(
+        conn,
+        phone=args.phone,
+        text=args.text,
+        mode=mode,
+        account_id=resolve_account(conn, args.account),
+        name=args.name,
+        author=who,
+        actor=who,
+        now=int(time.time()),
+    )
+
+
+def cmd_send_to(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    res = _start(conn, args, "send")
+    where = "new conversation" if res["created"] else "existing conversation"
+    emit(args, res, f"sent #{res['message']['id']} to conversation {res['conversation']['id']} ({where})")
+
+
+def cmd_draft_to(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    res = _start(conn, args, "draft")
+    where = "new conversation" if res["created"] else "existing conversation"
+    emit(args, res, f"draft #{res['message']['id']} in conversation {res['conversation']['id']} ({where})")
+
+
 def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     res = core.conversations.search_messages(conn, args.query, account_id=args.account, now=int(time.time()))
     if args.json:
@@ -398,6 +462,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--account", type=int)
     p.set_defaults(fn=cmd_search)
 
+    p = sub.add_parser("check", parents=[common], help="is a number on WhatsApp? (exit 2 when not)")
+    p.add_argument("phones", nargs="+", metavar="PHONE")
+    p.add_argument("--account", help="account id or label")
+    p.set_defaults(fn=cmd_check)
+
+    for name, fn, what in (
+        ("send-to", cmd_send_to, "send a first message to a number"),
+        ("draft-to", cmd_draft_to, "save a draft for a number"),
+    ):
+        p = sub.add_parser(name, parents=[common], help=f"{what} (creates the conversation if needed)")
+        p.add_argument("phone")
+        p.add_argument("text")
+        p.add_argument("--account", help="account id or label")
+        p.add_argument("--name", help="contact name for a new conversation")
+        p.set_defaults(fn=fn)
+
     jev = sub.add_parser("jev", help="Jev exit conditions: rules document, conditions, rules")
     jsub = jev.add_subparsers(dest="jev_command", required=True)
 
@@ -433,16 +513,20 @@ def main(argv: list[str] | None = None) -> int:
         args.tags = [*args.tags, *extra]
     elif extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
+    code = 0
     try:
         with closing(core.db.connect()) as conn:
-            args.fn(conn, args)
+            code = args.fn(conn, args) or 0
+    except core.errors.NotOnWhatsApp as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except core.errors.WaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except (sqlite3.Error, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    return 0
+    return code
 
 
 if __name__ == "__main__":

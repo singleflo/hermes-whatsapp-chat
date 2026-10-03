@@ -15,6 +15,7 @@
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
  *   GET  /history        - Drain history-sync messages (WHATSAPP_SYNC_HISTORY=recent|full)
+ *   POST /check          - Which numbers have WhatsApp { phones: [digits with country code] }
  *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
@@ -1272,6 +1273,31 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// Which phone numbers have WhatsApp: { phones: ["393331234567", ...] } (digits with country code, at most 50).
+// One query per number: Baileys answers only for numbers that exist, under their WhatsApp JID (which may
+// differ from the digits sent, e.g. Brazilian mobile numbers), so results are matched by request order.
+app.post('/check', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const phones = Array.isArray(req.body?.phones) ? req.body.phones : null;
+  if (!phones || phones.length === 0 || phones.length > 50
+    || !phones.every((p) => typeof p === 'string' && /^\d{6,15}$/.test(p))) {
+    return res.status(400).json({ error: 'phones must be 1-50 strings of 6-15 digits including the country code' });
+  }
+  try {
+    const results = [];
+    for (const phone of phones) {
+      const found = await sock.onWhatsApp(`${phone}@s.whatsapp.net`);
+      const hit = Array.isArray(found) ? found.find((r) => r && r.exists && r.jid) : null;
+      results.push({ phone, exists: Boolean(hit), jid: hit ? normalizeWhatsAppId(hit.jid) : null });
+    }
+    res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Health check

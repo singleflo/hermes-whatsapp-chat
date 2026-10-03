@@ -75,6 +75,8 @@ The desktop page has three sections: **Chats**, **Board**, **Settings**.
 
 A conversation list (all numbers, filterable by number, state and unread; messages can be searched across all of them) next to the thread. You can reply with text or a file, take over from the agent or hand back, escalate, mute, tag, move to another state and read the audit trail of state changes. Agent drafts appear in the thread with a Draft marker: approve (optionally edit first) or discard. Messages are labeled with who wrote them: contact, you (board), the linked phone, an agent profile, a rule, or the CLI. Live updates arrive over a WebSocket, with a polling fallback.
 
+**New chat** starts a conversation with a number that never wrote to you: enter the number with its country code (`+39 333 1234567`), **Check number** tells you whether it is on WhatsApp (or already in your chats), then **Save draft** or **Send**. Rules: the country code is never guessed, text only (send files afterwards in the conversation), the new conversation starts In progress (Waiting once you send) and never counts as "a contact wrote first" for notifications or `conversation.created` rules, and at most 10 new chats per hour per number are allowed because WhatsApp can block numbers that cold-message people. Hermes can do the same with `wa check`, `wa send-to` and `wa draft-to`.
+
 ### Board
 
 Five columns, one card per conversation: New, In progress, Waiting, Muted, Closed (hidden until you ask for it). Cards show the contact, number, preview, age, unread count, tags, urgency and drafts. Drag a card to move it; dropping on Muted snoozes it for the configured number of hours.
@@ -140,13 +142,16 @@ Optional. You write your rules in plain words, like a `USER.md`: which situation
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa tag ID +vip -spam
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa takeover ID            # also: handback ID
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa search QUERY [--account ID]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa check PHONE [PHONE ...] [--account ID|LABEL]   # is it on WhatsApp? exit 0 yes, 2 not on WhatsApp
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa draft-to PHONE TEXT [--account ID|LABEL] [--name NAME]   # first message as a draft (preferred)
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa send-to PHONE TEXT [--account ID|LABEL] [--name NAME]    # real WhatsApp message, creates the conversation
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev show               # Jev rules, conditions and their rules; also: jev on | jev off
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev generate [FILE|-] [--apply]   # rules document -> conditions + rules (preview; --apply stores)
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev apply PLAN|- [--rules FILE]
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev test TEXT          # or --conversation ID
 ```
 
-`ID` is the conversation id. The author of CLI messages is `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`. Exit code 0 is success, 1 an error (message on stderr). `bin/wa` is created by **Install service** (or **Install skill**) and runs `plugin/scripts/wa.py` on the plugin's Python. The skill template (`plugin/skill/whatsapp-chat/SKILL.md`) teaches agents these commands and the draft-first etiquette; **Install skill** renders it with the absolute `bin/wa` path into `~/.hermes/skills/whatsapp-chat/SKILL.md`.
+`ID` is the conversation id; `PHONE` is international (`+39 333 1234567`); `--account` takes the number's id or its label as shown by `wa list` (needed only with several linked numbers). The author of CLI messages is `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`. Exit code 0 is success, 1 an error (message on stderr), 2 a number that is not on WhatsApp (`check`, `send-to`, `draft-to`). `bin/wa` is created by **Install service** (or **Install skill**) and runs `plugin/scripts/wa.py` on the plugin's Python. The skill template (`plugin/skill/whatsapp-chat/SKILL.md`) teaches agents these commands and the draft-first etiquette; **Install skill** renders it with the absolute `bin/wa` path into `~/.hermes/skills/whatsapp-chat/SKILL.md`.
 
 The service can also be driven from a terminal with `plugin/sidecar/wa_channel.py`: `install`, `uninstall`, `install-skill`, `status`, `run` (what the service runs). These do exactly what the UI buttons do.
 
@@ -200,7 +205,7 @@ An existing v1 database (single number, `wa-session`) is migrated automatically 
 
 ## Updating the vendored bridge
 
-`plugin/sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `plugin/sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`). This is maintainer work, done in a clone of this repository. To refresh it from a Hermes checkout:
+`plugin/sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `plugin/sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`; `0002-receipts-contacts.patch`, delivery receipts and contact names; `0003-check-numbers.patch`, `POST /check` to ask WhatsApp whether numbers exist). This is maintainer work, done in a clone of this repository. To refresh it from a Hermes checkout:
 
 ```bash
 plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]     # default ~/.hermes/hermes-agent

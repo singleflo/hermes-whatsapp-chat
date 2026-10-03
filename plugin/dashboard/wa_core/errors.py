@@ -29,3 +29,11 @@ class BadGateway(WaError):
 
 class TooLarge(WaError):
     status = 413
+
+
+class NotOnWhatsApp(WaError):
+    status = 404
+
+
+class TooMany(WaError):
+    status = 429

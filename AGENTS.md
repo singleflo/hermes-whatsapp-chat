@@ -43,7 +43,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 
 | Module | Responsibility |
 |---|---|
-| `errors.py` | `WaError(Exception)` with `.status`: `NotFound` 404, `Conflict` 409, `Invalid` 400, `Unavailable` 503, `BadGateway` 502, `TooLarge` 413 |
+| `errors.py` | `WaError(Exception)` with `.status`: `NotFound` 404, `Conflict` 409, `Invalid` 400, `Unavailable` 503, `BadGateway` 502, `TooLarge` 413, `NotOnWhatsApp` 404, `TooMany` 429 |
 | `db.py` | paths (`data_dir`, `db_path`), `SCHEMA`, v1/v2/v3/v4→v5 migrations, `connect()`, `write_txn()`, `jloads()` |
 | `settings.py` | pydantic `Settings` model (single JSON row `global`), `get_settings`, `write_settings` (inside the caller's transaction, emits `settings.updated`), `save_settings` (own transaction) |
 | `accounts.py` | accounts CRUD, desired state, restart, status/QR, service heartbeat/`service_info` (`running`, `installed`, `skill_installed`, `node`; `install_command` is always `None`, kept for compatibility), session/media paths |
@@ -51,6 +51,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | `conversations.py` | board, list, detail, state machine, mute/takeover/escalate/read/tags, search, timers (`run_timers`) |
 | `contacts.py` | LID→phone resolution, ignored/system/self JIDs, `apply_contact` (names), `repair_lid_conversations` |
 | `outbound.py` | `send_text`, `send_media`, drafts (`create_draft`, `approve_draft`, `discard_draft`) |
+| `newchat.py` | New chat: `normalize_phone`, `pick_account`, `check_numbers` (bridge `POST /check`), `start_conversation` (below) |
 | `ingest.py` | `ingest_event`: the rules engine for inbound/owner/history messages |
 | `media.py` | media listing and `data:` URLs (path-prefix guarded) |
 | `events.py` | `emit()`: inserts an `events` row and enqueues matching automation runs |
@@ -59,7 +60,7 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | `jev.py` | Jev exit conditions: API key, request/answer building, `enqueue_for_message`/`enqueue_now`, `process_due` worker, `score_state` (pure, thread-safe), `score_conversation`/`score_text` (sync tests), `summary_text` |
 | `jev_rules.py` | Jev rules document: `generate` (Hermes one-shot → validated plan + Jev check of the examples), `apply` (document + exits + managed rules in one transaction), `plan_rules`, `normalize_plan`, `status` |
 | `jev_api.py` | `router` with the Jev routes (`/jev`, `/jev/key`, `/jev/generate` + `/jev/generate/{job_id}`, `/jev/apply`, `/jev/test`, `/conversations/{id}/classify`), included by `plugin_api.py` |
-| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`/`ensure_service`, `install_skill`/`uninstall_skill`, `service_installed`, `auto_install_enabled`, `linger_enabled`, `skill_installed`, `find_node`, `API_VERSION` (8). Subprocess calls go through `_run(argv, env=None)`, the Windows start through `_spawn` (test seams) |
+| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`/`ensure_service`, `install_skill`/`uninstall_skill`, `service_installed`, `auto_install_enabled`, `linger_enabled`, `skill_installed`, `find_node`, `API_VERSION` (9). Subprocess calls go through `_run(argv, env=None)`, the Windows start through `_spawn` (test seams) |
 
 ### Multi-account model
 
@@ -86,6 +87,7 @@ Errors are `{"detail": str}`.
 - Settings: `GET|PUT /settings` (PUT replaces the whole validated object, 422 on invalid).
 - Reading: `GET /board?account_id=&q=&include_closed=`, `GET /conversations?account_id=&state=&q=&unread_only=&limit=&offset=`, `GET /conversations/{id}`, `GET /conversations/{id}/messages?before_id=&limit=`, `GET /messages/{id}/media/{index}`, `GET /search?q=&account_id=`.
 - Mutations: `POST /conversations/{id}/state|mute|takeover|handback|escalate|read`, `PUT /conversations/{id}/tags`, `POST /conversations/{id}/reply|reply-media|drafts`, `POST /messages/{id}/approve|discard`.
+- New chat: `POST /contacts/check` (`{phones: 1–50, account_id?}` → `{account_id, results: [{input, phone, exists, jid, self, conversation_id}]}`), `POST /conversations` (`{phone, text 1–4096, mode: "send"|"draft" = "draft", account_id?, name? ≤ 120}` → `{conversation, created, message}`; 400 bad/own number or several numbers, 404 not on WhatsApp, 429 rate limit, 503 no linked number or bridge down).
 - Automations (`automations_api.router`): `GET|POST /automations`, `PUT|DELETE /automations/{id}`, `POST /automations/reorder`, `POST /automations/{id}/test` (dry run), `GET /automation-runs`, `POST /automation-runs/{id}/retry`.
 - Jev (`jev_api.router`): `GET /jev` → `jev_rules.status` (`{enabled, key_set, key_source, model, document, conditions: [{id, label, description, min_score, rules: [{id, name, enabled, managed}]}], else: {rules}}`; key source `settings`|`env`|null, the key is never returned), `PUT /jev/key` (`{api_key}`, empty removes; same shape), `POST /jev/generate` (`{document ≤ 20000, check = true}` → starts a background job and returns it at once: `{job_id, status: "running", started_at}`; 400 empty/too long; nothing persisted), `GET /jev/generate/{job_id}` (`status` `running` | `done` with `result = {plan, model, latency_ms, attempts, checks, check_error}` | `failed` with `error` and `error_status` 502 when Hermes fails or twice returns an invalid plan, 503 when Hermes cannot run; 404 unknown job, e.g. after a backend restart), `POST /jev/apply` (`{document, plan}` → `{settings, rules}`; 400 invalid plan), `POST /jev/test` (exactly one of `conversation_id` / `text`, else 400; optional `conditions` replace the stored ones; synchronous, nothing persisted → `{state, scores, exit, score, summary, model, latency_ms, usage}`; 400 no key/no exits, 502 Jev error with its detail, 503 unreachable), `POST /conversations/{id}/classify` (`{queued, run_id}`; 400 when disabled, no key or no exits). `GET /conversations/{id}` also returns `classification` (also nested in `conversation`) and `jev_runs` (last 5). Automation rules carry `managed_by`.
 - `WS /events`.
@@ -113,6 +115,12 @@ One JSON row, key `global`, validated by the pydantic `Settings` model with defa
 
 - Conversations are keyed by the contact's phone JID when the account session knows the LID→phone mapping (`lid-mapping-<lid>_reverse.json` in the session dir); unmapped LIDs stay `@lid` and show "Unknown contact". System chats (`0@s.whatsapp.net`, `status@broadcast`, broadcasts, newsletters, groups) and the own-number chat are never stored. The sidecar runs `contacts.repair_lid_conversations` every 30 s (rename or merge existing LID rows, delete system/self chats). Names come from history `contactName` and bridge `contacts.upsert/update` items (`contacts.apply_contact`, never overwrites an existing name).
 - Bridge `GET /updates` (patch 0002) feeds delivery receipts and contact items to `ingest.ingest_update`; receipts that arrive before the `wa_id` is stored are retried by the sidecar for 120 s.
+
+### New chat (`wa_core/newchat.py`)
+
+- `normalize_phone`: digits with country code. `+…` or `00…` accepted; a leading single `0` (national number) or bare digits under 11 are refused (the country is never guessed); 8–15 digits.
+- `pick_account`: explicit id (must be a linked, running WhatsApp number) or the only one that is; none → 503, several → 400. `check_numbers` calls the bridge `POST /check` (patch 0003) outside any transaction.
+- `start_conversation`: an existing conversation of that number (chat jid or `phone` column) is reused (no check, no limit, name never overwritten). Otherwise: at most 10 new chats per hour per number (state-log rows with reason `conversation started` → 429), bridge check (404 `NotOnWhatsApp` creates nothing), then one transaction inserts the conversation (`in_progress`, jid as returned by WhatsApp), its state-log row and `conversation.updated` (`fields: ["created"]`, `origin: "outbound"`). It deliberately emits **no** `conversation.created`: that event means a contact wrote first and drives notifications and automations. Then `outbound.send_text` (→ `waiting` by the outbound rule) or `create_draft` (stays `in_progress`). Text only.
 
 ### Events and automations
 
@@ -162,11 +170,11 @@ Subcommands: `run`, `install`, `uninstall`, `install-skill` (the three delegate 
 
 ### Bridge patches policy
 
-`plugin/sidecar/whatsapp-bridge/` is copied verbatim from Hermes (`scripts/whatsapp-bridge`) and **never edited by hand**. Local changes are versioned patches in `plugin/sidecar/patches/*.patch` (currently `0001-history-sync.patch`: `WHATSAPP_SYNC_HISTORY=off|recent|full` and `GET /history`; `0002-receipts-contacts.patch`: `GET /updates` receipts/contacts, history `contactName`, batch `POST /read`). Refresh with `plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]` (stages in a temp dir, applies patches in order, fails without touching the vendored copy if one does not apply, rewrites `UPSTREAM`), then `npm ci --prefix plugin/sidecar/whatsapp-bridge`. Keep patches minimal. `node_modules/` stays gitignored (the scanner on install allows ≤400 files, ≤10 MB, ≤1 MB/file, no escaping symlinks).
+`plugin/sidecar/whatsapp-bridge/` is copied verbatim from Hermes (`scripts/whatsapp-bridge`) and **never edited by hand**. Local changes are versioned patches in `plugin/sidecar/patches/*.patch` (currently `0001-history-sync.patch`: `WHATSAPP_SYNC_HISTORY=off|recent|full` and `GET /history`; `0002-receipts-contacts.patch`: `GET /updates` receipts/contacts, history `contactName`, batch `POST /read`; `0003-check-numbers.patch`: `POST /check {phones}` → `{results: [{phone, exists, jid}]}` through `sock.onWhatsApp`). Refresh with `plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]` (stages in a temp dir, applies patches in order, fails without touching the vendored copy if one does not apply, rewrites `UPSTREAM`), then `npm ci --prefix plugin/sidecar/whatsapp-bridge`. Keep patches minimal. `node_modules/` stays gitignored (the scanner on install allows ≤400 files, ≤10 MB, ≤1 MB/file, no escaping symlinks).
 
 ### CLI and skill
 
-`plugin/scripts/wa.py`: `list [--state S] [--account ID] [--unread] [--limit N] [--json]`, `show ID`, `send ID TEXT`, `draft ID TEXT`, `state ID STATE [--reason R]`, `tag ID +a -b`, `takeover ID`, `handback ID`, `search QUERY [--account ID]`. It loads `../dashboard/plugin_api.py` relative to its own file and calls `core` directly (same for `plugin/scripts/seed_demo.py`). Installed users run it as `<data>/bin/wa`; in dev, `uv run python plugin/scripts/wa.py`. Author of what it writes: `agent:$HERMES_PROFILE` if set, else `cli`. Exit 0 ok, 1 error (message on stderr). The skill template `plugin/skill/whatsapp-chat/SKILL.md` documents it with the `{{WA_CLI}}` token (draft-first rule); keep it in sync with the CLI.
+`plugin/scripts/wa.py`: `list [--state S] [--account ID] [--unread] [--limit N] [--json]`, `show ID`, `send ID TEXT`, `draft ID TEXT`, `state ID STATE [--reason R]`, `tag ID +a -b`, `takeover ID`, `handback ID`, `search QUERY [--account ID]`, `check PHONE… [--account ID|LABEL] [--json]`, `send-to PHONE TEXT` / `draft-to PHONE TEXT` (`[--account ID|LABEL] [--name NAME] [--json]`, `newchat.start_conversation`). `--account` of the new-chat commands takes the id or the label shown by `wa list` (case-insensitive; unknown → `unknown account: X`, exit 1). It loads `../dashboard/plugin_api.py` relative to its own file and calls `core` directly (same for `plugin/scripts/seed_demo.py`). Installed users run it as `<data>/bin/wa`; in dev, `uv run python plugin/scripts/wa.py`. Author of what it writes (also the state-log actor of a new chat): `agent:$HERMES_PROFILE` if set, else `cli`. Exit 0 ok, 1 error (message on stderr), 2 a number is not on WhatsApp (`check` with any missing number, `send-to`/`draft-to` on `NotOnWhatsApp`). The skill template `plugin/skill/whatsapp-chat/SKILL.md` documents it with the `{{WA_CLI}}` token (draft-first rule); keep it in sync with the CLI.
 
 `wa jev …` (same module `jev_rules`): `show [--json]` (status, rules document, conditions with their rules, Else), `on` / `off` (`settings.jev.enabled`), `generate [FILE|-] [--no-check] [--apply] [--json]` (preview of the plan with ✓/✗ per example; document = FILE, stdin or the stored one; `--apply` stores it), `apply PLAN|- [--rules FILE] [--json]` (PLAN = a generate result or a bare plan), `test TEXT | --conversation ID [--json]`.
 
@@ -191,7 +199,7 @@ Use only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI (
 | `plugin/scripts/seed_demo.py` | Demo data in a `kind='demo'` account (`--reset` / `--remove`); demo chats are `@demo.invalid` |
 | `plugin/skill/whatsapp-chat/` | Skill **template** teaching agents the CLI (`{{WA_CLI}}` token; rendered by Install skill) |
 | `.agents/skills/` | Project skills (Hermes plugin development, desktop plugins, Hermes agent) |
-| `tests/` | pytest suite: `test_plugin_api.py`, `test_automations.py`, `test_jev.py`, `test_jev_rules.py` |
+| `tests/` | pytest suite: `test_plugin_api.py`, `test_automations.py`, `test_jev.py`, `test_jev_rules.py`, `test_newchat.py` |
 | `docs/` | Original build kit (01–07 background; 08 spec is superseded) and `docs/skills/`, `docs/examples/` |
 | root | Dev-only: `pyproject.toml`, `package.json`, eslint/prettier configs, `README.md`, `AGENTS.md` |
 
@@ -298,7 +306,7 @@ The JS halves are hand-written files that load as-is; there is no build step.
 | `plugin/sidecar/_vendor/segno/` | Vendored QR library (do not edit) |
 | `plugin/sidecar/update_bridge.sh`, `plugin/sidecar/patches/` | Vendored bridge refresh and local patches |
 | `plugin/scripts/wa.py`, `plugin/skill/whatsapp-chat/SKILL.md` | CLI and skill template for Hermes agents |
-| `tests/test_plugin_api.py`, `tests/test_automations.py`, `tests/test_jev.py`, `tests/test_jev_rules.py` | pytest suites (real router + tmp SQLite) |
+| `tests/test_plugin_api.py`, `tests/test_automations.py`, `tests/test_jev.py`, `tests/test_jev_rules.py`, `tests/test_newchat.py` | pytest suites (real router + tmp SQLite) |
 | `plugin/desktop/plugin.js` / `plugin/dashboard/dist/index.js` | The two UI halves |
 | `plugin/dashboard/manifest.json` | Required fields: `name`, `tab.path`, `entry`. `api` points to `plugin_api.py` |
 | `plugin/plugin.yaml` | `name`, `version`, `description`, `python_runtime: external` |
@@ -325,6 +333,7 @@ The JS halves are hand-written files that load as-is; there is no build step.
 
 - **Framework:** pytest with FastAPI `TestClient` (requires `httpx`). Files: `tests/test_plugin_api.py` (routes, rules engine, accounts, outbound, migration, settings, events), `tests/test_automations.py` (matching, executor, actions, retries, loop guard) and `tests/test_jev.py` (Jev settings/key, enqueue and debounce, classification and decision, retries, rules/`{jev}`, routes, migrations, conversation deletes/merges; the Jev HTTP call is faked at `jev._post`).
   - `tests/test_jev_rules.py` covers the rules document (plan normalisation, generate/retry/check, plan → rules, apply replacing only managed rules, `/jev/test` with text and conditions, the `wa jev` CLI); fakes only `jev_rules._run_hermes` (and `subprocess.run` inside it for its own test) and `jev._post`.
+  - `tests/test_newchat.py` covers new chat (phone normalisation, account choice, number checks, creating/reusing conversations, rate limit, routes, the `wa check|send-to|draft-to` CLI); fakes only `core.bridge.bridge_request`.
 - **Pattern:**
   1. Load the **real** `plugin/dashboard/plugin_api.py` with `importlib.util.spec_from_file_location` (the `wa_core` package loads fresh through it).
   2. Mount `mod.router` in a bare `FastAPI()` with prefix `/api/plugins/hermes-whatsapp-chat`.

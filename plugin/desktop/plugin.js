@@ -238,7 +238,7 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 8
+const REQUIRED_API_VERSION = 9
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
   'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
@@ -1060,7 +1060,7 @@ function SearchResults({ q, accountId, selectedId, onSelect }) {
   )
 }
 
-function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSelect }) {
+function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSelect, onNewChat }) {
   const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
   const [mode, setMode] = useState('chats')
@@ -1091,11 +1091,28 @@ function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSel
     h(
       'div',
       { style: { ...F.col, gap: 8, padding: 10, borderBottom: BORDER } },
-      h(Input, {
-        value: qInput,
-        placeholder: mode === 'chats' ? 'Search name or phone' : 'Search messages',
-        onChange: e => setQInput(e.target.value)
-      }),
+      h(
+        'div',
+        { style: { ...F.row, gap: 6 } },
+        h(Input, {
+          value: qInput,
+          placeholder: mode === 'chats' ? 'Search name or phone' : 'Search messages',
+          onChange: e => setQInput(e.target.value),
+          style: { flex: '1 1 auto', minWidth: 0 }
+        }),
+        h(
+          Button,
+          {
+            size: 'sm',
+            variant: 'secondary',
+            title: 'Check a number on WhatsApp and start a new chat',
+            onClick: onNewChat,
+            style: { flex: '0 0 auto' }
+          },
+          h(Codicon, { name: 'add' }),
+          'New chat'
+        )
+      ),
       h(SegmentedControl, {
         options: [
           { id: 'chats', label: 'Conversations' },
@@ -2197,8 +2214,197 @@ function BoardView({ accountId, onOpen }) {
 
 // --- Page ----------------------------------------------------------------------------------
 
+// "New chat" panel: check a number on WhatsApp and write to someone with no conversation yet.
+function NewChatPanel({ accountId, onClose, onOpen }) {
+  const accounts = useApi('accounts', '/accounts')
+  const list = useMemo(
+    () => ((accounts.data && accounts.data.accounts) || []).filter(a => a.kind !== 'demo' && a.desired !== 'removed'),
+    [accounts.data]
+  )
+  const [chosen, setChosen] = useState(null)
+  const [phone, setPhone] = useState('')
+  const [name, setName] = useState('')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState('')
+  const [checked, setChecked] = useState(null)
+
+  const account =
+    list.find(a => a.id === chosen) ||
+    list.find(a => a.id === accountId) ||
+    list.find(a => accountState(a) === 'connected') ||
+    list[0] ||
+    null
+  const checkKey = phone.trim() + '\0' + (account ? account.id : '')
+  const result = checked && checked.key === checkKey ? checked.result : null
+  const ready = Boolean(account) && phone.trim() !== ''
+
+  const check = async () => {
+    if (!ready || busy) {
+      return
+    }
+    setBusy('check')
+    setError('')
+    try {
+      const body = { phones: [phone.trim()], account_id: account.id }
+      const data = await rest('/contacts/check', { method: 'POST', body })
+      setChecked({ key: checkKey, result: data.results[0] })
+    } catch (err) {
+      setError(set_errMsg(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const submit = async mode => {
+    if (!ready || !text.trim() || busy) {
+      return
+    }
+    setBusy(mode)
+    setError('')
+    try {
+      const body = { phone: phone.trim(), text: text.trim(), mode, account_id: account.id }
+      if (name.trim()) {
+        body.name = name.trim()
+      }
+      const data = await rest('/conversations', { method: 'POST', body, timeoutMs: 90000 })
+      await refresh()
+      onOpen(data.conversation.id)
+    } catch (err) {
+      setError(set_errMsg(err))
+      setBusy(null)
+    }
+  }
+
+  let verdict = null
+  if (result) {
+    if (result.self) {
+      verdict = h(Badge, { variant: 'warn' }, 'This is your own number')
+    } else if (result.conversation_id) {
+      verdict = h(
+        'div',
+        { style: { ...F.row, gap: 8 } },
+        h(Badge, { variant: 'outline' }, 'Already in your chats'),
+        h(Button, { size: 'xs', variant: 'secondary', onClick: () => onOpen(result.conversation_id) }, 'Open')
+      )
+    } else if (result.exists) {
+      verdict = h(Badge, { variant: 'success' }, 'On WhatsApp')
+    } else {
+      verdict = h(Badge, { variant: 'destructive' }, 'Not on WhatsApp')
+    }
+  }
+
+  return h(
+    'div',
+    { style: { ...F.col, ...F.fill, overflowY: 'auto', padding: 16 } },
+    h(
+      'div',
+      { style: { ...F.col, gap: 12, width: '100%', maxWidth: '32rem' } },
+      h(
+        'div',
+        { style: { ...F.row, gap: 8 } },
+        h('span', { style: { flex: '1 1 auto', fontSize: 14, fontWeight: 600 } }, 'New chat'),
+        h(Button, { size: 'xs', variant: 'ghost', title: 'Close', onClick: onClose }, h(Codicon, { name: 'close' }))
+      ),
+      list.length >= 2
+        ? h(
+            SettingsField,
+            { label: 'Number' },
+            h(SettingsSelect, {
+              value: account ? account.id : '',
+              onChange: v => setChosen(Number(v)),
+              options: list.map(a => [a.id, a.label])
+            })
+          )
+        : null,
+      !account && accounts.data
+        ? h('div', { style: T.warn }, 'No WhatsApp number is linked: add one in Settings.')
+        : null,
+      h(
+        SettingsField,
+        { label: 'Phone number' },
+        h(
+          'div',
+          { style: { ...F.row, gap: 8 } },
+          h(Input, {
+            value: phone,
+            placeholder: '+39 333 1234567',
+            onChange: e => setPhone(e.target.value),
+            onKeyDown: e => {
+              if (isSubmitEnter(e)) {
+                check()
+              }
+            },
+            style: { flex: '1 1 auto', minWidth: 0 }
+          }),
+          h(
+            Button,
+            {
+              size: 'sm',
+              variant: 'secondary',
+              loading: busy === 'check',
+              disabled: !ready || (busy !== null && busy !== 'check'),
+              onClick: check,
+              style: { flex: '0 0 auto' }
+            },
+            'Check number'
+          )
+        ),
+        verdict
+      ),
+      h(
+        SettingsField,
+        { label: 'Name (optional)' },
+        h(Input, { value: name, placeholder: 'Contact name', onChange: e => setName(e.target.value) })
+      ),
+      h(
+        SettingsField,
+        { label: 'Message' },
+        h(Textarea, {
+          value: text,
+          rows: 5,
+          placeholder: 'Write the first message',
+          onChange: e => setText(e.target.value)
+        })
+      ),
+      error ? h('div', { style: { color: 'var(--ui-red)', fontSize: 12 } }, error) : null,
+      h(
+        'div',
+        { style: { ...F.row, gap: 8 } },
+        h(
+          Button,
+          {
+            size: 'sm',
+            loading: busy === 'draft',
+            disabled: !ready || !text.trim() || (busy !== null && busy !== 'draft'),
+            onClick: () => submit('draft')
+          },
+          'Save draft'
+        ),
+        h(
+          Button,
+          {
+            size: 'sm',
+            variant: 'secondary',
+            loading: busy === 'send',
+            disabled: !ready || !text.trim() || (busy !== null && busy !== 'send'),
+            onClick: () => submit('send')
+          },
+          'Send'
+        )
+      ),
+      h(
+        'div',
+        { style: T.muted },
+        'First messages to people who never wrote to you can get the number blocked by WhatsApp: introduce yourself and keep it to a few chats an hour.'
+      )
+    )
+  )
+}
+
 function ChatsView({ accountId, selected, onSelect }) {
   const [stateFilter, setStateFilter] = useState('')
+  const [newChat, setNewChat] = useState(false)
   const [infoOpen, setInfoOpen] = useState(() => Boolean(ctxRef.storage.get('infoOpen', false)))
 
   const setInfo = useCallback(value => {
@@ -2221,21 +2427,40 @@ function ChatsView({ accountId, selected, onSelect }) {
   return h(
     'div',
     { style: { display: 'flex', ...F.fill } },
-    h(ConvSidebar, { accountId, stateFilter, setStateFilter, selectedId: selected, onSelect }),
-    selected
-      ? h(ChatPane, {
-          key: selected,
-          id: selected,
-          infoOpen,
-          onToggleInfo: () => setInfo(!infoOpen),
-          onCloseInfo: () => setInfo(false)
+    h(ConvSidebar, {
+      accountId,
+      stateFilter,
+      setStateFilter,
+      selectedId: selected,
+      onSelect: id => {
+        setNewChat(false)
+        onSelect(id)
+      },
+      onNewChat: () => setNewChat(true)
+    }),
+    newChat
+      ? h(NewChatPanel, {
+          accountId,
+          onClose: () => setNewChat(false),
+          onOpen: id => {
+            setNewChat(false)
+            onSelect(id)
+          }
         })
-      : h(
-          'div',
-          { style: { ...F.col, ...F.fill, alignItems: 'center', justifyContent: 'center', gap: 6 } },
-          h(Codicon, { name: 'comment-discussion', size: '2rem', style: T.muted }),
-          h('div', { style: T.muted }, 'Select a conversation')
-        )
+      : selected
+        ? h(ChatPane, {
+            key: selected,
+            id: selected,
+            infoOpen,
+            onToggleInfo: () => setInfo(!infoOpen),
+            onCloseInfo: () => setInfo(false)
+          })
+        : h(
+            'div',
+            { style: { ...F.col, ...F.fill, alignItems: 'center', justifyContent: 'center', gap: 6 } },
+            h(Codicon, { name: 'comment-discussion', size: '2rem', style: T.muted }),
+            h('div', { style: T.muted }, 'Select a conversation')
+          )
   )
 }
 

@@ -22,11 +22,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi import status as http_status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +141,19 @@ class ReplyMediaBody(BaseModel):
 
 class ApproveBody(BaseModel):
     text: str | None = None
+
+
+class CheckBody(BaseModel):
+    phones: list[str] = Field(min_length=1, max_length=50)
+    account_id: int | None = None
+
+
+class NewChatBody(BaseModel):
+    phone: str = Field(min_length=1, max_length=40)
+    text: str = Field(min_length=1, max_length=4096)
+    mode: Literal["send", "draft"] = "draft"
+    account_id: int | None = None
+    name: str | None = Field(default=None, max_length=120)
 
 
 # --- Health, service, accounts -----------------------------------------------------
@@ -430,6 +443,31 @@ def approve_draft(message_id: int, payload: ApproveBody | None = None) -> dict[s
 def discard_draft(message_id: int) -> dict[str, Any]:
     with _session("draft discard failed") as conn:
         return core.outbound.discard_draft(conn, message_id, now=_now())
+
+
+# --- New chat -------------------------------------------------------------------------
+
+
+@router.post("/contacts/check")
+def check_contacts(payload: CheckBody) -> dict[str, Any]:
+    with _session("number check failed") as conn:
+        return core.newchat.check_numbers(conn, payload.phones, payload.account_id)
+
+
+@router.post("/conversations")
+def start_conversation(payload: NewChatBody) -> dict[str, Any]:
+    with _session("new chat failed") as conn:
+        return core.newchat.start_conversation(
+            conn,
+            phone=payload.phone,
+            text=payload.text,
+            mode=payload.mode,
+            account_id=payload.account_id,
+            name=payload.name,
+            author="user",
+            actor="user",
+            now=_now(),
+        )
 
 
 # --- WebSocket: /events?since=<event id> ---------------------------------------------
