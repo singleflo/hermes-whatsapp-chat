@@ -669,7 +669,7 @@ def test_linux_install_writes_the_unit_and_runs_systemctl_in_order(client, core,
     lines = linux.unit.read_text().splitlines()
     assert lines[0] == "[Unit]" and "[Service]" in lines and "[Install]" in lines
     assert f'ExecStart="{linux.py}" "{PLUGIN_DIR / "sidecar" / "wa_channel.py"}" run' in lines
-    assert f'WorkingDirectory="{PLUGIN_DIR}"' in lines
+    assert f"WorkingDirectory={PLUGIN_DIR}" in lines
     assert f'Environment="WA_NODE={linux.node}"' in lines
     assert f'Environment="HERMES_HOME={tmp_path / "home"}"' in lines
     assert f'Environment="PATH={linux.node.parent}:/usr/local/bin:/usr/bin:/bin"' in lines
