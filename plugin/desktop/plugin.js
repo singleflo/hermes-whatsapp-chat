@@ -2441,14 +2441,16 @@ function onFrame(frame) {
 
 // --- Per-number routes ------------------------------------------------------------------------
 
-// One page route + one sidebar entry per WhatsApp number (`/wa-board-<account id>`). Registered at
-// runtime from /accounts and re-registered only when the list of numbers changes.
+// One page route + one sidebar entry per WhatsApp number (`/wa-board-<account id>`), only when there
+// are two or more numbers (with one number they would duplicate "Conversations"). Registered at
+// runtime from /accounts and re-registered only when the effective list changes.
 let numberRoutes = { key: '', dispose: null }
 
 function syncNumberRoutes(accounts) {
-  const list = accounts
+  const all = accounts
     .filter(a => a.kind === 'whatsapp' && a.desired !== 'removed')
     .map(a => ({ id: a.id, label: a.label }))
+  const list = all.length > 1 ? all : []
   const key = JSON.stringify(list)
   if (key === numberRoutes.key) {
     return
