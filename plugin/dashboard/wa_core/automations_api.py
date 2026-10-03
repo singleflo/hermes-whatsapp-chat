@@ -14,7 +14,10 @@ from . import automations, db, errors
 router = APIRouter()
 
 State = Literal["new", "in_progress", "waiting", "muted", "closed"]
-EventType = Literal["message.in", "message.out", "conversation.created", "conversation.state_changed"]
+EventType = Literal[
+    "message.in", "message.out", "conversation.created", "conversation.state_changed", "conversation.classified"
+]
+JEV_EXIT_ID = r"^[a-z][a-z0-9_]{0,39}$"
 
 
 class _Strict(BaseModel):
@@ -30,6 +33,7 @@ class Conditions(_Strict):
     tags_any: Optional[list[str]] = None
     first_message: Optional[bool] = None
     directions: Optional[list[Literal["in", "out"]]] = None
+    jev_exits: Optional[list[Annotated[str, Field(pattern=JEV_EXIT_ID)]]] = None
 
     @field_validator("text_regex")
     @classmethod

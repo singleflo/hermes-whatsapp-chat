@@ -62,6 +62,7 @@ RECEIPT_RETRY_SECONDS = 120.0  # a receipt may beat the backend storing the wa_i
 HISTORY_INGEST_PER_TICK = 300
 HTTP_TIMEOUT = 5.0
 AUTOMATION_THREADS = 2
+JEV_THREADS = 1
 CODE_CHECK_SECONDS = 5.0
 PLUGIN_GONE_SECONDS = 120.0  # plugin.yaml missing this long = removed (shorter = a reinstall in progress)
 
@@ -664,8 +665,9 @@ class Supervisor:
         self.runners: dict[int, Runner] = {}
         self.stop_event = threading.Event()
         self.started_at = int(time.time())
-        self.pool = ThreadPoolExecutor(max_workers=AUTOMATION_THREADS, thread_name_prefix="automations")
+        self.pool = ThreadPoolExecutor(max_workers=AUTOMATION_THREADS + JEV_THREADS, thread_name_prefix="automations")
         self.slots: list[Future | None] = [None] * AUTOMATION_THREADS
+        self.jev_slot: Future | None = None
         self.last_timers = 0.0
         self.last_precondition_check = time.monotonic()
         self.code_fp = code_fingerprint(PLUGIN_DIR)
@@ -734,6 +736,15 @@ class Supervisor:
                     log(f"automations: worker failed: {exc!r}")
             self.slots[i] = self.pool.submit(core.automations.process_due, core.db.connect, int(time.time()))
 
+    def _jev(self) -> None:
+        if self.jev_slot is not None:
+            if not self.jev_slot.done():
+                return
+            exc = self.jev_slot.exception()
+            if exc is not None:
+                log(f"jev: worker failed: {exc!r}")
+        self.jev_slot = self.pool.submit(core.jev.process_due, core.db.connect, int(time.time()))
+
     def tick(self) -> None:
         if IS_WINDOWS and STOP_MARKER.exists():  # Windows stop request (no launchctl/systemctl to ask)
             log("stop requested")
@@ -790,6 +801,7 @@ class Supervisor:
                 except Exception as exc:
                     log(f"account {account['id']}: repair failed: {exc!r}")
         self._automations()
+        self._jev()
 
     def _finish(self, runners: list[Runner]) -> None:
         """Terminate every child of the given runners, killing after the grace period."""

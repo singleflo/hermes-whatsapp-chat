@@ -45,7 +45,7 @@ _BREAKAWAY_FROM_JOB = 0x01000000
 # Version of the HTTP route surface. Hermes mounts plugin routes only at server startup, so after a plugin
 # update the UI can talk to the old backend still in memory: the UI compares this with its required
 # version. BUMP IT ON ANY ROUTE CHANGE (new/removed/changed route or response shape the UI relies on).
-API_VERSION = 5
+API_VERSION = 6
 # The service heartbeat is written every second; older than this means the service is not alive.
 SERVICE_STALE_SECONDS = 15
 WINDOWS_STOP_SECONDS = 20.0

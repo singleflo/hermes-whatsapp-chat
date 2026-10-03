@@ -1,4 +1,4 @@
-"""Paths, schema v3, v1/v2 -> v3 migrations, connection helpers."""
+"""Paths, schema v4, v1/v2/v3 -> v4 migrations, connection helpers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 PLUGIN_ID = "hermes-whatsapp-chat"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEMO_SUFFIX = "@demo.invalid"
 
 SCHEMA = """
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   priority INTEGER NOT NULL DEFAULT 0, muted_until INTEGER,
   last_message_at INTEGER, last_inbound_at INTEGER,
   unread_count INTEGER NOT NULL DEFAULT 0, agent_active INTEGER NOT NULL DEFAULT 1,
-  tags TEXT NOT NULL DEFAULT '[]', created_at INTEGER, updated_at INTEGER,
+  tags TEXT NOT NULL DEFAULT '[]', created_at INTEGER, updated_at INTEGER, classification TEXT,
   UNIQUE (account_id, chat_jid));
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   conversation_id INTEGER, status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
   attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER, output TEXT, error TEXT,
   created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
+CREATE TABLE IF NOT EXISTS jev_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+  message_id INTEGER, status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
+  attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER, error TEXT, model TEXT,
+  latency_ms INTEGER, input_tokens INTEGER,
+  created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conversation_id, ts, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(account_id, wa_id) WHERE wa_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_state ON conversations(state);
@@ -79,6 +85,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_last ON conversations(last_message_
 CREATE INDEX IF NOT EXISTS idx_state_log_conv ON conversation_state_log(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON automation_runs(status, not_before);
+CREATE INDEX IF NOT EXISTS idx_jev_runs_status ON jev_runs(status, not_before);
+CREATE INDEX IF NOT EXISTS idx_jev_runs_conv ON jev_runs(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_drafts ON messages(conversation_id) WHERE status = 'draft';
 """
 
@@ -167,10 +175,21 @@ def _upgrade(conn: sqlite3.Connection) -> None:
             _migrate_v1(conn, int(time.time()))
         elif version == 2:
             _migrate_v2(conn)
+            _migrate_v3(conn)
+        elif version == 3:
+            _migrate_v3(conn)
         else:
             for stmt in _statements():
                 conn.execute(stmt)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """v3 -> v4: ``conversations.classification`` and the ``jev_runs`` table."""
+    if "classification" not in [r[1] for r in conn.execute("PRAGMA table_info(conversations)")]:
+        conn.execute("ALTER TABLE conversations ADD COLUMN classification TEXT")
+    for stmt in _statements():
+        conn.execute(stmt)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:

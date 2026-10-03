@@ -52,6 +52,7 @@ def _load_core():
 router = APIRouter()
 core = _load_core()
 router.include_router(core.automations_api.router)
+router.include_router(core.jev_api.router)
 
 
 def _autostart() -> None:

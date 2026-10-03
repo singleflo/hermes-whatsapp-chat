@@ -216,7 +216,8 @@ def purge_conversations(conn: sqlite3.Connection, account_id: int) -> None:
     ids = "SELECT id FROM conversations WHERE account_id = ?"
     for table in ("messages", "conversation_state_log"):
         conn.execute(f"DELETE FROM {table} WHERE conversation_id IN ({ids})", (account_id,))
-    conn.execute(f"DELETE FROM automation_runs WHERE conversation_id IN ({ids})", (account_id,))
+    for table in ("automation_runs", "jev_runs"):
+        conn.execute(f"DELETE FROM {table} WHERE conversation_id IN ({ids})", (account_id,))
     conn.execute(f"DELETE FROM events WHERE conversation_id IN ({ids})", (account_id,))
     conn.execute("DELETE FROM conversations WHERE account_id = ?", (account_id,))
 

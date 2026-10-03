@@ -24,11 +24,17 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import db, errors, events, outbound, service, settings
+from . import db, errors, events, jev, outbound, service, settings
 
 log = logging.getLogger("hermes_whatsapp_chat.automations")
 
-TRIGGER_TYPES = ("message.in", "message.out", "conversation.created", "conversation.state_changed")
+TRIGGER_TYPES = (
+    "message.in",
+    "message.out",
+    "conversation.created",
+    "conversation.state_changed",
+    "conversation.classified",
+)
 STATES = ("new", "in_progress", "waiting", "muted", "closed")
 REPLY_ACTIONS = ("hermes", "webhook", "script", "reply")
 MAX_ATTEMPTS = 3
@@ -90,6 +96,7 @@ def _conversation(conn, conversation_id: int | None) -> dict[str, Any] | None:
         return None
     conv = dict(row)
     conv["tags"] = [t for t in db.jloads(row["tags"], []) if isinstance(t, str)]
+    conv["classification"] = db.jloads(row["classification"], None)
     return conv
 
 
@@ -213,6 +220,13 @@ def evaluate(conn, cfg: dict[str, Any], rule: dict[str, Any], ctx: dict[str, Any
     if cond.get("directions"):
         ok = ctx["direction"] in cond["directions"]
         out.append((ok, f"direction {ctx['direction']} {'is' if ok else 'is not'} in {cond['directions']}"))
+    if cond.get("jev_exits"):
+        classification = conv.get("classification")
+        if not isinstance(classification, dict):
+            out.append((False, "no Jev classification yet"))
+        else:
+            chosen = classification.get("exit")
+            out.append((chosen in cond["jev_exits"], f"Jev exit condition is {chosen}; rule wants {cond['jev_exits']}"))
     return out
 
 
@@ -361,7 +375,15 @@ def _template_vars(conn, cfg: dict[str, Any], conv: dict[str, Any], text: str) -
         "conversation_id": conv["id"],
         "history": _history_lines(conn, conv["id"], int(cfg["automations"]["history_messages_in_prompt"]), tz),
         "wa_cli": wa_cli_command(),
+        "jev": _jev_summary(conn, conv),
     }
+
+
+def _jev_summary(conn, conv: dict[str, Any]) -> str:
+    classification = conv.get("classification")
+    if not isinstance(classification, dict):
+        return ""
+    return jev.summary_text(settings.get_settings(conn).jev, classification)
 
 
 # --- External boundaries (seams for tests) ----------------------------------------
@@ -601,6 +623,7 @@ def _payload(conn, cfg: dict[str, Any], run, event, conv: dict[str, Any]) -> byt
             "priority": conv["priority"],
             "agent_active": bool(conv["agent_active"]),
             "tags": conv["tags"],
+            "classification": conv.get("classification"),
         },
         "messages": [dict(r) for r in reversed(rows)],
     }

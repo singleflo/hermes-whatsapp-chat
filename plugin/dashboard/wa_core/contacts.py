@@ -108,7 +108,7 @@ def apply_contact(conn: sqlite3.Connection, account_id: int, item: dict, now: in
 
 def delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
     """Delete one conversation with its messages, logs, events and runs. The caller holds a transaction."""
-    for table in ("messages", "conversation_state_log", "automation_runs", "events"):
+    for table in ("messages", "conversation_state_log", "automation_runs", "jev_runs", "events"):
         conn.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (conversation_id,))
     conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
 
@@ -152,7 +152,7 @@ def _merge(conn: sqlite3.Connection, src: sqlite3.Row, dst: sqlite3.Row, now: in
         "UPDATE messages SET conversation_id = ?, remote_jid = COALESCE(remote_jid, ?) WHERE conversation_id = ?",
         (dst["id"], src["chat_jid"], src["id"]),
     )
-    for table in ("conversation_state_log", "events", "automation_runs"):
+    for table in ("conversation_state_log", "events", "automation_runs", "jev_runs"):
         conn.execute(f"UPDATE {table} SET conversation_id = ? WHERE conversation_id = ?", (dst["id"], src["id"]))
     conn.execute(
         "UPDATE conversations SET last_message_at = ?, last_inbound_at = ?, unread_count = ?, contact_name = ?,"

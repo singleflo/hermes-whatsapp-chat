@@ -93,6 +93,7 @@ Five columns, one card per conversation: New, In progress, Waiting, Muted, Close
 - **Board**: urgency threshold, mute presets, drop-to-mute duration, closed-column limit.
 - **Hours**: timezone and weekly business hours (used by automation conditions).
 - **Automations**: the dispatcher described below, with a test button (dry run on a conversation) and a run log with retry.
+- **Jev**: opt-in exit conditions scored by TypeSafe Jev (see "Jev exit conditions" below): API key, numbers, conditions with their actions, and a test button.
 
 Conversations created by history import start Closed, and history messages never trigger rules, unread counters, notifications or automations.
 
@@ -100,8 +101,8 @@ Conversations created by history import start Closed, and history messages never
 
 An automation rule has an optional number filter, event types, conditions, an action, a reply mode and a "stop after match" flag. Rules run in order.
 
-- **Events**: `message.in`, `message.out`, `conversation.created`, `conversation.state_changed`.
-- **Conditions** (all optional, all must hold): conversation states, agent active or not, inside/outside business hours, text contains any of / matches a regex, any of the tags, first message of the conversation, message direction.
+- **Events**: `message.in`, `message.out`, `conversation.created`, `conversation.state_changed`, `conversation.classified` (Jev result stored).
+- **Conditions** (all optional, all must hold): conversation states, agent active or not, inside/outside business hours, text contains any of / matches a regex, any of the tags, first message of the conversation, message direction, Jev exit conditions.
 - **Actions**:
   | Type | What it does |
   |---|---|
@@ -113,10 +114,19 @@ An automation rule has an optional number filter, event types, conditions, an ac
   | `add_tags` | Adds tags. |
   | `escalate` | Raises priority. |
   | `takeover` | Hands the conversation to a human (agent stops answering). |
-- **Prompt templates**: `{contact_name} {phone} {text} {account_label} {state} {conversation_id} {history} {wa_cli}`.
+- **Prompt templates**: `{contact_name} {phone} {text} {account_label} {state} {conversation_id} {history} {wa_cli} {jev}`.
 - **Reply mode** (what happens with a reply text): `draft` (default, saved as a draft authored `agent:<profile>` or `rule:<id>` for you to approve), `send` (sent immediately), `none` (kept only in the run output).
 
 Safety nets: runs are skipped when a human took over (`agent_active` off), automations never trigger on messages written by agents or rules (no loops), there is a per-conversation hourly rate limit, and failed runs retry up to 3 attempts with backoff (30 s, then 120 s).
+
+### Jev exit conditions
+
+Optional. You list exit conditions (label, a plain-language description and a minimum score from 0 to 1); there is always an implicit **Else** after them. [TypeSafe Jev](https://typesafe.ai) scores every incoming text message against each condition in one call of about half a second, without running an LLM. The first condition in the list whose score reaches its minimum is chosen; when none does, Else is chosen. The result is stored on the conversation and raises the `conversation.classified` event, so ordinary automation rules (take over for a person, Hermes agent draft, escalate, ...) can act on it with the `jev_exits` condition; the `{jev}` template variable puts the chosen condition and every score into a prompt.
+
+- **Setup**: enter the API key in the Jev settings (stored in the plugin database, never shown again), or set `TYPESAFE_API_KEY` in the service environment as a fallback. Pick the numbers to classify (none selected = all WhatsApp numbers), then enable it.
+- **What Jev sees**: only live incoming text messages of the selected numbers, with the last messages of the conversation as context. History imports, your own messages, reactions, media without text and demo chats are never sent.
+- **Testing and manual runs**: the test button scores a conversation without saving anything; **Classify now** in a conversation queues a run immediately.
+- **Failures**: rate limits and temporary errors retry (up to 3 attempts); a wrong key or an invalid answer fails the run, which shows in the conversation detail.
 
 ## CLI for Hermes (and you)
 
@@ -165,7 +175,7 @@ flowchart LR
 
 - **The database is the control plane.** The UI writes the desired state of each number (running, stopped, logged out, removed); the sidecar reconciles every second and writes status, QR codes and a heartbeat back. No extra port is opened for control.
 - **Backend**: `plugin/dashboard/plugin_api.py` holds only HTTP routes and the live event stream; all logic is in the `plugin/dashboard/wa_core/` package (accounts, conversations, rules engine, outbound, automations, settings, service install, schema/migrations).
-- **Sidecar**: runs the supervisor loop, one bridge process per paired number (own session directory, port and media cache), the QR pairing subprocess (QR codes rendered with a vendored copy of [segno](https://github.com/heuer/segno), BSD), history ingest, timers (mute expiry, auto-close) and the automation executor on a small thread pool so message ingest never blocks. It installs the bridge's Node dependencies (`npm ci --omit=dev`) itself when `node_modules` is missing.
+- **Sidecar**: runs the supervisor loop, one bridge process per paired number (own session directory, port and media cache), the QR pairing subprocess (QR codes rendered with a vendored copy of [segno](https://github.com/heuer/segno), BSD), history ingest, timers (mute expiry, auto-close) and the automation and Jev executors on a small thread pool so message ingest never blocks. It installs the bridge's Node dependencies (`npm ci --omit=dev`) itself when `node_modules` is missing.
 - **Hermes interaction** uses only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI and HTTP.
 
 ### Data locations
@@ -216,7 +226,7 @@ cd hermes-whatsapp-chat
 uv sync --python 3.11                                   # FastAPI, pydantic, pytest, ruff, ty
 npm ci --prefix plugin/sidecar/whatsapp-bridge          # the bridge's Node deps (the installed service does this itself)
 
-uv run pytest -q                                        # tests/test_plugin_api.py, tests/test_automations.py
+uv run pytest -q                                        # tests/test_plugin_api.py, tests/test_automations.py, tests/test_jev.py
 uv run ruff check . && uv run ty check plugin tests
 pnpm lint && pnpm format:check                          # JS halves (hand-written, no build step)
 uv run python plugin/scripts/seed_demo.py --reset       # demo conversations (@demo.invalid; --remove to delete)

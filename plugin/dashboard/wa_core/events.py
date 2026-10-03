@@ -1,7 +1,8 @@
 """Event log: every core mutation emits one row here, inside its own transaction.
 
 ``emit`` never opens or closes a transaction: the caller wraps it in ``db.write_txn``.
-Triggerable events also enqueue matching automation runs (see ``automations``).
+Triggerable events also enqueue matching automation runs (see ``automations``); a live inbound
+message also queues a Jev classification (see ``jev``).
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import json
 import logging
 from typing import Any
 
-from . import automations
+from . import automations, jev
 
 log = logging.getLogger("hermes_whatsapp_chat.events")
 
@@ -46,4 +47,10 @@ def emit(
         except Exception:
             # A broken rule must never roll back the message/state change that raised the event.
             log.exception("automation matching failed for event %s (%s)", event_id, type)
+    if type == "message.in" and conversation_id is not None and message_id is not None:
+        try:
+            jev.enqueue_for_message(conn, conversation_id=conversation_id, message_id=message_id, now=now)
+        except Exception:
+            # Jev is optional: a failure here must never roll back the message that raised the event.
+            log.exception("jev enqueue failed for event %s (%s)", event_id, type)
     return event_id

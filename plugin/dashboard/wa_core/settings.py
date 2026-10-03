@@ -15,6 +15,9 @@ from . import db
 SETTINGS_KEY = "global"
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+DEFAULT_JEV_QUESTION = (
+    "Does the conversation meet `condition` now? Judge `latest_message` in the context of `recent_messages`."
+)
 
 
 def _check_hhmm(value: str) -> str:
@@ -115,6 +118,36 @@ class Privacy(_Strict):
     send_read_receipts: bool = True
 
 
+class JevExit(_Strict):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")  # "else" is reserved
+    label: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=500)  # the condition Jev scores
+    min_score: float = Field(default=0.7, ge=0, le=1)
+
+
+class JevSettings(_Strict):
+    enabled: bool = False
+    model: str = Field(default="jev-latest", min_length=1, max_length=60)
+    account_ids: list[int] = Field(default_factory=list)  # empty = every WhatsApp number
+    history_messages: int = Field(default=10, ge=0, le=50)
+    debounce_seconds: int = Field(default=5, ge=0, le=120)
+    timeout_s: int = Field(default=10, ge=1, le=60)
+    question: str = Field(default=DEFAULT_JEV_QUESTION, min_length=1, max_length=2000)
+    exits: list[JevExit] = Field(default_factory=list, max_length=30)
+
+    @field_validator("exits")
+    @classmethod
+    def _exits(cls, value: list[JevExit]) -> list[JevExit]:
+        seen: set[str] = set()
+        for item in value:
+            if item.id == "else":
+                raise ValueError('exit id "else" is reserved')
+            if item.id in seen:
+                raise ValueError(f"duplicate exit id {item.id!r}")
+            seen.add(item.id)
+        return value
+
+
 class Settings(_Strict):
     rules: Rules = Field(default_factory=lambda: Rules())
     notifications: Notifications = Field(default_factory=lambda: Notifications())
@@ -123,6 +156,7 @@ class Settings(_Strict):
     automations: AutomationsSettings = Field(default_factory=lambda: AutomationsSettings())
     media: MediaSettings = Field(default_factory=lambda: MediaSettings())
     privacy: Privacy = Field(default_factory=lambda: Privacy())
+    jev: JevSettings = Field(default_factory=lambda: JevSettings())
 
 
 def get_settings(conn: sqlite3.Connection) -> Settings:

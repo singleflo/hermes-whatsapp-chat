@@ -240,12 +240,23 @@ def get_conversation(conn: sqlite3.Connection, conversation_id: int, *, now: int
         " WHERE r.conversation_id = ? ORDER BY r.id DESC LIMIT 20",
         (conversation_id,),
     ).fetchall()
+    jev_runs = conn.execute(
+        "SELECT * FROM jev_runs WHERE conversation_id = ? ORDER BY id DESC LIMIT 5", (conversation_id,)
+    ).fetchall()
+    classification = db.jloads(row["classification"], None)
     return {
-        "conversation": {**card, "previous_state": row["previous_state"], "created_at": row["created_at"]},
+        "conversation": {
+            **card,
+            "previous_state": row["previous_state"],
+            "created_at": row["created_at"],
+            "classification": classification,
+        },
         "account": account,
         "allowed_states": sorted(allowed_from(row["state"])),
         "state_history": [dict(h) for h in history],
         "runs": [dict(r) for r in runs],
+        "classification": classification,
+        "jev_runs": [dict(r) for r in jev_runs],
     }
 
 
