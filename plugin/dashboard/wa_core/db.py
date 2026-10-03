@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 PLUGIN_ID = "hermes-whatsapp-chat"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEMO_SUFFIX = "@demo.invalid"
 
 SCHEMA = """
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS automation_rules (
   event_types TEXT NOT NULL DEFAULT '["message.in"]', conditions TEXT NOT NULL DEFAULT '{}',
   action TEXT NOT NULL, reply_mode TEXT NOT NULL DEFAULT 'draft' CHECK (reply_mode IN ('draft','send','none')),
   stop_after_match INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL, updated_at INTEGER);
+  created_at INTEGER NOT NULL, updated_at INTEGER, managed_by TEXT);
 CREATE TABLE IF NOT EXISTS automation_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, rule_id INTEGER NOT NULL, event_id INTEGER NOT NULL,
   conversation_id INTEGER, status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
@@ -176,8 +176,12 @@ def _upgrade(conn: sqlite3.Connection) -> None:
         elif version == 2:
             _migrate_v2(conn)
             _migrate_v3(conn)
+            _migrate_v4(conn)
         elif version == 3:
             _migrate_v3(conn)
+            _migrate_v4(conn)
+        elif version == 4:
+            _migrate_v4(conn)
         else:
             for stmt in _statements():
                 conn.execute(stmt)
@@ -190,6 +194,12 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE conversations ADD COLUMN classification TEXT")
     for stmt in _statements():
         conn.execute(stmt)
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """v4 -> v5: ``automation_rules.managed_by`` (NULL = user rule, ``'jev'`` = generated from the Jev rules)."""
+    if "managed_by" not in [r[1] for r in conn.execute("PRAGMA table_info(automation_rules)")]:
+        conn.execute("ALTER TABLE automation_rules ADD COLUMN managed_by TEXT")
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:

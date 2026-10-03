@@ -222,7 +222,7 @@ CREATE TABLE messages (
 
 
 def _old_db(env, monkeypatch, version: int) -> Path:
-    """A DB the way an older release left it: v4 with the newer pieces removed."""
+    """A DB the way an older release left it: the latest schema with the newer pieces removed."""
     path = env.tmp_path / f"v{version}.db"
     monkeypatch.setenv("WA_ARCHIVE_DB", str(path))
     conn = env.core.db.connect()
@@ -233,8 +233,10 @@ def _old_db(env, monkeypatch, version: int) -> Path:
         "INSERT INTO conversations (id, account_id, chat_jid, contact_name, state, created_at) VALUES (7,1,?,'Anna','new',?)",
         (CONTACT_JID, NOW),
     )
-    conn.execute("DROP TABLE jev_runs")
-    conn.execute("ALTER TABLE conversations DROP COLUMN classification")
+    conn.execute("ALTER TABLE automation_rules DROP COLUMN managed_by")
+    if version < 4:
+        conn.execute("DROP TABLE jev_runs")
+        conn.execute("ALTER TABLE conversations DROP COLUMN classification")
     if version == 2:
         conn.execute("DROP TABLE messages")
         conn.execute(V2_MESSAGES)
@@ -254,15 +256,16 @@ def _old_db(env, monkeypatch, version: int) -> Path:
     return path
 
 
-@pytest.mark.parametrize("version", [2, 3])
-def test_old_schema_migrates_to_v4_keeping_rows_and_adding_jev(env, monkeypatch, version):
+@pytest.mark.parametrize("version", [2, 3, 4])
+def test_old_schema_migrates_to_v5_keeping_rows_and_adding_jev(env, monkeypatch, version):
     _old_db(env, monkeypatch, version)
     conn = env.core.db.connect()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         cols = [r[1] for r in conn.execute("PRAGMA table_info(conversations)")]
         assert "classification" in cols
         assert conn.execute("SELECT COUNT(*) FROM jev_runs").fetchone()[0] == 0
+        assert "managed_by" in [r[1] for r in conn.execute("PRAGMA table_info(automation_rules)")]
         assert conn.execute("SELECT contact_name, classification FROM conversations WHERE id = 7").fetchone()[:] == ("Anna", None)
         assert conn.execute("SELECT body FROM messages").fetchone()[0] == "ciao"
         indexes = {r[1] for r in conn.execute("PRAGMA index_list(jev_runs)")}
@@ -315,27 +318,31 @@ def test_valid_exits_round_trip_in_order(env):
 # --- API key ----------------------------------------------------------------------------------
 
 
+def _key(status: dict) -> dict:
+    return {k: status[k] for k in ("key_set", "key_source")}
+
+
 def test_key_is_stored_never_returned_and_removable(env, monkeypatch):
-    assert env.client.get(f"{PREFIX}/jev").json() == {"key_set": False, "key_source": None}
+    assert _key(env.client.get(f"{PREFIX}/jev").json()) == {"key_set": False, "key_source": None}
     r = env.client.put(f"{PREFIX}/jev/key", json={"api_key": "  secret-key  "})
-    assert r.json() == {"key_set": True, "key_source": "settings"}
-    assert env.client.get(f"{PREFIX}/jev").json() == {"key_set": True, "key_source": "settings"}
+    assert _key(r.json()) == {"key_set": True, "key_source": "settings"}
+    assert _key(env.client.get(f"{PREFIX}/jev").json()) == {"key_set": True, "key_source": "settings"}
     assert "secret-key" not in json.dumps(env.client.get(f"{PREFIX}/settings").json())
     assert "secret-key" not in json.dumps(env.client.get(f"{PREFIX}/jev").json())
     assert env.core.jev.api_key(env.conn) == ("secret-key", "settings")
 
-    assert env.client.put(f"{PREFIX}/jev/key", json={"api_key": ""}).json() == {"key_set": False, "key_source": None}
+    assert _key(env.client.put(f"{PREFIX}/jev/key", json={"api_key": ""}).json()) == {"key_set": False, "key_source": None}
     assert env.conn.execute("SELECT 1 FROM settings WHERE key = 'jev_api_key'").fetchone() is None
 
 
 def test_key_falls_back_to_the_environment_and_the_stored_key_wins(env, monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "env-key")
-    assert env.client.get(f"{PREFIX}/jev").json() == {"key_set": True, "key_source": "env"}
+    assert _key(env.client.get(f"{PREFIX}/jev").json()) == {"key_set": True, "key_source": "env"}
     assert env.core.jev.api_key(env.conn) == ("env-key", "env")
     env.client.put(f"{PREFIX}/jev/key", json={"api_key": "ui-key"})
     assert env.core.jev.api_key(env.conn) == ("ui-key", "settings")
     env.client.put(f"{PREFIX}/jev/key", json={"api_key": ""})
-    assert env.client.get(f"{PREFIX}/jev").json() == {"key_set": True, "key_source": "env"}
+    assert _key(env.client.get(f"{PREFIX}/jev").json()) == {"key_set": True, "key_source": "env"}
 
 
 # --- Enqueue -------------------------------------------------------------------------------------

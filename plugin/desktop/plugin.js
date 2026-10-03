@@ -238,7 +238,7 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 6
+const REQUIRED_API_VERSION = 7
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
   'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
@@ -2729,63 +2729,6 @@ const SETTINGS_RUN_BADGE = {
   skipped: 'outline'
 }
 
-const SETTINGS_JEV_STARTER_EXITS = [
-  {
-    id: 'person',
-    label: 'Needs a person',
-    description:
-      'The contact asks to talk to a person, complains, is upset, or raises a sensitive, personal or commercial matter (price, refund, contract) that the owner must decide',
-    min_score: 0.7
-  },
-  {
-    id: 'agent',
-    label: 'Agent can answer',
-    description:
-      'The contact asks a routine question or makes a routine request that an assistant can answer from the conversation (information, availability, status of a request)',
-    min_score: 0.7
-  },
-  {
-    id: 'no_reply',
-    label: 'No reply needed',
-    description: 'The message is only a greeting, thanks or acknowledgement (ok, 👍) and needs no answer',
-    min_score: 0.8
-  }
-]
-
-// Starter automation rules for the starter conditions; created disabled.
-function set_jevStarterRules() {
-  const base = { enabled: false, account_id: null, event_types: ['conversation.classified'], stop_after_match: false }
-  return [
-    {
-      ...base,
-      name: 'Jev · Needs a person → take over',
-      conditions: { jev_exits: ['person'] },
-      action: { type: 'takeover' },
-      reply_mode: 'none'
-    },
-    {
-      ...base,
-      name: 'Jev · Agent can answer → agent draft',
-      conditions: { jev_exits: ['agent'], agent_active: true },
-      action: {
-        type: 'hermes',
-        profile: null,
-        prompt: SETTINGS_DEFAULT_PROMPT + '\n\nJev:\n{jev}',
-        timeout_s: SETTINGS_TIMEOUTS.hermes,
-        skills: []
-      },
-      reply_mode: 'draft'
-    },
-    {
-      ...base,
-      name: 'Jev · Else → escalate',
-      conditions: { jev_exits: ['else'] },
-      action: { type: 'escalate' },
-      reply_mode: 'none'
-    }
-  ]
-}
-
 // Label of an exit condition id ('else' is the fallback; an id that no longer exists shows as is).
 function set_jevLabel(exits, id) {
   if (id === 'else') {
@@ -2795,28 +2738,40 @@ function set_jevLabel(exits, id) {
   return e && e.label ? e.label : id
 }
 
-// Slug of a label that fits ^[a-z][a-z0-9_]{0,39}$, is not taken and is not the reserved 'else' (suffix _2, _3, …).
-function set_jevSlug(label, taken) {
-  let base = String(label)
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-  base = base ? (/^[a-z]/.test(base) ? base : 'c_' + base) : 'condition'
-  base = base.slice(0, 34).replace(/_+$/, '')
-  let id = base
-  let n = 2
-  while (id === 'else' || taken.includes(id)) {
-    id = base + '_' + n
-    n += 1
+// One plan action in words.
+function set_jevActionText(a) {
+  const withText = (head, text) => (text ? head + ': ' + text : head)
+  if (a.type === 'takeover') {
+    return 'Take over'
   }
-  return id
+  if (a.type === 'escalate') {
+    return 'Escalate'
+  }
+  if (a.type === 'agent_draft') {
+    return withText('Agent draft', a.instructions)
+  }
+  if (a.type === 'agent_reply') {
+    return withText('Agent replies', a.instructions)
+  }
+  if (a.type === 'reply') {
+    return 'Reply: ' + a.text
+  }
+  if (a.type === 'set_state') {
+    return 'Set state: ' + a.state
+  }
+  if (a.type === 'add_tags') {
+    return 'Tag: ' + (a.tags || []).join(', ')
+  }
+  return String(a.type)
 }
 
-function set_jevRefs(rules, id) {
-  return rules.filter(r => ((r.conditions || {}).jev_exits || []).includes(id))
-}
+const SETTINGS_JEV_MAX_DOCUMENT = 20000
+const SETTINGS_JEV_PLACEHOLDER =
+  '# My WhatsApp rules\n\n' +
+  '- If a customer complains, asks for a refund or is upset, a person must handle it: take over the conversation.\n' +
+  '- If they ask about opening hours or the status of an order, the agent writes a draft reply for me to approve.\n' +
+  '- If they only say thanks or ok, do nothing.\n' +
+  '- Anything else: mark the conversation as urgent.'
 
 const set_muted = { color: 'var(--ui-text-tertiary)' }
 const set_secondary = { color: 'var(--ui-text-secondary)' }
@@ -5125,6 +5080,9 @@ function SettingsAutomations({ draft, set }) {
                   rule.stop_after_match
                     ? jsx(SettingsBadge, { variant: 'muted', children: 'stops after match' })
                     : null,
+                  rule.managed_by === 'jev'
+                    ? jsx(SettingsBadge, { variant: 'outline', children: 'From Jev rules' })
+                    : null,
                   set_h(
                     'div',
                     { className: 'flex gap-1 ml-auto' },
@@ -5195,148 +5153,9 @@ function SettingsAutomations({ draft, set }) {
   )
 }
 
-// --- Section 7: Jev exit conditions ---------------------------------------------------------------
+// --- Section 7: Jev rules -------------------------------------------------------------------------
 
-// Actions of one exit condition (or Else): the automation rules whose conditions.jev_exits include it.
-function SettingsJevActions({ exitId, label, rules, exits, accounts }) {
-  const [editing, setEditing] = useState(null) // null | 'new' | rule id
-  const mine = set_jevRefs(rules, exitId)
-  const editingRule = typeof editing === 'number' ? mine.find(r => r.id === editing) : null
-  const template = {
-    name: 'Jev · ' + label,
-    enabled: true,
-    event_types: ['conversation.classified'],
-    conditions: { jev_exits: [exitId] },
-    action: { type: 'takeover' },
-    reply_mode: 'none'
-  }
-  const close = () => setEditing(null)
-  return set_h(
-    'div',
-    { className: 'flex flex-col gap-2' },
-    set_h('span', { className: 'text-xs font-medium', style: set_secondary }, 'Actions'),
-    mine.length === 0 && editing === null
-      ? set_h('div', { className: 'text-xs', style: set_muted }, 'No action yet: nothing runs when this is chosen.')
-      : null,
-    ...mine.map(rule =>
-      editing === rule.id && editingRule
-        ? jsx(SettingsRuleForm, { key: rule.id, rule: editingRule, accounts, exits, onDone: close, onCancel: close })
-        : set_h(
-            'div',
-            { key: rule.id, className: 'flex flex-wrap items-center gap-2 text-xs' },
-            jsx(SettingsBadge, {
-              variant: rule.enabled ? 'success' : 'muted',
-              children: rule.enabled ? 'Enabled' : 'Disabled'
-            }),
-            set_h('span', { style: { color: 'var(--ui-text-primary)' } }, rule.name),
-            jsx(SettingsBadge, { variant: 'outline', children: set_ruleSummary(rule) }),
-            jsx(Button, { size: 'xs', variant: 'secondary', onClick: () => setEditing(rule.id), children: 'Edit' })
-          )
-    ),
-    editing === 'new'
-      ? jsx(SettingsRuleForm, { key: 'new', rule: template, accounts, exits, onDone: close, onCancel: close })
-      : null,
-    editing === null
-      ? set_h(
-          'div',
-          { className: 'flex' },
-          jsx(Button, { size: 'xs', variant: 'secondary', onClick: () => setEditing('new'), children: 'Add action' })
-        )
-      : null
-  )
-}
-
-function SettingsJevExit({ exit, index, count, rules, exits, accounts, onChange, onMove, onRemove }) {
-  const [confirm, setConfirm] = useState(false)
-  const refs = set_jevRefs(rules, exit.id)
-  return set_h(
-    'div',
-    { className: 'flex flex-col gap-3', style: set_card },
-    set_h(
-      'div',
-      { className: 'flex flex-wrap items-end gap-3' },
-      set_h(
-        'div',
-        { style: { flex: '2 1 220px' } },
-        jsx(SettingsField, {
-          label: 'Condition ' + (index + 1),
-          hint: 'id: ' + exit.id,
-          children: jsx(Input, {
-            value: exit.label,
-            onChange: e => onChange({ ...exit, label: e.target.value }),
-            placeholder: 'Label'
-          })
-        })
-      ),
-      set_h(
-        'div',
-        { style: { width: 140 } },
-        jsx(SettingsField, {
-          label: 'Minimum score (0–1)',
-          children: jsx(SettingsNumber, {
-            value: exit.min_score,
-            onChange: v => onChange({ ...exit, min_score: v }),
-            min: 0,
-            max: 1,
-            step: 0.05
-          })
-        })
-      ),
-      set_h(
-        'div',
-        { className: 'flex gap-1' },
-        jsx(Button, {
-          size: 'icon-xs',
-          variant: 'ghost',
-          title: 'Move up',
-          disabled: index === 0,
-          onClick: () => onMove(-1),
-          children: '↑'
-        }),
-        jsx(Button, {
-          size: 'icon-xs',
-          variant: 'ghost',
-          title: 'Move down',
-          disabled: index === count - 1,
-          onClick: () => onMove(1),
-          children: '↓'
-        }),
-        jsx(Button, {
-          size: 'icon-xs',
-          variant: 'ghost',
-          title: 'Remove condition',
-          onClick: () => setConfirm(true),
-          children: '✕'
-        })
-      )
-    ),
-    jsx(SettingsField, {
-      label: 'Description (the condition Jev scores)',
-      hint: exit.description.trim() ? undefined : 'Required: describe when this condition applies.',
-      children: jsx(Textarea, {
-        value: exit.description,
-        rows: 3,
-        onChange: e => onChange({ ...exit, description: e.target.value })
-      })
-    }),
-    confirm
-      ? jsx(SettingsConfirm, {
-          message:
-            'Remove “' +
-            exit.label +
-            '”?' +
-            (refs.length
-              ? ' These rules reference it and will never match: ' + refs.map(r => r.name).join(', ') + '.'
-              : ''),
-          confirmLabel: 'Remove',
-          onCancel: () => setConfirm(false),
-          onConfirm: onRemove
-        })
-      : null,
-    jsx(SettingsJevActions, { exitId: exit.id, label: exit.label, rules, exits, accounts })
-  )
-}
-
+// Compact API key row inside the Jev card.
 function SettingsJevKey() {
   const q = useApi('jev', '/jev')
   const [text, setText] = useState('')
@@ -5360,116 +5179,298 @@ function SettingsJevKey() {
       setError(res.error)
     }
   }
+  return set_h(
+    'div',
+    { className: 'flex flex-col gap-2' },
+    set_h(
+      'div',
+      { className: 'flex items-center gap-2' },
+      set_h('span', { className: 'text-xs font-medium', style: set_secondary }, 'TypeSafe API key'),
+      q.error && !q.data
+        ? set_h(
+            'span',
+            { className: 'text-xs', style: { color: 'var(--ui-red)' } },
+            errorText(q.error) + restartHint(q.error)
+          )
+        : status
+          ? jsx(SettingsBadge, { variant: status[0], children: status[1] })
+          : jsx(Skeleton, { className: 'h-5 w-24' })
+    ),
+    set_h(
+      'div',
+      { className: 'flex flex-wrap items-end gap-2' },
+      set_h(
+        'div',
+        { style: { flex: '1 1 260px' } },
+        jsx(Input, {
+          type: 'password',
+          value: text,
+          autoComplete: 'off',
+          placeholder: 'Paste the TypeSafe API key',
+          onChange: e => setText(e.target.value)
+        })
+      ),
+      jsx(Button, {
+        size: 'sm',
+        loading: busy,
+        disabled: !text.trim(),
+        onClick: () => save(text.trim()),
+        children: 'Save key'
+      }),
+      jsx(Button, {
+        size: 'sm',
+        variant: 'outline',
+        disabled: busy || !q.data || q.data.key_source !== 'settings',
+        onClick: () => save(''),
+        children: 'Remove'
+      })
+    ),
+    set_h(
+      'div',
+      { className: 'text-xs', style: set_muted },
+      'Stored in the plugin database and never shown again; TYPESAFE_API_KEY in the service environment is the fallback.'
+    ),
+    error ? set_h('div', { className: 'text-xs', style: set_errorBox }, error) : null
+  )
+}
+
+// Example messages of a plan item, each with the check result when Jev scored it (✓/✗, chosen condition, score).
+function SettingsJevExamples({ examples, expected, checks, labelOf }) {
+  if (!examples || examples.length === 0) {
+    return null
+  }
+  return set_h(
+    'div',
+    { className: 'flex flex-col gap-0.5' },
+    set_h('span', { className: 'text-xs font-medium', style: set_secondary }, 'Examples'),
+    ...examples.map((text, i) => {
+      const check = checks ? checks.find(c => c.text === text && c.expected === expected) : null
+      const mark = check ? (check.ok ? '✓' : '✗') : '•'
+      const color = check ? (check.ok ? 'var(--ui-green)' : 'var(--ui-red)') : 'var(--ui-text-tertiary)'
+      return set_h(
+        'div',
+        { key: i, className: 'flex flex-wrap items-baseline gap-1.5 text-xs' },
+        set_h('span', { style: { color, fontWeight: 600 } }, mark),
+        set_h('span', { style: { color: 'var(--ui-text-primary)' } }, '“' + text + '”'),
+        check
+          ? set_h(
+              'span',
+              { style: set_muted },
+              '→ ' +
+                labelOf(check.exit) +
+                (typeof check.score === 'number' && check.exit !== 'else' ? ' ' + check.score.toFixed(2) : '')
+            )
+          : null
+      )
+    })
+  )
+}
+
+// One condition (or Else) of a generated plan.
+function SettingsJevPlanItem({ title, meta, description, actions, examples, expected, checks, labelOf }) {
+  return set_h(
+    'div',
+    { className: 'flex flex-col gap-2', style: set_subtle },
+    set_h(
+      'div',
+      { className: 'flex flex-wrap items-baseline gap-2' },
+      set_h('span', { className: 'text-sm font-semibold' }, title),
+      meta ? set_h('span', { className: 'text-xs', style: set_muted }, meta) : null
+    ),
+    description ? set_h('div', { className: 'text-xs', style: set_muted }, description) : null,
+    set_h(
+      'div',
+      { className: 'flex flex-col gap-0.5' },
+      set_h('span', { className: 'text-xs font-medium', style: set_secondary }, 'Actions'),
+      actions.length === 0
+        ? set_h('div', { className: 'text-xs', style: set_muted }, 'No action: nothing runs when this is chosen.')
+        : null,
+      ...actions.map((a, i) => set_h('div', { key: i, className: 'text-xs' }, '→ ' + set_jevActionText(a)))
+    ),
+    jsx(SettingsJevExamples, { examples, expected, checks, labelOf })
+  )
+}
+
+// Preview of a generated plan with Apply / Discard.
+function SettingsJevPreview({ result, onApply, onDiscard, busy, error }) {
+  const plan = result.plan
+  const checks = result.checks || null
+  const labelOf = id => set_jevLabel(plan.conditions, id)
+  const meta = [
+    result.model,
+    typeof result.latency_ms === 'number' ? (result.latency_ms / 1000).toFixed(1) + ' s' : '',
+    result.attempts > 1 ? result.attempts + ' attempts' : ''
+  ].filter(Boolean)
   return jsx(SettingsCard, {
-    title: 'API key',
-    desc: 'The TypeSafe API key Jev is called with. It is stored in the plugin database and never shown again; TYPESAFE_API_KEY in the service environment is the fallback.',
+    title: 'Preview',
+    desc: 'Nothing is saved until you apply it. Applying replaces the rules generated earlier from the Jev rules; rules made in Automations stay as they are.',
+    children: set_h(
+      'div',
+      { className: 'flex flex-col gap-3' },
+      ...plan.conditions.map((c, i) =>
+        jsx(SettingsJevPlanItem, {
+          key: c.id,
+          title: i + 1 + '. ' + c.label,
+          meta: '[' + c.id + '] min score ' + Number(c.min_score).toFixed(2),
+          description: c.description,
+          actions: c.actions || [],
+          examples: c.examples || [],
+          expected: c.id,
+          checks,
+          labelOf
+        })
+      ),
+      jsx(SettingsJevPlanItem, {
+        title: 'Else',
+        meta: 'chosen when no condition reaches its minimum score',
+        actions: plan.else_actions || [],
+        examples: plan.else_examples || [],
+        expected: 'else',
+        checks,
+        labelOf
+      }),
+      (plan.notes || []).length
+        ? set_h(
+            'div',
+            { className: 'flex flex-col gap-0.5' },
+            set_h('span', { className: 'text-xs font-medium', style: set_secondary }, 'Notes'),
+            ...plan.notes.map((n, i) => set_h('div', { key: i, className: 'text-xs', style: set_muted }, '• ' + n))
+          )
+        : null,
+      result.check_error
+        ? set_h('div', { className: 'text-xs', style: { color: 'var(--ui-orange)' } }, result.check_error)
+        : null,
+      meta.length ? set_h('div', { className: 'text-xs', style: set_muted }, meta.join(' · ')) : null,
+      error ? set_h('div', { className: 'text-xs', style: set_errorBox }, error) : null,
+      set_h(
+        'div',
+        { className: 'flex gap-2' },
+        jsx(Button, { size: 'sm', loading: busy, onClick: onApply, children: 'Apply' }),
+        jsx(Button, { size: 'sm', variant: 'outline', disabled: busy, onClick: onDiscard, children: 'Discard' })
+      )
+    )
+  })
+}
+
+// Active conditions and the rules bound to them (read-only, from GET /jev).
+function SettingsJevActive() {
+  const q = useApi('jev', '/jev')
+  const conditions = (q.data && q.data.conditions) || []
+  const elseRules = (q.data && q.data.else && q.data.else.rules) || []
+  const rulesLines = rules =>
+    rules.length === 0
+      ? set_h('div', { className: 'text-xs', style: set_muted }, 'No rules: nothing runs when this is chosen.')
+      : set_h(
+          'div',
+          { className: 'flex flex-col gap-1' },
+          ...rules.map(r =>
+            set_h(
+              'div',
+              { key: r.id, className: 'flex flex-wrap items-center gap-2 text-xs' },
+              jsx(SettingsBadge, {
+                variant: r.enabled ? 'success' : 'muted',
+                children: r.enabled ? 'Enabled' : 'Disabled'
+              }),
+              set_h('span', { style: { color: 'var(--ui-text-primary)' } }, r.name),
+              r.managed ? jsx(SettingsBadge, { variant: 'outline', children: 'from rules' }) : null
+            )
+          )
+        )
+  return jsx(SettingsCard, {
+    title: 'Active conditions',
+    desc: 'Checked top to bottom: the first condition whose score reaches its minimum is chosen, otherwise Else.',
     children: set_h(
       'div',
       { className: 'flex flex-col gap-3' },
       q.error && !q.data
         ? set_h('div', { className: 'text-xs', style: set_errorBox }, errorText(q.error) + restartHint(q.error))
-        : status
-          ? set_h(
-              'div',
-              { className: 'flex items-center gap-2' },
-              jsx(SettingsBadge, { variant: status[0], children: status[1] })
-            )
-          : jsx(Skeleton, { className: 'h-6 w-32' }),
-      set_h(
-        'div',
-        { className: 'flex flex-wrap items-end gap-2' },
+        : !q.data
+          ? jsx(Skeleton, { className: 'h-16 w-full' })
+          : conditions.length === 0
+            ? set_h(
+                'div',
+                { className: 'text-xs', style: set_muted },
+                'No conditions yet. Write your rules above and generate.'
+              )
+            : null,
+      ...conditions.map((c, i) =>
         set_h(
           'div',
-          { style: { flex: '1 1 260px' } },
-          jsx(SettingsField, {
-            label: 'API key',
-            children: jsx(Input, {
-              type: 'password',
-              value: text,
-              autoComplete: 'off',
-              placeholder: 'Paste the TypeSafe API key',
-              onChange: e => setText(e.target.value)
-            })
-          })
-        ),
-        jsx(Button, {
-          size: 'sm',
-          loading: busy,
-          disabled: !text.trim(),
-          onClick: () => save(text.trim()),
-          children: 'Save key'
-        }),
-        jsx(Button, {
-          size: 'sm',
-          variant: 'outline',
-          disabled: busy || !q.data || q.data.key_source !== 'settings',
-          onClick: () => save(''),
-          children: 'Remove'
-        })
+          { key: c.id, className: 'flex flex-col gap-2', style: set_subtle },
+          set_h(
+            'div',
+            { className: 'flex flex-wrap items-baseline gap-2' },
+            set_h('span', { className: 'text-sm font-semibold' }, i + 1 + '. ' + c.label),
+            set_h(
+              'span',
+              { className: 'text-xs', style: set_muted },
+              '[' + c.id + '] min score ' + Number(c.min_score).toFixed(2)
+            )
+          ),
+          set_h('div', { className: 'text-xs', style: set_muted }, c.description),
+          rulesLines(c.rules || [])
+        )
       ),
-      error ? set_h('div', { className: 'text-xs', style: set_errorBox }, error) : null
+      q.data
+        ? set_h(
+            'div',
+            { className: 'flex flex-col gap-2', style: set_subtle },
+            set_h('span', { className: 'text-sm font-semibold' }, 'Else'),
+            set_h(
+              'div',
+              { className: 'text-xs', style: set_muted },
+              'Chosen when no condition reaches its minimum score'
+            ),
+            rulesLines(elseRules)
+          )
+        : null,
+      set_h(
+        'div',
+        { className: 'text-xs', style: set_muted },
+        'Change them by editing the rules and generating again; rules made in Automations stay as they are.'
+      )
     )
   })
 }
 
 function SettingsJevTest() {
-  const convQ = useApi('conversations-pick', '/conversations?limit=50')
-  const [convId, setConvId] = useState('')
+  const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
-  const convs = (convQ.data && convQ.data.conversations) || []
   const run = async () => {
-    const id = Number(convId)
-    if (!convId || !Number.isInteger(id) || id <= 0) {
-      setError('Pick a conversation.')
-      return
-    }
     setBusy(true)
     setError('')
     setResult(null)
     try {
-      setResult(await rest('/jev/test', { method: 'POST', body: { conversation_id: id } }))
+      setResult(await rest('/jev/test', { method: 'POST', body: { text: text.trim() } }))
     } catch (err) {
       setError(set_errMsg(err))
     }
     setBusy(false)
   }
   return jsx(SettingsCard, {
-    title: 'Test',
-    desc: 'Scores the latest incoming message of a conversation with the saved conditions. Nothing is stored and no action runs.',
+    title: 'Try a message',
+    desc: 'Scores a message with the active conditions. Nothing is stored and no action runs.',
     children: set_h(
       'div',
       { className: 'flex flex-col gap-3' },
+      jsx(Textarea, {
+        value: text,
+        rows: 3,
+        placeholder: 'Type a message a contact might send',
+        onChange: e => setText(e.target.value)
+      }),
       set_h(
         'div',
-        { className: 'flex flex-wrap items-end gap-3' },
-        set_h(
-          'div',
-          { style: { flex: '1 1 260px' } },
-          jsx(SettingsField, {
-            label: 'Conversation',
-            children: jsx(SettingsSelect, {
-              value: convs.some(c => String(c.id) === convId) ? convId : '',
-              onChange: setConvId,
-              options: [
-                ['', convQ.data ? 'Pick a conversation…' : 'Loading…'],
-                ...convs.map(c => [
-                  String(c.id),
-                  '#' +
-                    c.id +
-                    ' · ' +
-                    (c.contact_name || c.phone || c.chat_jid) +
-                    ' · ' +
-                    (c.account_label || '') +
-                    ' · ' +
-                    (STATE_LABELS[c.state] || c.state)
-                ])
-              ]
-            })
-          })
-        ),
-        jsx(Button, { size: 'sm', loading: busy, onClick: run, children: 'Run' })
+        { className: 'flex' },
+        jsx(Button, {
+          size: 'sm',
+          loading: busy,
+          disabled: !text.trim() || text.length > 2000,
+          onClick: run,
+          children: 'Run'
+        })
       ),
       error ? set_h('div', { className: 'text-xs', style: set_errorBox }, error) : null,
       result
@@ -5497,64 +5498,54 @@ function SettingsJevTest() {
   })
 }
 
-function SettingsJevForm({ draft, set }) {
-  const rulesQ = useApi('automations', '/automations')
+function SettingsJevForm({ draft, set, onApplied }) {
   const accQ = useApi('accounts', '/accounts')
-  const [newLabel, setNewLabel] = useState('')
-  const [starterBusy, setStarterBusy] = useState(false)
-  const [starterNote, setStarterNote] = useState('')
-  const [starterError, setStarterError] = useState('')
-  const rules = (rulesQ.data && rulesQ.data.rules) || []
+  const [gen, setGen] = useState(null)
+  const [genBusy, setGenBusy] = useState(false)
+  const [genError, setGenError] = useState('')
+  const [applyBusy, setApplyBusy] = useState(false)
+  const [applyError, setApplyError] = useState('')
+  const [applyNote, setApplyNote] = useState('')
   const accounts = (accQ.data && accQ.data.accounts) || []
   const numbers = accounts.filter(a => a.kind === 'whatsapp' && a.desired !== 'removed')
   const j = (k, fb) => set_getIn(draft, ['jev', k], fb)
-  const exits = j('exits', [])
   const accountIds = j('account_ids', [])
-  const setExits = list => set(['jev', 'exits'], list)
+  const doc = j('document', '')
 
-  const addExit = () => {
-    const label = newLabel.trim()
-    if (!label) {
+  const generate = async () => {
+    setGenBusy(true)
+    setGenError('')
+    setApplyError('')
+    setApplyNote('')
+    try {
+      setGen(await rest('/jev/generate', { method: 'POST', body: { document: doc, check: true } }))
+    } catch (err) {
+      setGenError(set_errMsg(err))
+    }
+    setGenBusy(false)
+  }
+  const apply = async () => {
+    setApplyBusy(true)
+    setApplyError('')
+    const res = await set_call('/jev/apply', 'POST', { document: doc, plan: gen.plan })
+    setApplyBusy(false)
+    if (!res.ok) {
+      setApplyError(res.error)
       return
     }
-    const id = set_jevSlug(
-      label,
-      exits.map(e => e.id)
+    const saved = res.data.settings
+    const conditions = saved.jev.exits.length
+    const rules = res.data.rules.length
+    onApplied(saved)
+    setGen(null)
+    setApplyNote(
+      'Applied: ' +
+        conditions +
+        (conditions === 1 ? ' condition, ' : ' conditions, ') +
+        rules +
+        (rules === 1 ? ' rule.' : ' rules.') +
+        (saved.jev.enabled ? '' : ' Turn Jev on and Save to start classifying.')
     )
-    setExits([...exits, { id, label, description: '', min_score: 0.7 }])
-    setNewLabel('')
-  }
-  const moveExit = (i, dir) => {
-    const list = exits.slice()
-    const k = i + dir
-    if (k < 0 || k >= list.length) {
-      return
-    }
-    ;[list[i], list[k]] = [list[k], list[i]]
-    setExits(list)
-  }
-  const addStarters = async () => {
-    setStarterBusy(true)
-    setStarterError('')
-    setStarterNote('')
-    const have = exits.map(e => e.id)
-    const missing = SETTINGS_JEV_STARTER_EXITS.filter(e => !have.includes(e.id))
-    if (missing.length) {
-      setExits([...exits, ...missing.map(e => ({ ...e }))])
-    }
-    const names = rules.map(r => r.name)
-    for (const rule of set_jevStarterRules()) {
-      if (names.includes(rule.name)) {
-        continue
-      }
-      const res = await set_call('/automations', 'POST', rule)
-      if (!res.ok) {
-        setStarterError(res.error)
-        break
-      }
-    }
-    setStarterNote('Save to keep the new conditions; the rules start disabled.')
-    setStarterBusy(false)
   }
 
   return set_h(
@@ -5562,20 +5553,75 @@ function SettingsJevForm({ draft, set }) {
     { className: 'flex flex-col gap-3' },
     jsx(SettingsCard, {
       title: 'Jev',
-      desc: 'Jev (TypeSafe) scores every incoming message against your exit conditions in about half a second, without running an LLM. The first condition in the list whose score reaches its minimum is chosen; when none does, Else is chosen. The actions of the chosen condition then run.',
-      children: jsx(SettingsToggle, {
-        checked: j('enabled', false),
-        onChange: v => set(['jev', 'enabled'], v),
-        label: 'Jev exit conditions enabled',
-        hint: 'Off by default. Only incoming text messages of the selected numbers are sent to Jev.'
-      })
-    }),
-    jsx(SettingsJevKey, {}),
-    jsx(SettingsCard, {
-      title: 'Options',
+      desc: 'Jev (TypeSafe) scores every incoming message against your conditions in about half a second, without an LLM. The first condition whose score reaches its minimum is chosen, otherwise Else, and its actions run.',
       children: set_h(
         'div',
         { className: 'flex flex-col gap-3' },
+        jsx(SettingsToggle, {
+          checked: j('enabled', false),
+          onChange: v => set(['jev', 'enabled'], v),
+          label: 'Jev exit conditions enabled',
+          hint: 'Off by default. Only incoming text messages of the selected numbers are sent to Jev.'
+        }),
+        jsx(SettingsJevKey, {})
+      )
+    }),
+    jsx(SettingsCard, {
+      title: 'Rules',
+      desc: 'Write in your own words the situations you care about and what should happen, like a USER.md. Hermes turns them into Jev conditions and automation rules.',
+      children: set_h(
+        'div',
+        { className: 'flex flex-col gap-3' },
+        jsx(Textarea, {
+          value: doc,
+          rows: 16,
+          placeholder: SETTINGS_JEV_PLACEHOLDER,
+          style: { fontFamily: 'monospace' },
+          onChange: e => set(['jev', 'document'], e.target.value)
+        }),
+        set_h(
+          'div',
+          { className: 'flex flex-wrap items-center gap-3' },
+          jsx(Button, {
+            size: 'sm',
+            loading: genBusy,
+            disabled: !doc.trim() || doc.length > SETTINGS_JEV_MAX_DOCUMENT,
+            onClick: generate,
+            children: 'Generate conditions'
+          }),
+          set_h(
+            'span',
+            { className: 'text-xs', style: set_muted },
+            doc.length > SETTINGS_JEV_MAX_DOCUMENT
+              ? 'Too long: ' + doc.length + ' / ' + SETTINGS_JEV_MAX_DOCUMENT + ' characters.'
+              : 'Uses your Hermes profile’s default model, about 10–30 s.'
+          )
+        ),
+        genError ? set_h('div', { className: 'text-xs', style: set_errorBox }, genError) : null,
+        applyNote ? set_h('div', { className: 'text-xs', style: set_muted }, applyNote) : null
+      )
+    }),
+    gen
+      ? jsx(SettingsJevPreview, {
+          result: gen,
+          onApply: apply,
+          onDiscard: () => {
+            setGen(null)
+            setApplyError('')
+          },
+          busy: applyBusy,
+          error: applyError
+        })
+      : null,
+    jsx(SettingsJevActive, {}),
+    jsx(SettingsJevTest, {}),
+    set_h(
+      'details',
+      { className: 'flex flex-col gap-3', style: set_card },
+      set_h('summary', { className: 'text-sm font-semibold cursor-pointer' }, 'Advanced'),
+      set_h(
+        'div',
+        { className: 'flex flex-col gap-3', style: { marginTop: 12 } },
         jsx(SettingsField, {
           label: 'Model',
           hint: 'Pin a version such as jev-1.13.0 once the scores are tuned.',
@@ -5656,83 +5702,7 @@ function SettingsJevForm({ draft, set }) {
           })
         })
       )
-    }),
-    jsx(SettingsCard, {
-      title: 'Exit conditions',
-      desc: 'Checked top to bottom: the first condition whose score reaches its minimum is chosen, otherwise Else. Give each condition and Else their actions.',
-      children: set_h(
-        'div',
-        { className: 'flex flex-col gap-3' },
-        rulesQ.error && !rulesQ.data
-          ? set_h('div', { className: 'text-xs', style: set_errorBox }, errorText(rulesQ.error))
-          : null,
-        exits.length === 0 ? set_h('div', { className: 'text-xs', style: set_muted }, 'No exit conditions yet.') : null,
-        ...exits.map((exit, i) =>
-          jsx(SettingsJevExit, {
-            key: exit.id,
-            exit,
-            index: i,
-            count: exits.length,
-            rules,
-            exits,
-            accounts,
-            onChange: next => setExits(exits.map((x, k) => (k === i ? next : x))),
-            onMove: dir => moveExit(i, dir),
-            onRemove: () => setExits(exits.filter((_, k) => k !== i))
-          })
-        ),
-        set_h(
-          'div',
-          { className: 'flex flex-col gap-3', style: set_card },
-          set_h('div', { className: 'text-sm font-semibold' }, 'Else'),
-          set_h(
-            'div',
-            { className: 'text-xs', style: set_muted },
-            'Chosen when no condition reaches its minimum score'
-          ),
-          jsx(SettingsJevActions, { exitId: 'else', label: 'Else', rules, exits, accounts })
-        ),
-        set_h(
-          'div',
-          { className: 'flex flex-wrap items-end gap-2' },
-          set_h(
-            'div',
-            { style: { flex: '1 1 260px' } },
-            jsx(SettingsField, {
-              label: 'New condition',
-              children: jsx(Input, {
-                value: newLabel,
-                placeholder: 'Label, e.g. Wants a quote',
-                onChange: e => setNewLabel(e.target.value),
-                onKeyDown: e => {
-                  if (isSubmitEnter(e)) {
-                    e.preventDefault()
-                    addExit()
-                  }
-                }
-              })
-            })
-          ),
-          jsx(Button, {
-            size: 'sm',
-            variant: 'secondary',
-            disabled: !newLabel.trim(),
-            onClick: addExit,
-            children: 'Add condition'
-          }),
-          jsx(Button, {
-            size: 'sm',
-            variant: 'secondary',
-            loading: starterBusy,
-            onClick: addStarters,
-            children: 'Add starter conditions and rules'
-          })
-        ),
-        starterError ? set_h('div', { className: 'text-xs', style: set_errorBox }, starterError) : null,
-        starterNote ? set_h('div', { className: 'text-xs', style: set_muted }, starterNote) : null
-      )
-    }),
-    jsx(SettingsJevTest, {})
+    )
   )
 }
 
@@ -5792,6 +5762,14 @@ function SettingsPage() {
     setError('')
     setState(s => ({ base: s.base, draft: set_clone(s.base) }))
   }
+  // Jev rules applied: the saved settings become the base; other unsaved edits stay in the draft.
+  const applied = saved => {
+    setState(s => ({
+      base: saved,
+      draft: { ...s.draft, jev: { ...s.draft.jev, document: saved.jev.document, exits: saved.jev.exits } }
+    }))
+    refresh()
+  }
   const save = async () => {
     setSaving(true)
     setError('')
@@ -5827,7 +5805,7 @@ function SettingsPage() {
               : sec === 'hours'
                 ? jsx(SettingsHoursForm, props)
                 : sec === 'jev'
-                  ? jsx(SettingsJevForm, props)
+                  ? jsx(SettingsJevForm, { ...props, onApplied: applied })
                   : jsx(SettingsAutomations, props)
     content = set_h(
       'div',

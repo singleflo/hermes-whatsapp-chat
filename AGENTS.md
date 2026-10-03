@@ -44,8 +44,8 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | Module | Responsibility |
 |---|---|
 | `errors.py` | `WaError(Exception)` with `.status`: `NotFound` 404, `Conflict` 409, `Invalid` 400, `Unavailable` 503, `BadGateway` 502, `TooLarge` 413 |
-| `db.py` | paths (`data_dir`, `db_path`), `SCHEMA`, v1/v2/v3→v4 migrations, `connect()`, `write_txn()`, `jloads()` |
-| `settings.py` | pydantic `Settings` model (single JSON row `global`), `get_settings`, `save_settings` (emits `settings.updated`) |
+| `db.py` | paths (`data_dir`, `db_path`), `SCHEMA`, v1/v2/v3/v4→v5 migrations, `connect()`, `write_txn()`, `jloads()` |
+| `settings.py` | pydantic `Settings` model (single JSON row `global`), `get_settings`, `write_settings` (inside the caller's transaction, emits `settings.updated`), `save_settings` (own transaction) |
 | `accounts.py` | accounts CRUD, desired state, restart, status/QR, service heartbeat/`service_info` (`running`, `installed`, `skill_installed`, `node`; `install_command` is always `None`, kept for compatibility), session/media paths |
 | `bridge.py` | tiny HTTP client to one bridge port (`bridge_request`, raises `BridgeUnavailable`) |
 | `conversations.py` | board, list, detail, state machine, mute/takeover/escalate/read/tags, search, timers (`run_timers`) |
@@ -56,9 +56,10 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 | `events.py` | `emit()`: inserts an `events` row and enqueues matching automation runs |
 | `automations.py` | rule matching, run queue, executor (`process_due`), action types |
 | `automations_api.py` | `router` with the automation routes, included by `plugin_api.py` |
-| `jev.py` | Jev exit conditions: API key, request/answer building, `enqueue_for_message`/`enqueue_now`, `process_due` worker, `score_conversation` (sync test), `summary_text` |
-| `jev_api.py` | `router` with the Jev routes (`/jev`, `/jev/key`, `/jev/test`, `/conversations/{id}/classify`), included by `plugin_api.py` |
-| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`/`ensure_service`, `install_skill`/`uninstall_skill`, `service_installed`, `auto_install_enabled`, `linger_enabled`, `skill_installed`, `find_node`, `API_VERSION` (6). Subprocess calls go through `_run(argv, env=None)`, the Windows start through `_spawn` (test seams) |
+| `jev.py` | Jev exit conditions: API key, request/answer building, `enqueue_for_message`/`enqueue_now`, `process_due` worker, `score_state` (pure, thread-safe), `score_conversation`/`score_text` (sync tests), `summary_text` |
+| `jev_rules.py` | Jev rules document: `generate` (Hermes one-shot → validated plan + Jev check of the examples), `apply` (document + exits + managed rules in one transaction), `plan_rules`, `normalize_plan`, `status` |
+| `jev_api.py` | `router` with the Jev routes (`/jev`, `/jev/key`, `/jev/generate`, `/jev/apply`, `/jev/test`, `/conversations/{id}/classify`), included by `plugin_api.py` |
+| `service.py` | Service/skill installer (below): `plugin_dir()`, `write_launchers`, `install_service`/`uninstall_service`/`ensure_service`, `install_skill`/`uninstall_skill`, `service_installed`, `auto_install_enabled`, `linger_enabled`, `skill_installed`, `find_node`, `API_VERSION` (7). Subprocess calls go through `_run(argv, env=None)`, the Windows start through `_spawn` (test seams) |
 
 ### Multi-account model
 
@@ -67,9 +68,9 @@ UI desktop: ctx.rest/ctx.socket        UI dashboard: SDK.fetchJSON / WebSocket
 - New accounts get `session_dir = sessions/<id>` and the lowest free port ≥ 3017 (≠ 3000). Media dir `<data>/wa-media/<id>`, uploads `<data>/uploads/<account_id>/`.
 - All timestamps are integer unix seconds.
 
-### Schema v4 and migration
+### Schema v5 and migration
 
-`PRAGMA user_version = 4`, created in `db.connect()` (WAL). Tables: `accounts`, `account_status`, `service_status`, `settings`, `conversations`, `messages`, `conversation_state_log`, `events`, `automation_rules`, `automation_runs`, `jev_runs` (+ indexes). The full DDL is `SCHEMA` in `wa_core/db.py`. v2→v3 (`_migrate_v2`) rebuilds `messages` (new status values and columns `delivered_at`, `read_at`, `remote_jid`); existing inbound rows get `read_at = ts`. v3→v4 (`_migrate_v3`) adds `conversations.classification` (latest Jev result, JSON) and the `jev_runs` queue (same statuses as `automation_runs`; `message_id`, `attempts`, `not_before`, `error`, `model`, `latency_ms`, `input_tokens`); `_upgrade` chains v2 → v3 → v4. `jev_runs` is deleted with (`accounts.purge_conversations`, `contacts.delete_conversation`) or moved with (`contacts._merge`) its conversation.
+`PRAGMA user_version = 5`, created in `db.connect()` (WAL). Tables: `accounts`, `account_status`, `service_status`, `settings`, `conversations`, `messages`, `conversation_state_log`, `events`, `automation_rules`, `automation_runs`, `jev_runs` (+ indexes). The full DDL is `SCHEMA` in `wa_core/db.py`. v2→v3 (`_migrate_v2`) rebuilds `messages` (new status values and columns `delivered_at`, `read_at`, `remote_jid`); existing inbound rows get `read_at = ts`. v3→v4 (`_migrate_v3`) adds `conversations.classification` (latest Jev result, JSON) and the `jev_runs` queue (same statuses as `automation_runs`; `message_id`, `attempts`, `not_before`, `error`, `model`, `latency_ms`, `input_tokens`). v4→v5 (`_migrate_v4`) adds `automation_rules.managed_by` (NULL = rule made by the user, `'jev'` = generated from the Jev rules document). `_upgrade` chains v2 → v3 → v4 → v5. `jev_runs` is deleted with (`accounts.purge_conversations`, `contacts.delete_conversation`) or moved with (`contacts._merge`) its conversation.
 
 - `messages.author`: `contact`, `user` (sent from the UI), `phone` (typed on the linked phone), `auto_reply` (WhatsApp Business away/greeting echo), `agent:<profile|default>`, `rule:<id>`, `cli`. `status` ∈ `received|pending|sent|delivered|read|played|failed|draft|discarded` (outbound ticks advance monotonically via `STATUS_RANK`; `delivered_at`/`read_at` on outbound = when the contact's phone received/read it, on inbound = when we marked it read); `remote_jid` = raw WhatsApp chat JID the message travelled on (may be `@lid`); `source` ∈ `live|history`. Media meta: `{"mediaType", "media": [{"path","mime","name","size"}]}`.
 - Migration v1→v2 runs in `connect()` in one transaction when `user_version < 2`: a v1 `conversations` table (`chat_jid` primary key) becomes account 1 (`Main`, green, port 3017, `wa-session` dir) if real conversations or `wa-session/creds.json` exist, plus a `Demo` account for `@demo.invalid` chats; conversations, messages (in→author `contact`/status `received`, out→`user`/`sent`) and the state log are copied, old tables dropped. A fresh DB gets the schema directly with no accounts.
@@ -86,7 +87,7 @@ Errors are `{"detail": str}`.
 - Reading: `GET /board?account_id=&q=&include_closed=`, `GET /conversations?account_id=&state=&q=&unread_only=&limit=&offset=`, `GET /conversations/{id}`, `GET /conversations/{id}/messages?before_id=&limit=`, `GET /messages/{id}/media/{index}`, `GET /search?q=&account_id=`.
 - Mutations: `POST /conversations/{id}/state|mute|takeover|handback|escalate|read`, `PUT /conversations/{id}/tags`, `POST /conversations/{id}/reply|reply-media|drafts`, `POST /messages/{id}/approve|discard`.
 - Automations (`automations_api.router`): `GET|POST /automations`, `PUT|DELETE /automations/{id}`, `POST /automations/reorder`, `POST /automations/{id}/test` (dry run), `GET /automation-runs`, `POST /automation-runs/{id}/retry`.
-- Jev (`jev_api.router`): `GET /jev` (`{key_set, key_source}`, source `settings`|`env`|null; the key is never returned), `PUT /jev/key` (`{api_key}`, empty removes; same shape), `POST /jev/test` (`{conversation_id}`; synchronous, nothing persisted → `{state, scores, exit, score, summary, model, latency_ms, usage}`; 400 no key/no exits, 502 Jev error with its detail, 503 unreachable), `POST /conversations/{id}/classify` (`{queued, run_id}`; 400 when disabled, no key or no exits). `GET /conversations/{id}` also returns `classification` (also nested in `conversation`) and `jev_runs` (last 5).
+- Jev (`jev_api.router`): `GET /jev` → `jev_rules.status` (`{enabled, key_set, key_source, model, document, conditions: [{id, label, description, min_score, rules: [{id, name, enabled, managed}]}], else: {rules}}`; key source `settings`|`env`|null, the key is never returned), `PUT /jev/key` (`{api_key}`, empty removes; same shape), `POST /jev/generate` (`{document ≤ 20000, check = true}` → `{plan, model, latency_ms, attempts, checks, check_error}`; nothing persisted; 400 empty/too long, 502 when Hermes fails or twice returns an invalid plan, 503 when Hermes cannot run), `POST /jev/apply` (`{document, plan}` → `{settings, rules}`; 400 invalid plan), `POST /jev/test` (exactly one of `conversation_id` / `text`, else 400; optional `conditions` replace the stored ones; synchronous, nothing persisted → `{state, scores, exit, score, summary, model, latency_ms, usage}`; 400 no key/no exits, 502 Jev error with its detail, 503 unreachable), `POST /conversations/{id}/classify` (`{queued, run_id}`; 400 when disabled, no key or no exits). `GET /conversations/{id}` also returns `classification` (also nested in `conversation`) and `jev_runs` (last 5). Automation rules carry `managed_by`.
 - `WS /events`.
 
 ### Rules engine (`ingest.py`, `conversations.py`)
@@ -103,6 +104,8 @@ Errors are `{"detail": str}`.
 One JSON row, key `global`, validated by the pydantic `Settings` model with defaults: `rules` (the five inbound/outbound policies above, `auto_reply_window_seconds`, `auto_close_waiting_days`), `notifications` (`new_conversation`, `every_inbound`, `escalation`, `quiet_hours`), `board` (`urgency_hours`, `mute_presets_hours`, `drop_mute_hours`, `closed_limit`), `hours` (timezone + weekly business hours), `automations` (`enabled`, `max_runs_per_conversation_per_hour`, `history_messages_in_prompt`), `media` (`max_upload_mb`), `jev` (below). The model is the single source of truth for defaults and bounds.
 
 `jev` (opt-in): `enabled` (false), `model` (`jev-latest`), `account_ids` (empty = every WhatsApp number), `history_messages` (10), `debounce_seconds` (5), `timeout_s` (10), `question` (`DEFAULT_JEV_QUESTION`) and `exits[]` (`id` slug unique and never `else`, `label`, `description` = the condition Jev scores, `min_score` 0–1, default 0.7; order matters). The API key is **not** part of it: row `jev_api_key` of the `settings` table (JSON string, never returned by any route), fallback env `TYPESAFE_API_KEY`.
+
+`jev.document` (≤ 20000 chars) is the user's **Jev rules** (Markdown, see "Jev rules document" below); `jev.exits` is normally written by `jev_rules.apply` from it (the settings form may still save both).
 
 `privacy` (`send_read_receipts`, default true): opening a conversation in the UI (`POST /conversations/{id}/read` only; never CLI, agents or automations) sends WhatsApp read receipts through the bridge `POST /read`.
 
@@ -124,6 +127,15 @@ One JSON row, key `global`, validated by the pydantic `Settings` model with defa
 - **Worker.** `jev.process_due` (sidecar, own 1-thread slot) claims due runs like `automations._claim` (stale `running` older than `timeout_s + 60` → requeue, or fail after 3 attempts), builds the request and POSTs **outside any transaction** via the seam `jev._post(body, key, timeout)`. Body `{state, model, questions}` to `https://api.typesafe.ai/v1/systemone` with `Authorization: Bearer <key>`; `questions` has one `noul` question per exit (`instructions` = object `{question, condition}` whose fields the question references with backticks, `criteria` = `{true, false}`); `state` = `{number, contact{name,phone}, conversation{state,tags,handled_by}, latest_message, recent_messages[]}` (no timestamps). The answer's `answers[id].noul` (P(true), finite, 0–1) must exist for every exit. 401/403/404/422 and invalid answers fail the run; 408/429/5xx/529 and network errors retry (`retry-after` clamped 1–300 s, else 5 s / 30 s) up to 3 attempts. Skipped with `Jev disabled` / `no API key` / `no exit conditions` / `conversation not found`.
 - **Decision.** `decide`: the first exit in list order with `score >= min_score` wins, otherwise `else`. Result stored in `conversations.classification` = `{exit, score, scores, model, at, run_id, message_id, latency_ms}` in one transaction with the run (`done`) and the events `conversation.updated` (`["classification"]`) and `conversation.classified` (`{run_id, message_id, exit, score}`).
 - **Rules.** Condition `jev_exits` (list of exit ids, `"else"` allowed) matches the conversation's current classification (`no Jev classification yet` when none); `{jev}` renders `jev.summary_text` (chosen exit and every score, empty without classification); the webhook/script payload carries `conversation.classification`.
+
+### Jev rules document (`wa_core/jev_rules.py`)
+
+The user writes one Markdown document (`settings.jev.document`); the backend turns it into conditions and rules. Nothing is persisted until **apply**.
+
+- **Generate.** `jev_rules.generate(conn, document, check=True)` calls the profile's default model through the public CLI, one shot, no tools: `[hermes, "-z", PROMPT, "--reasoning", "none", "-t", "context_engine", "--ignore-rules", "--usage-file", <tmp>]` (cwd = data dir, 180 s) via the seam `jev_rules._run_hermes(prompt, timeout)` (never called for real in tests). The answer (code fences tolerated) is repaired by `normalize_plan` (slug ids, dedupe `_2`…, `else` → `else_2`, clamp `min_score`, truncate label/description, drop action keys the type does not use) and strictly validated into a `Plan`. Invalid → one retry with the error appended; a second failure is a 502 (`BadGateway`), Hermes unavailable 503. `PROMPT` is in the module and is replaced with `str.replace`, never `.format`; it asks for labels, descriptions, examples and notes in the language of the rules.
+- **Check.** With a Jev key, every `examples` item (expected = its condition id) and `else_examples` (expected `else`) is scored with `jev.score_state` against the plan's conditions in a 4-thread pool (no database access in threads); `checks[]` = `{text, expected, exit, score, scores, ok}`. A Jev failure gives `checks = null` + `check_error`; the plan is still returned.
+- **Actions** of a plan: `takeover`, `escalate`, `agent_draft`, `agent_reply`, `reply`, `set_state`, `add_tags`. `plan_rules` makes one `RuleIn`-shaped rule per action (`conversation.classified`, `conditions.jev_exits = [id]`, plus `agent_active` for agent/reply actions; `agent_*` use the `hermes` action with `AGENT_PROMPT` + the instructions).
+- **Apply.** `jev_rules.apply(conn, document, plan, now)` is one transaction: write settings (`jev.document`, `jev.exits`; everything else unchanged, via `settings.write_settings`), delete the queued `automation_runs` of the old managed rules and the rules with `managed_by = 'jev'`, insert the new ones (`managed_by = 'jev'`, positions after the current max). Rules made by the user (`managed_by` NULL) are never touched; a user edit of a managed rule keeps its `managed_by` and is lost at the next apply. Jev on/off stays the separate `jev.enabled` toggle.
 
 ### Service installer (`wa_core/service.py`) and runtime interpreter
 
@@ -156,6 +168,8 @@ Subcommands: `run`, `install`, `uninstall`, `install-skill` (the three delegate 
 
 `plugin/scripts/wa.py`: `list [--state S] [--account ID] [--unread] [--limit N] [--json]`, `show ID`, `send ID TEXT`, `draft ID TEXT`, `state ID STATE [--reason R]`, `tag ID +a -b`, `takeover ID`, `handback ID`, `search QUERY [--account ID]`. It loads `../dashboard/plugin_api.py` relative to its own file and calls `core` directly (same for `plugin/scripts/seed_demo.py`). Installed users run it as `<data>/bin/wa`; in dev, `uv run python plugin/scripts/wa.py`. Author of what it writes: `agent:$HERMES_PROFILE` if set, else `cli`. Exit 0 ok, 1 error (message on stderr). The skill template `plugin/skill/whatsapp-chat/SKILL.md` documents it with the `{{WA_CLI}}` token (draft-first rule); keep it in sync with the CLI.
 
+`wa jev …` (same module `jev_rules`): `show [--json]` (status, rules document, conditions with their rules, Else), `on` / `off` (`settings.jev.enabled`), `generate [FILE|-] [--no-check] [--apply] [--json]` (preview of the plan with ✓/✗ per example; document = FILE, stdin or the stored one; `--apply` stores it), `apply PLAN|- [--rules FILE] [--json]` (PLAN = a generate result or a bare plan), `test TEXT | --conversation ID [--json]`.
+
 ### Hermes-update safety
 
 Use only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI (`hermes [-p PROFILE] chat -Q -q PROMPT --source whatsapp-chat`) and HTTP. **Never edit Hermes core** and never import Hermes internals except the existing guarded `_ws_upgrade_authorized` and `plugins.plugin_storage` (both with `ImportError` fallbacks). `plugin/plugin.yaml` sets `python_runtime: external`.
@@ -177,7 +191,7 @@ Use only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI (
 | `plugin/scripts/seed_demo.py` | Demo data in a `kind='demo'` account (`--reset` / `--remove`); demo chats are `@demo.invalid` |
 | `plugin/skill/whatsapp-chat/` | Skill **template** teaching agents the CLI (`{{WA_CLI}}` token; rendered by Install skill) |
 | `.agents/skills/` | Project skills (Hermes plugin development, desktop plugins, Hermes agent) |
-| `tests/` | pytest suite: `test_plugin_api.py`, `test_automations.py`, `test_jev.py` |
+| `tests/` | pytest suite: `test_plugin_api.py`, `test_automations.py`, `test_jev.py`, `test_jev_rules.py` |
 | `docs/` | Original build kit (01–07 background; 08 spec is superseded) and `docs/skills/`, `docs/examples/` |
 | root | Dev-only: `pyproject.toml`, `package.json`, eslint/prettier configs, `README.md`, `AGENTS.md` |
 
@@ -284,7 +298,7 @@ The JS halves are hand-written files that load as-is; there is no build step.
 | `plugin/sidecar/_vendor/segno/` | Vendored QR library (do not edit) |
 | `plugin/sidecar/update_bridge.sh`, `plugin/sidecar/patches/` | Vendored bridge refresh and local patches |
 | `plugin/scripts/wa.py`, `plugin/skill/whatsapp-chat/SKILL.md` | CLI and skill template for Hermes agents |
-| `tests/test_plugin_api.py`, `tests/test_automations.py`, `tests/test_jev.py` | pytest suites (real router + tmp SQLite) |
+| `tests/test_plugin_api.py`, `tests/test_automations.py`, `tests/test_jev.py`, `tests/test_jev_rules.py` | pytest suites (real router + tmp SQLite) |
 | `plugin/desktop/plugin.js` / `plugin/dashboard/dist/index.js` | The two UI halves |
 | `plugin/dashboard/manifest.json` | Required fields: `name`, `tab.path`, `entry`. `api` points to `plugin_api.py` |
 | `plugin/plugin.yaml` | `name`, `version`, `description`, `python_runtime: external` |
@@ -310,6 +324,7 @@ The JS halves are hand-written files that load as-is; there is no build step.
 ## Testing & QA
 
 - **Framework:** pytest with FastAPI `TestClient` (requires `httpx`). Files: `tests/test_plugin_api.py` (routes, rules engine, accounts, outbound, migration, settings, events), `tests/test_automations.py` (matching, executor, actions, retries, loop guard) and `tests/test_jev.py` (Jev settings/key, enqueue and debounce, classification and decision, retries, rules/`{jev}`, routes, migrations, conversation deletes/merges; the Jev HTTP call is faked at `jev._post`).
+  - `tests/test_jev_rules.py` covers the rules document (plan normalisation, generate/retry/check, plan → rules, apply replacing only managed rules, `/jev/test` with text and conditions, the `wa jev` CLI); fakes only `jev_rules._run_hermes` (and `subprocess.run` inside it for its own test) and `jev._post`.
 - **Pattern:**
   1. Load the **real** `plugin/dashboard/plugin_api.py` with `importlib.util.spec_from_file_location` (the `wa_core` package loads fresh through it).
   2. Mount `mod.router` in a bare `FastAPI()` with prefix `/api/plugins/hermes-whatsapp-chat`.

@@ -93,7 +93,7 @@ Five columns, one card per conversation: New, In progress, Waiting, Muted, Close
 - **Board**: urgency threshold, mute presets, drop-to-mute duration, closed-column limit.
 - **Hours**: timezone and weekly business hours (used by automation conditions).
 - **Automations**: the dispatcher described below, with a test button (dry run on a conversation) and a run log with retry.
-- **Jev**: opt-in exit conditions scored by TypeSafe Jev (see "Jev exit conditions" below): API key, numbers, conditions with their actions, and a test button.
+- **Jev**: opt-in exit conditions scored by TypeSafe Jev (see "Jev exit conditions" below): you write your rules in plain text, **Generate conditions** turns them into conditions and automation rules, and a box tries a message.
 
 Conversations created by history import start Closed, and history messages never trigger rules, unread counters, notifications or automations.
 
@@ -121,12 +121,13 @@ Safety nets: runs are skipped when a human took over (`agent_active` off), autom
 
 ### Jev exit conditions
 
-Optional. You list exit conditions (label, a plain-language description and a minimum score from 0 to 1); there is always an implicit **Else** after them. [TypeSafe Jev](https://typesafe.ai) scores every incoming text message against each condition in one call of about half a second, without running an LLM. The first condition in the list whose score reaches its minimum is chosen; when none does, Else is chosen. The result is stored on the conversation and raises the `conversation.classified` event, so ordinary automation rules (take over for a person, Hermes agent draft, escalate, ...) can act on it with the `jev_exits` condition; the `{jev}` template variable puts the chosen condition and every score into a prompt.
+Optional. You write your rules in plain words, like a `USER.md`: which situations matter and what should happen ("if the client is upset, a person answers; routine questions get a draft from the agent"). **Generate conditions** asks the default model of your Hermes profile (one shot, no tools, about 10–30 s) to turn them into **exit conditions** (label, a description Jev reads, a minimum score from 0 to 1) and the actions of each; there is always an implicit **Else** after them. The preview shows every condition, its actions and a few example messages that Jev scores right away (✓ when the example lands on the condition it should), so you can see whether the conditions work before you **Apply** them. [TypeSafe Jev](https://typesafe.ai) then scores every incoming text message against the conditions in one call of about half a second, without running an LLM. The first condition in the list whose score reaches its minimum is chosen; when none does, Else is chosen. The result is stored on the conversation and raises the `conversation.classified` event, and the actions of the chosen condition run as ordinary automation rules (take over for a person, Hermes agent draft or reply, fixed reply, set state, tags, escalate); the `{jev}` template variable puts the chosen condition and every score into a prompt.
 
-- **Setup**: enter the API key in the Jev settings (stored in the plugin database, never shown again), or set `TYPESAFE_API_KEY` in the service environment as a fallback. Pick the numbers to classify (none selected = all WhatsApp numbers), then enable it.
+- **Setup**: enter the API key in the Jev settings (stored in the plugin database, never shown again), or set `TYPESAFE_API_KEY` in the service environment as a fallback. Write the rules, Generate, Apply, then turn Jev on (it stays off until you do). Pick the numbers to classify in the advanced options (none selected = all WhatsApp numbers).
+- **Generated rules**: Apply replaces every automation rule marked "From Jev rules" and the conditions with the new ones; rules you made yourself in Automations are never touched, and an edit of a generated rule is lost at the next Apply. Agent replies are drafts for you to approve unless your rules explicitly ask for automatic replies.
 - **What Jev sees**: only live incoming text messages of the selected numbers, with the last messages of the conversation as context. History imports, your own messages, reactions, media without text and demo chats are never sent.
-- **Testing and manual runs**: the test button scores a conversation without saving anything; **Classify now** in a conversation queues a run immediately.
-- **Failures**: rate limits and temporary errors retry (up to 3 attempts); a wrong key or an invalid answer fails the run, which shows in the conversation detail.
+- **Testing and manual runs**: the "try a message" box scores a typed message with the active conditions without saving anything; **Classify now** in a conversation queues a run immediately.
+- **Failures**: rate limits and temporary errors retry (up to 3 attempts); a wrong key or an invalid answer fails the run, which shows in the conversation detail. If Hermes cannot produce valid conditions after two tries, Generate reports the error and nothing changes.
 
 ## CLI for Hermes (and you)
 
@@ -139,6 +140,10 @@ Optional. You list exit conditions (label, a plain-language description and a mi
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa tag ID +vip -spam
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa takeover ID            # also: handback ID
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa search QUERY [--account ID]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev show               # Jev rules, conditions and their rules; also: jev on | jev off
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev generate [FILE|-] [--apply]   # rules document -> conditions + rules (preview; --apply stores)
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev apply PLAN|- [--rules FILE]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa jev test TEXT          # or --conversation ID
 ```
 
 `ID` is the conversation id. The author of CLI messages is `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`. Exit code 0 is success, 1 an error (message on stderr). `bin/wa` is created by **Install service** (or **Install skill**) and runs `plugin/scripts/wa.py` on the plugin's Python. The skill template (`plugin/skill/whatsapp-chat/SKILL.md`) teaches agents these commands and the draft-first etiquette; **Install skill** renders it with the absolute `bin/wa` path into `~/.hermes/skills/whatsapp-chat/SKILL.md`.
@@ -226,7 +231,7 @@ cd hermes-whatsapp-chat
 uv sync --python 3.11                                   # FastAPI, pydantic, pytest, ruff, ty
 npm ci --prefix plugin/sidecar/whatsapp-bridge          # the bridge's Node deps (the installed service does this itself)
 
-uv run pytest -q                                        # tests/test_plugin_api.py, tests/test_automations.py, tests/test_jev.py
+uv run pytest -q                                        # tests/test_plugin_api.py, test_automations.py, test_jev.py, test_jev_rules.py
 uv run ruff check . && uv run ty check plugin tests
 pnpm lint && pnpm format:check                          # JS halves (hand-written, no build step)
 uv run python plugin/scripts/seed_demo.py --reset       # demo conversations (@demo.invalid; --remove to delete)

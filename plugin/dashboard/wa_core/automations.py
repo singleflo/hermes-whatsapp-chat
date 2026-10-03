@@ -71,6 +71,7 @@ def rule_to_dict(row) -> dict[str, Any]:
         "stop_after_match": bool(row["stop_after_match"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "managed_by": row["managed_by"],
     }
 
 

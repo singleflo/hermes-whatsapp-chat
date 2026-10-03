@@ -134,6 +134,7 @@ class JevSettings(_Strict):
     timeout_s: int = Field(default=10, ge=1, le=60)
     question: str = Field(default=DEFAULT_JEV_QUESTION, min_length=1, max_length=2000)
     exits: list[JevExit] = Field(default_factory=list, max_length=30)
+    document: str = Field(default="", max_length=20000)  # the user's Jev rules (Markdown)
 
     @field_validator("exits")
     @classmethod
@@ -169,15 +170,20 @@ def get_settings(conn: sqlite3.Connection) -> Settings:
         return Settings()
 
 
-def save_settings(conn: sqlite3.Connection, s: Settings, now: int) -> Settings:
+def write_settings(conn: sqlite3.Connection, s: Settings, now: int) -> Settings:
+    """Validate and store the settings inside the caller's transaction (emits ``settings.updated``)."""
     from . import events  # lazy: events pulls in the automations slice, which imports this module
 
     s = Settings.model_validate(s.model_dump())
-    with db.write_txn(conn):
-        conn.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (SETTINGS_KEY, json.dumps(s.model_dump()), now),
-        )
-        events.emit(conn, "settings.updated", now=now)
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (SETTINGS_KEY, json.dumps(s.model_dump()), now),
+    )
+    events.emit(conn, "settings.updated", now=now)
     return s
+
+
+def save_settings(conn: sqlite3.Connection, s: Settings, now: int) -> Settings:
+    with db.write_txn(conn):
+        return write_settings(conn, s, now)

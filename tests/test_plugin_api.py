@@ -279,7 +279,7 @@ def test_health_reports_db_count_and_schema_version(client, db, account):
     body = client.get(f"{PREFIX}/health").json()
     assert body["ok"] is True
     assert body["conversations"] == 2
-    assert body["schema_version"] == 4
+    assert body["schema_version"] == 5
     assert body["db"].endswith("wa_board.db")
 
 
@@ -505,15 +505,15 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
 
 
 def test_health_and_service_report_api_version(client, core):
-    assert core.service.API_VERSION == 6
-    assert client.get(f"{PREFIX}/health").json()["api_version"] == 6
-    assert client.get(f"{PREFIX}/service").json()["api_version"] == 6
+    assert core.service.API_VERSION == 7
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 7
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 7
 
 
 def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["api_version"]) == (False, 6)
+    assert (body["ok"], body["api_version"]) == (False, 7)
 
 
 def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):
@@ -1136,7 +1136,7 @@ def test_v1_db_migrates_keeping_conversations_and_creating_accounts(client, core
     assert detail["state_history"][0]["to_state"] == "new"
     conn = core.db.connect()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute("SELECT last_inbound_at FROM conversations WHERE chat_jid = ?", (CONTACT_JID,)).fetchone()[0] == NOW - 100
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert not any(t.startswith("v1_") for t in tables)
@@ -1991,6 +1991,7 @@ DEFAULT_SETTINGS = {
         "timeout_s": 10,
         "question": "Does the conversation meet `condition` now? Judge `latest_message` in the context of `recent_messages`.",
         "exits": [],
+        "document": "",
     },
 }
 
@@ -2336,7 +2337,7 @@ def receipt(wa_id, status, ts=None, chat=CONTACT_JID):
     return {"type": "receipt", "id": wa_id, "chatId": chat, "status": status, "ts": ts or NOW}
 
 
-def test_v2_db_migrates_to_v4_keeping_rows_and_marking_old_inbound_read(client, core, tmp_path):
+def test_v2_db_migrates_to_v5_keeping_rows_and_marking_old_inbound_read(client, core, tmp_path):
     raw = sqlite3.connect(tmp_path / "wa_board.db")
     raw.executescript(V2_SCHEMA)
     raw.execute(
@@ -2352,7 +2353,7 @@ def test_v2_db_migrates_to_v4_keeping_rows_and_marking_old_inbound_read(client, 
     raw.close()
 
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["schema_version"], body["conversations"]) == (True, 4, 1)
+    assert (body["ok"], body["schema_version"], body["conversations"]) == (True, 5, 1)
 
     conn = core.db.connect()
     try:

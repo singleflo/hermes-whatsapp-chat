@@ -300,15 +300,11 @@ def enqueue_now(conn, conversation_id: int, now: int) -> int:
     )
 
 
-# --- Synchronous test ----------------------------------------------------------------------
+# --- Synchronous scoring ---------------------------------------------------------------------
 
 
-def score_conversation(conn, conversation_id: int) -> dict[str, Any]:
-    """Score a conversation's latest incoming message right now; nothing is stored."""
-    cfg = _require_ready(conn)
-    key = api_key(conn)[0] or ""
-    conv = _conversation_row(conn, conversation_id)
-    state = build_state(conn, cfg, conv, None)
+def score_state(cfg: settings.JevSettings, key: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Score ``state`` against ``cfg.exits`` right now; no database access, so it is safe in a thread."""
     body = json.dumps(
         {"state": state, "model": cfg.model, "questions": build_questions(cfg)}, ensure_ascii=False
     ).encode("utf-8")
@@ -337,6 +333,46 @@ def score_conversation(conn, conversation_id: int) -> dict[str, Any]:
         "latency_ms": latency_ms,
         "usage": data.get("usage"),
     }
+
+
+def text_state(text: str) -> dict[str, Any]:
+    """A synthetic state for a message typed in the UI or CLI (no conversation behind it)."""
+    return {
+        "number": "",
+        "contact": {"name": None, "phone": None},
+        "conversation": {"state": "new", "tags": [], "handled_by": "agent"},
+        "latest_message": text[:_BODY_CHARS],
+        "recent_messages": ["contact: " + text[:_BODY_CHARS]],
+    }
+
+
+def _ready(conn, exits: list[settings.JevExit] | None) -> tuple[settings.JevSettings, str]:
+    """Settings and key for a manual call; ``exits`` (a preview) replaces the stored conditions."""
+    cfg = settings.get_settings(conn).jev
+    key = api_key(conn)[0]
+    if key is None:
+        raise errors.Invalid("Jev has no API key")
+    if exits is not None:
+        try:
+            cfg = cfg.model_copy(update={"exits": settings.JevSettings(exits=exits).exits})
+        except ValueError as exc:
+            raise errors.Invalid(f"invalid conditions: {exc}") from exc
+    if not cfg.exits:
+        raise errors.Invalid("Jev has no exit conditions")
+    return cfg, key
+
+
+def score_conversation(conn, conversation_id: int, exits: list[settings.JevExit] | None = None) -> dict[str, Any]:
+    """Score a conversation's latest incoming message right now; nothing is stored."""
+    cfg, key = _ready(conn, exits)
+    conv = _conversation_row(conn, conversation_id)
+    return score_state(cfg, key, build_state(conn, cfg, conv, None))
+
+
+def score_text(conn, text: str, exits: list[settings.JevExit] | None = None) -> dict[str, Any]:
+    """Score free text against ``exits`` (default: the stored ones); nothing is stored."""
+    cfg, key = _ready(conn, exits)
+    return score_state(cfg, key, text_state(text))
 
 
 # --- Queue ---------------------------------------------------------------------------------

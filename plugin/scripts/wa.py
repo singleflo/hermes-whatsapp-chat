@@ -10,6 +10,13 @@ Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher writte
     tag ID +a -b
     takeover ID | handback ID
     search QUERY [--account ID]
+    jev show [--json]                         Jev exit conditions, their rules and the rules document
+    jev on | jev off                          turn Jev classification on or off
+    jev generate [FILE|-] [--no-check] [--apply] [--json]
+                                              turn the Jev rules document into conditions + rules (preview;
+                                              --apply stores them); FILE defaults to the stored document
+    jev apply PLAN|- [--rules FILE] [--json]  apply a plan (a generate result or a bare plan)
+    jev test TEXT | jev test --conversation ID [--json]
 
 Author of send/draft/state changes: agent:$HERMES_PROFILE when set, else cli.
 Exit codes: 0 ok, 1 error (message on stderr). `--json` prints machine-readable output.
@@ -226,6 +233,113 @@ def cmd_search(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print(table(rows))
 
 
+# --- jev -------------------------------------------------------------------------------
+
+
+def _read_text(source: str) -> str:
+    return sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+
+
+def _rule_line(rule: dict) -> str:
+    flags = ("on" if rule["enabled"] else "off") + (", from rules" if rule["managed"] else "")
+    return f"- {rule['name']} ({flags})"
+
+
+def cmd_jev_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    st = core.jev_rules.status(conn)
+    key = f"set ({st['key_source']})" if st["key_set"] else "not set"
+    lines = [f"Jev: {'on' if st['enabled'] else 'off'}  key: {key}  model: {st['model']}", ""]
+    lines += ["Rules document:", st["document"].strip() or "(empty)", "", "Conditions (the first whose score reaches its minimum wins):"]
+    if not st["conditions"]:
+        lines.append("(none: write the rules and run `jev generate --apply`)")
+    for i, cond in enumerate(st["conditions"], 1):
+        lines.append(f"{i}. {cond['label']} [{cond['id']}] min {cond['min_score']:g}")
+        lines.append(f"   {cond['description']}")
+        lines += [f"   {_rule_line(r)}" for r in cond["rules"]]
+    lines.append("Else (no condition reached its minimum)")
+    lines += [f"   {_rule_line(r)}" for r in st["else"]["rules"]]
+    emit(args, st, "\n".join(lines))
+
+
+def cmd_jev_toggle(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    enabled = args.command_value == "on"
+    current = core.settings.get_settings(conn)
+    saved = core.settings.save_settings(
+        conn, current.model_copy(update={"jev": current.jev.model_copy(update={"enabled": enabled})}), int(time.time())
+    )
+    emit(args, {"enabled": saved.jev.enabled}, f"Jev is {'on' if saved.jev.enabled else 'off'}")
+
+
+def render_plan(result: dict) -> str:
+    plan = core.jev_rules.normalize_plan(result)
+    checks = {(c["expected"], c["text"]): c for c in result.get("checks") or []}
+
+    def examples(expected: str, texts: list[str]) -> list[str]:
+        out = []
+        for text in texts:
+            c = checks.get((expected, text))
+            if c is None:
+                out.append(f"     - {text}")
+                continue
+            score = "" if c["score"] is None else f" {c['score']:.2f}"
+            out.append(f"     {'✓' if c['ok'] else '✗'} {text} -> {c['exit']}{score}")
+        return out
+
+    def actions(items: list) -> str:
+        return "; ".join(core.jev_rules.action_words(a) for a in items) or "none"
+
+    lines = []
+    for i, c in enumerate(plan.conditions, 1):
+        lines += [f"{i}. {c.label} [{c.id}] min {c.min_score:g}", f"   {c.description}", f"   actions: {actions(c.actions)}"]
+        if c.examples:
+            lines += ["   examples:", *examples(c.id, c.examples)]
+    lines += ["Else (no condition reached its minimum)", f"   actions: {actions(plan.else_actions)}"]
+    if plan.else_examples:
+        lines += ["   examples:", *examples(core.jev.ELSE, plan.else_examples)]
+    if plan.notes:
+        lines += ["Notes:", *[f"- {n}" for n in plan.notes]]
+    if result.get("check_error"):
+        lines.append(f"Check: {result['check_error']}")
+    return "\n".join(lines)
+
+
+def render_applied(applied: dict) -> str:
+    exits = applied["settings"]["jev"]["exits"]
+    lines = [f"Applied {len(exits)} conditions and {len(applied['rules'])} rules."]
+    lines += [f"{i}. {e['label']} [{e['id']}] min {e['min_score']:g}" for i, e in enumerate(exits, 1)]
+    lines += [f"- {r['name']} ({'on' if r['enabled'] else 'off'})" for r in applied["rules"]]
+    return "\n".join(lines)
+
+
+def cmd_jev_generate(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    document = _read_text(args.file) if args.file else core.settings.get_settings(conn).jev.document
+    result = core.jev_rules.generate(conn, document, check=not args.no_check)
+    applied = core.jev_rules.apply(conn, document, result["plan"], int(time.time())) if args.apply else None
+    if args.json:
+        emit(args, {"generate": result, "apply": applied} if args.apply else result, "")
+        return
+    print(render_plan(result))
+    if applied is not None:
+        print("\n" + render_applied(applied))
+
+
+def cmd_jev_apply(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    plan = json.loads(_read_text(args.plan))
+    document = _read_text(args.rules) if args.rules else core.settings.get_settings(conn).jev.document
+    applied = core.jev_rules.apply(conn, document, plan, int(time.time()))
+    emit(args, applied, render_applied(applied))
+
+
+def cmd_jev_test(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    if (args.text is None) == (args.conversation is None):
+        raise core.errors.Invalid("pass exactly one of TEXT or --conversation ID")
+    if args.text is not None:
+        res = core.jev.score_text(conn, args.text)
+    else:
+        res = core.jev.score_conversation(conn, args.conversation)
+    emit(args, res, f"{res['summary']}\n(model {res['model']}, {res['latency_ms']} ms)")
+
+
 # --- parser ----------------------------------------------------------------------------
 
 
@@ -281,6 +395,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("query")
     p.add_argument("--account", type=int)
     p.set_defaults(fn=cmd_search)
+
+    jev = sub.add_parser("jev", help="Jev exit conditions: rules document, conditions, rules")
+    jsub = jev.add_subparsers(dest="jev_command", required=True)
+
+    p = jsub.add_parser("show", parents=[common], help="status, rules document, conditions and their rules")
+    p.set_defaults(fn=cmd_jev_show)
+
+    for value in ("on", "off"):
+        p = jsub.add_parser(value, parents=[common], help=f"turn Jev {value}")
+        p.set_defaults(fn=cmd_jev_toggle, command_value=value)
+
+    p = jsub.add_parser("generate", parents=[common], help="turn the rules document into conditions and rules")
+    p.add_argument("file", nargs="?", help="rules document (- = stdin); default: the stored document")
+    p.add_argument("--no-check", action="store_true", help="do not score the examples with Jev")
+    p.add_argument("--apply", action="store_true", help="store the result (document, conditions, rules)")
+    p.set_defaults(fn=cmd_jev_generate)
+
+    p = jsub.add_parser("apply", parents=[common], help="apply a plan (generate result or bare plan JSON)")
+    p.add_argument("plan", help="plan file (- = stdin)")
+    p.add_argument("--rules", help="rules document file; default: the stored document")
+    p.set_defaults(fn=cmd_jev_apply)
+
+    p = jsub.add_parser("test", parents=[common], help="score a message (or a conversation's latest) now")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--conversation", type=int, help="conversation id")
+    p.set_defaults(fn=cmd_jev_test)
     return parser
 
 
@@ -297,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     except core.errors.WaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except (sqlite3.Error, ValueError) as exc:
+    except (sqlite3.Error, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

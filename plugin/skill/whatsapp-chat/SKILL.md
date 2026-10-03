@@ -1,8 +1,8 @@
 ---
 name: whatsapp-chat
-description: Read and operate WhatsApp conversations of the hermes-whatsapp-chat plugin: list, read threads, draft or send replies, change state, tag, take over.
-version: 2.0.0
-platforms: [macos]
+description: Read and operate WhatsApp conversations of the hermes-whatsapp-chat plugin (list, read threads, draft or send replies, change state, tag, take over) and write its Jev rules, which classify every incoming message and decide what happens (take over, escalate, agent draft, ...).
+version: 2.1.0
+platforms: [macos, linux, windows]
 metadata:
   hermes:
     tags: [whatsapp, chat, inbox, customer-support]
@@ -10,7 +10,7 @@ metadata:
 
 # WhatsApp Chat
 
-`hermes-whatsapp-chat` is a Hermes plugin that runs its own WhatsApp channel (one or more linked numbers, never Hermes' native WhatsApp) and shows every conversation in a desktop chat UI and a kanban board. Each conversation has a state, tags, unread count and a message thread. You operate it with one CLI; everything you do is visible to the human in the UI immediately.
+`hermes-whatsapp-chat` is a Hermes plugin that runs its own WhatsApp channel (one or more linked numbers, never Hermes' native WhatsApp) and shows every conversation in a desktop chat UI and a kanban board. Each conversation has a state, tags, unread count and a message thread. You operate it with one CLI; everything you do is visible to the human in the UI immediately. It can also classify every incoming message with **Jev** following rules the user writes in plain words (see "Jev rules" below).
 
 ## Command
 
@@ -88,7 +88,7 @@ Message statuses: `received`, `pending`, `sent`, `failed`, `draft`, `discarded`.
 
 ## How automations invoke you
 
-The plugin has an automation layer (configured in the desktop app under Automations). A rule matches events (`message.in`, `message.out`, `conversation.created`, `conversation.state_changed`) with conditions (state, business hours, text contains/regex, tags, first message, ...) and runs an action. For a Hermes action the plugin starts:
+The plugin has an automation layer (configured in the desktop app under Automations). A rule matches events (`message.in`, `message.out`, `conversation.created`, `conversation.state_changed`, `conversation.classified` from Jev) with conditions (state, business hours, text contains/regex, tags, first message, Jev condition, ...) and runs an action. The rules generated from the Jev rules document are ordinary automation rules on `conversation.classified`. For a Hermes action the plugin starts:
 
 ```bash
 hermes [-p PROFILE] chat -Q -q "<rendered prompt>" --source whatsapp-chat [-s skill ...]
@@ -103,6 +103,67 @@ The rendered prompt carries the conversation context: contact name, phone, accou
 Automations never trigger on messages authored by agents or rules, so your own replies cannot start a loop. If the conversation has `agent_active = 0` (human took over) the run is skipped.
 
 When you are invoked manually instead (no automation prompt), use the subcommands above yourself. Messages you create through the CLI use the author `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`.
+
+## Jev rules (classify incoming messages, decide what happens)
+
+Jev (TypeSafe) scores every incoming WhatsApp message against a short list of **conditions** in about half a second, without an LLM. The first condition in the list whose score reaches its minimum is chosen; when none does, **Else** is chosen. Then the **actions** of the chosen condition run (take over for a person, escalate, Hermes agent draft, fixed reply, set state, add tags).
+
+The user does not edit conditions one by one. They keep ONE Markdown document, the **Jev rules** (like USER.md), in their own words and language. From it the plugin generates the conditions and their actions with the profile's default model (one fast call, JSON only), checks them with Jev on example messages, and applies them. Re-applying replaces only the rules generated from the document; rules the user made by hand in Automations are never touched.
+
+```bash
+# Current state: on/off, API key, the rules document, the active conditions and their actions
+{{WA_CLI}} jev show
+{{WA_CLI}} jev show --json
+
+# Preview the conditions generated from a rules file (nothing is saved); every example is checked with Jev (✓/✗)
+{{WA_CLI}} jev generate /tmp/jev-rules.md
+# Same, and apply it (stores the document, the conditions and the generated rules)
+{{WA_CLI}} jev generate /tmp/jev-rules.md --apply
+# Regenerate from the stored document
+{{WA_CLI}} jev generate --apply
+
+# Apply a plan you reviewed or edited (output of `generate --json`, or a bare plan)
+{{WA_CLI}} jev generate /tmp/jev-rules.md --json > /tmp/jev-plan.json
+{{WA_CLI}} jev apply /tmp/jev-plan.json --rules /tmp/jev-rules.md
+
+# Try a message against the active conditions, or a conversation's latest incoming message
+{{WA_CLI}} jev test "a che punto è la mia pratica?"
+{{WA_CLI}} jev test --conversation 42
+
+# Turn classification on or off
+{{WA_CLI}} jev on
+{{WA_CLI}} jev off
+```
+
+### When the user asks you to create or change the rules
+
+1. `{{WA_CLI}} jev show` and read the current document: you extend or edit it, you do not throw it away unless asked.
+2. Write the whole document to a temporary file in the user's language. One `##` section per situation, in priority order (the first matching condition wins), each with what the contact writes and what should happen. End with a section for everything else. Example:
+
+   ```markdown
+   # WhatsApp rules
+
+   ## Needs a person
+   - The customer complains, is angry or reports something urgent (system down, error in production): I take it over and mark it urgent.
+   - Quotes, prices, discounts, contracts, invoices: I handle them myself.
+
+   ## The agent can answer
+   - Routine questions (opening hours, how something works, status of a request, which documents to send): the agent writes a short, polite draft and never invents dates or prices.
+
+   ## No answer needed
+   - Greetings, thanks, "ok", emoji: close the conversation without answering.
+
+   ## Everything else
+   - I take the conversation over.
+   ```
+
+   Say what should happen with these words, which map to actions: take over / I handle it (takeover), urgent (escalate), the agent drafts (agent draft, approved by a person), the agent answers by itself (agent reply, sent at once: only when the user explicitly wants automatic answers), always answer "..." (fixed reply, sent at once), close / waiting / in progress (set state), tag X (add tags).
+3. `{{WA_CLI}} jev generate FILE` and read the preview: every example should be ✓. A ✗ means two conditions overlap or a description is vague: sharpen the wording in the document (name the words or requests that signal each situation, keep one situation per section) and generate again. Report the notes the generator prints.
+4. Show the user the conditions, their actions and the checks. Apply only when they agree, or when they asked you to apply directly: `{{WA_CLI}} jev generate FILE --apply`.
+5. Confirm with two or three realistic messages: `{{WA_CLI}} jev test "..."`.
+6. Classification runs only while Jev is on and an API key is set (`jev show`). Turn it on with `{{WA_CLI}} jev on` only when the user asks; the API key is entered by the user in the plugin Settings → Jev (never ask for it in chat, never print it).
+
+Notes: generated actions that send messages (`agent reply`, `fixed reply`) reach real contacts at once; prefer drafts unless the user wants automatic answers. When Hermes runs as a Jev action, its prompt contains a `Jev:` block with the chosen condition and every score: use it to understand why you were called.
 
 ## Visibility
 
