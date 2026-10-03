@@ -398,7 +398,8 @@ def test_hermes_action_creates_draft_with_agent_author(env, conv):
     assert env.commands[0]["timeout"] == 180
     assert prompt.startswith("Customer Anna (393330001111) on Main is new: Hello, I would like the PRICE list")
     assert "] user:" not in prompt and "contact: Earlier question" in prompt and "contact: Hello, I would like" in prompt
-    assert "scripts/wa.py" in prompt and "{" not in prompt and prompt.endswith(" ")
+    wa = env.core.db.data_dir() / "bin" / "wa"
+    assert f"CLI={wa} " in prompt and wa.is_file() and "{" not in prompt and prompt.endswith(" ")
 
     draft = one(env, "SELECT * FROM messages WHERE status = 'draft'")
     assert draft["body"] == "Hi Anna, here is the list."

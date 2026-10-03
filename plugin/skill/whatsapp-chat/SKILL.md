@@ -14,10 +14,10 @@ metadata:
 
 ## Command
 
-Always use this exact absolute command (referred to below as `WA`):
+Always use this exact absolute command (every example below uses it):
 
 ```bash
-WA="/Users/crotti/VSC/TOOLS/hermes-whatsapp-chat/.venv/bin/python /Users/crotti/VSC/TOOLS/hermes-whatsapp-chat/scripts/wa.py"
+{{WA_CLI}}
 ```
 
 Conversations are addressed by their integer **conversation id** (the `ID` column of `list`). Add `--json` to any subcommand for machine-readable output. Exit code 0 = ok; 1 = error with the message on stderr (unknown id, invalid transition, number not linked, ...). Do not retry blindly: read the error.
@@ -26,36 +26,36 @@ Conversations are addressed by their integer **conversation id** (the `ID` colum
 
 ```bash
 # Inbox overview, newest activity first
-$WA list
-$WA list --state waiting
-$WA list --account 2 --unread
-$WA list --unread --json
+{{WA_CLI}} list
+{{WA_CLI}} list --state waiting
+{{WA_CLI}} list --account 2 --unread
+{{WA_CLI}} list --unread --json
 
 # Read a thread (oldest -> newest, with author, time and status per message)
-$WA show 42
-$WA show 42 --limit 100
-$WA show 42 --json
+{{WA_CLI}} show 42
+{{WA_CLI}} show 42 --limit 100
+{{WA_CLI}} show 42 --json
 
 # Draft a reply: stored for a human to review/approve in the UI. PREFERRED.
-$WA draft 42 "Hi Marco, your order shipped today. Tracking: ..."
+{{WA_CLI}} draft 42 "Hi Marco, your order shipped today. Tracking: ..."
 
 # Send immediately (real WhatsApp message). Only when the user explicitly asks.
-$WA send 42 "Thanks, see you tomorrow at 10."
+{{WA_CLI}} send 42 "Thanks, see you tomorrow at 10."
 
 # Change state (optionally with a reason that lands in the audit log)
-$WA state 42 in_progress
-$WA state 42 closed --reason "resolved by phone"
+{{WA_CLI}} state 42 in_progress
+{{WA_CLI}} state 42 closed --reason "resolved by phone"
 
 # Tags: +name adds, -name removes, several at once
-$WA tag 42 +vip +refund -spam
+{{WA_CLI}} tag 42 +vip +refund -spam
 
 # Hand the conversation to a human / back to the agent
-$WA takeover 42
-$WA handback 42
+{{WA_CLI}} takeover 42
+{{WA_CLI}} handback 42
 
 # Search message bodies across all accounts
-$WA search "invoice"
-$WA search "invoice" --account 2
+{{WA_CLI}} search "invoice"
+{{WA_CLI}} search "invoice" --account 2
 ```
 
 `show` prints each message as `[time] #id author (status)` followed by the indented body. Media appear as `[media: type]` markers; their content is not downloaded by the CLI.
@@ -94,7 +94,7 @@ The plugin has an automation layer (configured in the desktop app under Automati
 hermes [-p PROFILE] chat -Q -q "<rendered prompt>" --source whatsapp-chat [-s skill ...]
 ```
 
-The rendered prompt carries the conversation context: contact name, phone, account label, state, conversation id, the latest message text and the recent history (`[time] author: body` lines), plus the absolute `WA` command. Your **stdout is the reply text**: print only the message to send, nothing else (no explanations, no quotes). What happens with it depends on the rule's reply mode:
+The rendered prompt carries the conversation context: contact name, phone, account label, state, conversation id, the latest message text and the recent history (`[time] author: body` lines), plus the absolute CLI command (`{{WA_CLI}}`). Your **stdout is the reply text**: print only the message to send, nothing else (no explanations, no quotes). What happens with it depends on the rule's reply mode:
 
 - `draft` (default): saved as a draft authored `agent:<profile>` for human approval.
 - `send`: sent immediately as `agent:<profile>`.
@@ -111,5 +111,5 @@ Everything you send or draft shows up in the plugin UI (desktop chat, dashboard 
 ## Troubleshooting
 
 - `error: ... not paired` / `Unavailable`: the WhatsApp number is not linked or its bridge is stopped. Tell the user to open the plugin Settings -> Accounts (pairing happens there with a QR code).
-- `wa.py` import errors: the repo venv is missing; run `uv sync` in `/Users/crotti/VSC/TOOLS/hermes-whatsapp-chat`.
-- Service status: `/Users/crotti/VSC/TOOLS/hermes-whatsapp-chat/.venv/bin/python /Users/crotti/VSC/TOOLS/hermes-whatsapp-chat/sidecar/wa_channel.py status`.
+- The CLI fails to start or reports import errors: the launcher it runs through is stale (for example after a Hermes update). Tell the user to open the plugin Settings -> Numbers and press **Reinstall** (or **Install skill**); that rewrites the launcher and this skill.
+- Service status: the plugin UI (Settings -> Numbers) shows whether the channel service is running; if it is not, tell the user to press **Install service** there.

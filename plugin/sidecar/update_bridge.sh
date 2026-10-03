@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Re-vendor the Baileys WhatsApp bridge from a Hermes checkout and re-apply our
-# local patches (sidecar/patches/*.patch, in lexical order).
+# local patches (patches/*.patch next to this script, in lexical order).
 #
-# Usage: sidecar/update_bridge.sh [HERMES_CHECKOUT]
+# Usage: update_bridge.sh [HERMES_CHECKOUT]   (run from anywhere)
 #   HERMES_CHECKOUT defaults to ~/.hermes/hermes-agent
 #
 # Everything is staged in a temp dir first: if a patch does not apply, the
-# script fails loudly and sidecar/whatsapp-bridge/ is left untouched.
+# script fails loudly and whatsapp-bridge/ (next to this script) is left untouched.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Bridge location relative to the plugin dir: the patches are `patch -p1` diffs against the
+# plugin dir layout, so the staging tree mirrors it.
 BRIDGE_REL="sidecar/whatsapp-bridge"
 BRIDGE_DIR="$SCRIPT_DIR/whatsapp-bridge"
 PATCH_DIR="$SCRIPT_DIR/patches"
@@ -99,11 +101,12 @@ license: $UP_LICENSE
 patches: ${PATCH_NAMES:-none}
 
 The files above are copied verbatim from the upstream commit, then the patches
-in sidecar/patches/ are applied in order (patch -p1 from the repo root).
-Refresh with: sidecar/update_bridge.sh [HERMES_CHECKOUT]
+in ../patches/ are applied in order (patch -p1 from the plugin directory).
+Refresh with: ../update_bridge.sh [HERMES_CHECKOUT]
 EOF
 echo "wrote $BRIDGE_REL/UPSTREAM (commit $COMMIT, patches: ${PATCH_NAMES:-none})"
 
 echo
-echo "Reminder: dependencies may have changed. Run:"
-echo "  npm ci --prefix sidecar/whatsapp-bridge"
+echo "Reminder: dependencies may have changed. The channel service runs npm ci on start when"
+echo "node_modules is missing; to refresh by hand:"
+echo "  rm -rf \"$BRIDGE_DIR/node_modules\" && npm ci --omit=dev --prefix \"$BRIDGE_DIR\""

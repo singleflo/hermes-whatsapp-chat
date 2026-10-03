@@ -1,6 +1,6 @@
 """CLI for Hermes (and humans) to operate the WhatsApp chat plugin.
 
-Run with the repo venv:  <repo>/.venv/bin/python <repo>/scripts/wa.py <command>
+Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher written by the plugin's Install service)
 
     list [--state S] [--account ID] [--unread] [--limit N] [--json]
     show ID [--limit N] [--json]
@@ -28,11 +28,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-REPO = Path(__file__).resolve().parents[1]
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
 
 def _load_api():
-    spec = importlib.util.spec_from_file_location("hwc_plugin_api", REPO / "plugin" / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("hwc_plugin_api", PLUGIN_DIR / "dashboard" / "plugin_api.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod

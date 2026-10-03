@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import time
@@ -25,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import db, errors, events, outbound, settings
+from . import db, errors, events, outbound, service, settings
 
 log = logging.getLogger("hermes_whatsapp_chat.automations")
 
@@ -313,13 +312,9 @@ def dry_run(conn, rule: dict[str, Any], conversation_id: int, now: int) -> dict[
 # --- Templates --------------------------------------------------------------------
 
 
-@functools.lru_cache(maxsize=1)
 def wa_cli_command() -> str:
-    """Absolute command running scripts/wa.py from the dev repo; plain ``wa.py`` when not found."""
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "pyproject.toml").is_file():
-            return f"{shlex.quote(str(parent / '.venv' / 'bin' / 'python'))} {shlex.quote(str(parent / 'scripts' / 'wa.py'))}"
-    return "wa.py"
+    """Absolute path of the ``<data>/bin/wa`` launcher (written lazily)."""
+    return service.wa_command()
 
 
 def render_template(template: str, variables: dict[str, Any]) -> str:

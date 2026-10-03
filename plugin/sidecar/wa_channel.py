@@ -3,14 +3,16 @@
 One LaunchAgent supervises one vendored Baileys bridge per WhatsApp account. The SQLite DB
 is the control plane: the UI writes the desired state, this service reconciles it every
 second and writes status, QR codes and a heartbeat back. Never touches Hermes' native WhatsApp.
+The bridge's npm dependencies are installed on first start (npm ci, log in logs/npm.log).
 
-    uv run python sidecar/wa_channel.py install        # LaunchAgent: start now and at login
-    uv run python sidecar/wa_channel.py uninstall
-    uv run python sidecar/wa_channel.py status         # service + accounts
-    uv run python sidecar/wa_channel.py install-skill  # copy the Hermes skill to ~/.hermes/skills/
-    uv run python sidecar/wa_channel.py run            # what launchd runs
+    wa_channel.py install        # LaunchAgent: start now and at login (same as the plugin UI)
+    wa_channel.py uninstall
+    wa_channel.py status         # service + accounts
+    wa_channel.py install-skill  # render the Hermes skill into <hermes home>/skills/
+    wa_channel.py run            # what launchd runs
 
-Pairing (QR) happens in the plugin UI, not here.
+Run it with the plugin backend's Python (<data>/bin/hwc-python). Pairing (QR) happens in
+the plugin UI, not here.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ import argparse
 import importlib.util
 import json
 import os
-import plistlib
 import queue
 import re
 import shutil
@@ -35,13 +36,16 @@ from contextlib import closing
 from pathlib import Path
 from typing import IO, Any, NoReturn
 
-REPO = Path(__file__).resolve().parents[1]
-BRIDGE_DIR = REPO / "sidecar" / "whatsapp-bridge"
-SKILL_SRC = REPO / "hermes-skill" / "whatsapp-chat"
-LABEL = "it.fl1.hermes-whatsapp-chat.channel"
-PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+BRIDGE_DIR = PLUGIN_DIR / "sidecar" / "whatsapp-bridge"
+VENDOR_DIR = PLUGIN_DIR / "sidecar" / "_vendor"
 VERSION = "2.0.0"
 MIN_NODE_MAJOR = 20
+DEPS_ERROR = "Bridge dependencies failed to install (see logs/npm.log)"
+DEPS_RETRY_SECONDS = 300.0
+NPM_TIMEOUT_SECONDS = 1200.0
+
+sys.path.insert(0, str(VENDOR_DIR))  # vendored segno (QR rendering)
 
 TICK_SECONDS = 1.0
 RESTART_DELAY_SECONDS = 5.0
@@ -58,7 +62,7 @@ AUTOMATION_THREADS = 2
 
 
 def _load_api():
-    spec = importlib.util.spec_from_file_location("hwc_plugin_api", REPO / "plugin" / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("hwc_plugin_api", PLUGIN_DIR / "dashboard" / "plugin_api.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -84,7 +88,7 @@ def die(msg: str) -> NoReturn:
 
 def check_node() -> tuple[str | None, str | None]:
     """Return (node path, error). The error is a one-line, UI-friendly message."""
-    node = os.environ.get("WA_NODE") or shutil.which("node")
+    node = core.service.find_node()
     if not node:
         return None, f"node not found: install Node {MIN_NODE_MAJOR}+ or set WA_NODE"
     try:
@@ -94,9 +98,48 @@ def check_node() -> tuple[str | None, str | None]:
     match = re.match(r"v(\d+)\.", out)
     if not match or int(match.group(1)) < MIN_NODE_MAJOR:
         return node, f"Node {out or 'unknown version'} at {node} is too old: Node {MIN_NODE_MAJOR}+ required (set WA_NODE)"
-    if not (BRIDGE_DIR / "node_modules").exists():
-        return node, "missing bridge deps: run npm ci --prefix sidecar/whatsapp-bridge"
     return node, None
+
+
+def bridge_deps_ready() -> bool:
+    # npm writes this lockfile last, so it distinguishes a finished install from a partial one.
+    return (BRIDGE_DIR / "node_modules" / ".package-lock.json").is_file()
+
+
+def install_bridge_deps(node: str) -> bool:
+    """`npm ci` in the bridge dir with the npm next to the node binary; output goes to logs/npm.log."""
+    node_bin = Path(node).resolve().parent
+    sibling = node_bin / "npm"
+    npm = str(sibling) if sibling.is_file() else shutil.which("npm")
+    logs = core.db.data_dir() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PATH": os.pathsep.join([str(node_bin), os.environ.get("PATH", "")])}
+    returncode: int | None = None
+    with open(logs / "npm.log", "a", encoding="utf-8") as out:
+        out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} npm ci in {BRIDGE_DIR} ===\n")
+        out.flush()
+        if npm is None:
+            out.write("npm not found\n")
+        else:
+            try:
+                returncode = subprocess.run(
+                    [npm, "ci", "--omit=dev", "--no-audit", "--no-fund"],
+                    cwd=BRIDGE_DIR,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    timeout=NPM_TIMEOUT_SECONDS,
+                    check=False,
+                ).returncode
+            except (OSError, subprocess.SubprocessError) as exc:
+                out.write(f"npm failed: {exc}\n")
+            else:
+                out.write(f"npm exited with {returncode}\n")
+    if returncode != 0 or not bridge_deps_ready():
+        shutil.rmtree(BRIDGE_DIR / "node_modules", ignore_errors=True)
+        return False
+    return True
 
 
 def qr_svg(qr: str) -> str | None:
@@ -104,7 +147,7 @@ def qr_svg(qr: str) -> str | None:
     try:
         import segno
     except ImportError:
-        log("segno is not installed: QR codes cannot be rendered (uv sync)")
+        log(f"vendored segno missing in {VENDOR_DIR}: QR codes cannot be rendered")
         return None
     # segno validates colours, so render black and swap it for currentColor afterwards.
     svg = segno.make(qr, error="l").svg_inline(scale=4, dark="#000", light=None)
@@ -286,6 +329,9 @@ class Runner:
         if self.sup.precondition_error:
             self.stop(mono)
             return {"state": "error", "error": self.sup.precondition_error}
+        if self.sup.installing_deps:
+            self.stop(mono)
+            return {"state": "starting"}
         if account.get("port") is None:
             return {"state": "error", "error": "account has no bridge port"}
 
@@ -522,7 +568,10 @@ class Runner:
 
 class Supervisor:
     def __init__(self) -> None:
-        self.node, self.precondition_error = check_node()
+        self.node, self.node_error = check_node()
+        self.deps_error: str | None = None
+        self.deps_thread: threading.Thread | None = None
+        self.deps_failed_at: float | None = None
         self.runners: dict[int, Runner] = {}
         self.stop_event = threading.Event()
         self.started_at = int(time.time())
@@ -531,6 +580,40 @@ class Supervisor:
         self.last_timers = 0.0
         self.last_precondition_check = time.monotonic()
         self.conn: sqlite3.Connection | None = None
+        self._update_deps(self.last_precondition_check)
+
+    @property
+    def precondition_error(self) -> str | None:
+        return self.node_error or self.deps_error
+
+    @property
+    def installing_deps(self) -> bool:
+        return self.deps_thread is not None and self.deps_thread.is_alive()
+
+    def _deps_worker(self, node: str) -> None:
+        if install_bridge_deps(node):
+            log("bridge dependencies installed")
+            return
+        self.deps_failed_at = time.monotonic()
+        self.deps_error = DEPS_ERROR
+        log(DEPS_ERROR)
+
+    def _update_deps(self, mono: float) -> None:
+        """Install the bridge's npm dependencies in the background when they are missing."""
+        if self.node_error or not self.node:
+            return
+        if bridge_deps_ready():
+            self.deps_error = None
+            return
+        if self.installing_deps:
+            return
+        if self.deps_failed_at is not None and mono - self.deps_failed_at < DEPS_RETRY_SECONDS:
+            return
+        self.deps_error = None
+        self.deps_failed_at = None
+        log("installing bridge dependencies (npm ci)")
+        self.deps_thread = threading.Thread(target=self._deps_worker, args=(self.node,), name="npm-ci", daemon=True)
+        self.deps_thread.start()
 
     def request_stop(self, *_: object) -> None:
         self.stop_event.set()
@@ -565,12 +648,12 @@ class Supervisor:
         conn = self._connection()
         core.accounts.service_heartbeat(conn, pid=os.getpid(), version=VERSION, started_at=self.started_at, now=now)
 
-        if self.precondition_error and mono - self.last_precondition_check > 30:
+        if self.node_error and mono - self.last_precondition_check > 30:
             self.last_precondition_check = mono
-            self.node, error = check_node()
-            if error is None:
-                log("preconditions satisfied")
-            self.precondition_error = error
+            self.node, self.node_error = check_node()
+            if self.node_error is None:
+                log("node found")
+        self._update_deps(mono)
 
         rows = [dict(r) for r in conn.execute("SELECT * FROM accounts WHERE kind = 'whatsapp' ORDER BY id")]
         seen = {row["id"] for row in rows}
@@ -650,38 +733,21 @@ def cmd_run() -> int:
     return Supervisor().run()
 
 
+def _service_call(fn: Any, **kwargs: Any) -> dict:
+    try:
+        return fn(**kwargs)
+    except core.errors.WaError as exc:
+        die(str(exc))
+
+
 def cmd_install() -> int:
-    node, error = check_node()
-    if error or not node:
-        die(error or "node not found")
-    data_dir = core.db.data_dir()
-    logs = data_dir / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    env = {"WA_NODE": node}
-    env.update({k: os.environ[k] for k in ("WA_ARCHIVE_DB", "HERMES_HOME") if k in os.environ})
-    plist = {
-        "Label": LABEL,
-        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "run"],
-        "EnvironmentVariables": env,
-        "WorkingDirectory": str(REPO),
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "ThrottleInterval": 10,
-        "StandardOutPath": str(logs / "channel.log"),
-        "StandardErrorPath": str(logs / "channel.log"),
-    }
-    PLIST.parent.mkdir(parents=True, exist_ok=True)
-    PLIST.write_bytes(plistlib.dumps(plist))
-    domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], check=False)
-    subprocess.run(["launchctl", "bootstrap", domain, str(PLIST)], check=True)
-    print(f"installed {PLIST}")
+    _service_call(core.service.install_service, now=int(time.time()))
+    print(f"installed {core.service.plist_path()}")
     return 0
 
 
 def cmd_uninstall() -> int:
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], check=False)
-    PLIST.unlink(missing_ok=True)
+    _service_call(core.service.uninstall_service)
     print("uninstalled")
     return 0
 
@@ -705,7 +771,7 @@ def cmd_status() -> int:
     print(f"service: {'running' if info.get('running') else 'NOT running'}")
     print(f"  pid {info.get('pid') or '-'}  version {info.get('version') or '-'}  heartbeat {_age(info.get('heartbeat_at'), now)}")
     if not info.get("running"):
-        print(f"  install: {info.get('install_command')}")
+        print("  start it: Install service in the plugin UI, or `wa_channel.py install`")
     print(f"db: {core.db.db_path()}")
     if not accounts:
         print("accounts: none")
@@ -733,13 +799,8 @@ def cmd_status() -> int:
 
 
 def cmd_install_skill() -> int:
-    if not SKILL_SRC.is_dir():
-        die(f"skill source missing: {SKILL_SRC}")
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    dest = home / "skills" / "whatsapp-chat"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(SKILL_SRC, dest, dirs_exist_ok=True)
-    print(f"installed skill to {dest}")
+    result = _service_call(core.service.install_skill, now=int(time.time()))
+    print(f"installed skill to {result.get('path')}")
     return 0
 
 

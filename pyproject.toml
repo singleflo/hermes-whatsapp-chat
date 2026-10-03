@@ -13,6 +13,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 preview = true
+extend-exclude = ["plugin/sidecar/_vendor"]
 
 [tool.ruff.lint]
 select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
@@ -22,3 +23,6 @@ select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251"]
 
 [tool.ty.environment]
 python-version = "3.11"
+
+[tool.ty.src]
+exclude = ["plugin/sidecar/_vendor"]

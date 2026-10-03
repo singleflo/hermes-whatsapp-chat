@@ -64,7 +64,9 @@ const $selected = atom(null)
 //   STATE_LABELS            conversation state id → label
 //   ACCOUNT_COLORS          account color name → var(--ui-*) css color
 //   AccountDot({account})   colored dot for an account (Account or conversation Card)
-//   ServiceBanner()         "WhatsApp service not running" + install command
+//   ServiceBanner()         "WhatsApp service not installed / not running" + Install / Reinstall button
+//   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes
+//   SERVICE_LOG_HINT        where the service writes its log (shown on errors)
 
 const STATE_LABELS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', muted: 'Muted', closed: 'Closed' }
 
@@ -171,46 +173,68 @@ function AccountDot({ account, size = 8 }) {
   })
 }
 
+const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
+
+// POSTs a /service/* or /skill/* route; act() toasts failures and refreshes every query.
+function useServiceAction() {
+  const [busy, setBusy] = useState(null)
+  const run = async (key, path, doneMessage) => {
+    haptic('tap')
+    setBusy(key)
+    const ok = await act(path, undefined)
+    setBusy(null)
+    if (ok && doneMessage) {
+      host.notify({ kind: 'info', message: doneMessage })
+    }
+  }
+  return [busy, run]
+}
+
 function ServiceBanner() {
   const q = useApi('service', '/service')
+  const [busy, run] = useServiceAction()
   if (!q.data || q.data.running) {
     return null
   }
-  const cmd = q.data.install_command
+  const installed = q.data.installed !== false
   return h(
     'div',
     { style: { ...BANNER, ...F.col, gap: 4 } },
-    h('div', { style: { fontWeight: 600 } }, 'WhatsApp service not running'),
+    h(
+      'div',
+      { style: { fontWeight: 600 } },
+      installed ? 'WhatsApp service is not running' : 'WhatsApp service is not installed'
+    ),
     h(
       'div',
       { style: T.muted },
-      'Messages are neither received nor sent until the background service runs. Install or start it with:'
+      installed
+        ? 'Messages are neither received nor sent until the background service runs. Reinstalling restarts it.'
+        : 'Messages are neither received nor sent until the background service is installed. It starts automatically and keeps running in the background.'
     ),
-    cmd
+    installed
       ? h(
           'div',
-          { style: { ...F.row, gap: 6 } },
-          h('code', { style: { ...CODE, flex: '1 1 auto', minWidth: 0, overflowX: 'auto' } }, cmd),
-          h(
-            Button,
-            {
-              size: 'xs',
-              variant: 'secondary',
-              onClick: () => {
-                haptic('tap')
-                ctxRef.os.writeClipboard(cmd).then(ok => {
-                  host.notify(
-                    ok
-                      ? { kind: 'info', message: 'Command copied' }
-                      : { kind: 'error', message: 'Clipboard unavailable' }
-                  )
-                })
-              }
-            },
-            'Copy'
-          )
+          { style: T.muted },
+          'If it keeps failing, check the log: ',
+          h('code', { style: CODE }, SERVICE_LOG_HINT)
         )
-      : null
+      : null,
+    h(
+      'div',
+      { style: { ...F.row, gap: 6 } },
+      h(
+        Button,
+        {
+          size: 'xs',
+          variant: 'secondary',
+          loading: busy === 'install',
+          disabled: busy !== null,
+          onClick: () => run('install', '/service/install', 'WhatsApp service installed')
+        },
+        installed ? 'Reinstall' : 'Install service'
+      )
+    )
   )
 }
 
@@ -3274,6 +3298,148 @@ function SettingsPairing({ accountId, onClose }) {
   )
 }
 
+function SettingsKeyValue({ label, value, warn }) {
+  return set_h(
+    'div',
+    { className: 'flex items-baseline gap-2 text-xs' },
+    set_h('span', { style: { ...set_muted, width: 96, flex: '0 0 auto' } }, label),
+    set_h('span', { className: 'min-w-0', style: warn ? { color: 'var(--ui-orange)' } : set_secondary }, value)
+  )
+}
+
+function SettingsServiceCard() {
+  const q = useApi('service', '/service')
+  const [busy, run] = useServiceAction()
+  const [confirm, setConfirm] = useState(false)
+  const s = q.data
+  if (!s) {
+    return q.error
+      ? jsx(SettingsCard, {
+          title: 'Service',
+          children: set_h('div', { className: 'text-xs', style: set_errorBox }, errorText(q.error))
+        })
+      : jsx(Skeleton, { className: 'h-24 w-full' })
+  }
+  const installed = s.installed !== false
+  const badge = s.running
+    ? ['success', 'Running']
+    : installed
+      ? ['destructive', 'Not running']
+      : ['muted', 'Not installed']
+  return jsx(SettingsCard, {
+    title: 'Service',
+    desc: 'The background process that keeps your numbers connected and delivers messages. It starts at login and restarts if it stops.',
+    children: set_h(
+      'div',
+      { className: 'flex flex-col gap-2' },
+      set_h(
+        'div',
+        { className: 'flex items-center gap-2' },
+        jsx(SettingsBadge, { variant: badge[0], children: badge[1] })
+      ),
+      jsx(SettingsKeyValue, { label: 'Installed', value: installed ? 'Yes' : 'No' }),
+      jsx(SettingsKeyValue, { label: 'Running', value: s.running ? 'Yes' : 'No' }),
+      s.running ? jsx(SettingsKeyValue, { label: 'PID', value: String(s.pid) }) : null,
+      s.version ? jsx(SettingsKeyValue, { label: 'Version', value: String(s.version) }) : null,
+      jsx(SettingsKeyValue, {
+        label: 'Node.js',
+        value: s.node || 'Not found. Install Node.js, then install the service.',
+        warn: !s.node
+      }),
+      s.heartbeat_at ? jsx(SettingsKeyValue, { label: 'Heartbeat', value: set_ago(s.heartbeat_at) }) : null,
+      installed && !s.running
+        ? set_h(
+            'div',
+            { className: 'text-xs', style: set_muted },
+            'Not running. Try Reinstall; details are written to ',
+            set_h('code', { style: CODE }, SERVICE_LOG_HINT)
+          )
+        : null,
+      confirm
+        ? jsx(SettingsConfirm, {
+            message:
+              'Uninstall the service? Numbers stay linked but stop receiving and sending until it is installed again.',
+            confirmLabel: 'Uninstall service',
+            busy: busy === 'uninstall',
+            onCancel: () => setConfirm(false),
+            onConfirm: async () => {
+              await run('uninstall', '/service/uninstall', 'WhatsApp service uninstalled')
+              setConfirm(false)
+            }
+          })
+        : set_h(
+            'div',
+            { className: 'flex flex-wrap gap-2' },
+            jsx(Button, {
+              size: 'sm',
+              variant: installed ? 'secondary' : 'default',
+              loading: busy === 'install',
+              disabled: busy !== null,
+              onClick: () => run('install', '/service/install', 'WhatsApp service installed'),
+              children: installed ? 'Reinstall' : 'Install service'
+            }),
+            installed
+              ? jsx(Button, {
+                  size: 'sm',
+                  variant: 'outline',
+                  disabled: busy !== null,
+                  onClick: () => setConfirm(true),
+                  children: 'Uninstall service'
+                })
+              : null
+          )
+    )
+  })
+}
+
+function SettingsSkillCard() {
+  const q = useApi('service', '/service')
+  const [busy, run] = useServiceAction()
+  const s = q.data
+  if (!s) {
+    return null
+  }
+  const installed = Boolean(s.skill_installed)
+  return jsx(SettingsCard, {
+    title: 'Hermes skill',
+    desc: 'Lets Hermes agents list, read and answer your WhatsApp conversations. Installed into the Hermes skills folder.',
+    children: set_h(
+      'div',
+      { className: 'flex flex-col gap-2' },
+      set_h(
+        'div',
+        { className: 'flex items-center gap-2' },
+        jsx(SettingsBadge, {
+          variant: installed ? 'success' : 'muted',
+          children: installed ? 'Installed' : 'Not installed'
+        })
+      ),
+      set_h(
+        'div',
+        { className: 'flex flex-wrap gap-2' },
+        jsx(Button, {
+          size: 'sm',
+          variant: installed ? 'secondary' : 'default',
+          loading: busy === 'skill-install',
+          disabled: busy !== null,
+          onClick: () => run('skill-install', '/skill/install', 'Hermes skill installed'),
+          children: installed ? 'Reinstall skill' : 'Install skill'
+        }),
+        installed
+          ? jsx(Button, {
+              size: 'sm',
+              variant: 'outline',
+              loading: busy === 'skill-remove',
+              disabled: busy !== null,
+              onClick: () => run('skill-remove', '/skill/uninstall', 'Hermes skill removed'),
+              children: 'Remove skill'
+            })
+          : null
+      )
+    )
+  })
+}
+
 function SettingsAccounts() {
   const q = useApi('accounts', '/accounts')
   const [adding, setAdding] = useState(false)
@@ -3333,7 +3499,9 @@ function SettingsAccounts() {
             { className: 'text-xs', style: set_muted },
             'No numbers yet. Add a number to link a WhatsApp account by scanning a QR code.'
           )
-        : accounts.map(a => jsx(SettingsAccountRow, { key: a.id, account: a, onPair: setPairId }))
+        : accounts.map(a => jsx(SettingsAccountRow, { key: a.id, account: a, onPair: setPairId })),
+    jsx(SettingsServiceCard, {}),
+    jsx(SettingsSkillCard, {})
   )
 }
 

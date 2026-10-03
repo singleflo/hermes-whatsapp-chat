@@ -1129,42 +1129,212 @@
     )
   }
 
+  const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
+
+  // POSTs a /service/* or /skill/* route; app.call toasts failures and refreshes.
+  function useServiceAction() {
+    const app = useContext(AppCtx)
+    const [busy, setBusy] = useState('')
+    function run(key, path, doneMessage) {
+      setBusy(key)
+      return app.call('POST', path, {}).then(res => {
+        setBusy('')
+        if (res && doneMessage) {
+          app.showToast(doneMessage, 'success')
+        }
+        return res
+      })
+    }
+    return [busy, run]
+  }
+
   function ServiceBanner() {
     const app = useContext(AppCtx)
-    const svc = app.service
-    const cmd = svc && svc.install_command
-    function copy() {
-      if (cmd && navigator.clipboard) {
-        navigator.clipboard.writeText(cmd).then(
-          () => app.showToast('Command copied', 'success'),
-          () => app.showToast('Could not copy; select the command manually', 'error')
-        )
-      }
-    }
+    const [busy, run] = useServiceAction()
+    const installed = !app.service || app.service.installed !== false
     return h(
       Card,
       { className: 'wab-banner' },
       h(
         CardContent,
         null,
-        h('strong', { className: 'wab-error' }, 'WhatsApp service is not running'),
+        h(
+          'strong',
+          { className: 'wab-error' },
+          installed ? 'WhatsApp service is not running' : 'WhatsApp service is not installed'
+        ),
         h(
           'div',
           { className: 'wab-small' },
-          'Numbers cannot connect, receive or send messages until the background service is running. Install and start it with:'
+          installed
+            ? 'Numbers cannot connect, receive or send messages until the background service is running. Reinstalling restarts it.'
+            : 'Numbers cannot connect, receive or send messages until the background service is installed. It starts automatically and keeps running in the background.'
         ),
-        cmd
+        installed
           ? h(
               'div',
-              { className: 'wab-row wab-nowrap' },
-              h('code', { className: 'wab-code wab-grow' }, cmd),
-              h(Button, { size: 'sm', outlined: true, onClick: copy }, 'Copy')
+              { className: 'wab-muted wab-small' },
+              'If it keeps failing, check the log: ',
+              h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
             )
-          : h(
+          : null,
+        h(
+          'div',
+          { className: 'wab-actions' },
+          h(
+            Button,
+            {
+              size: 'sm',
+              disabled: busy !== '',
+              onClick: () => run('install', '/service/install', 'WhatsApp service installed')
+            },
+            busy === 'install' ? 'Installing…' : installed ? 'Reinstall' : 'Install service'
+          )
+        )
+      )
+    )
+  }
+
+  function ServiceCard() {
+    const app = useContext(AppCtx)
+    const [busy, run] = useServiceAction()
+    const s = app.service
+    if (!s) {
+      return null
+    }
+    const installed = s.installed !== false
+    function uninstall() {
+      if (
+        window.confirm(
+          'Uninstall the WhatsApp service? Numbers stay linked but stop receiving and sending until it is installed again.'
+        )
+      ) {
+        run('uninstall', '/service/uninstall', 'WhatsApp service uninstalled')
+      }
+    }
+    return h(
+      Card,
+      null,
+      h(
+        CardContent,
+        { className: 'wab-account' },
+        h(
+          'div',
+          { className: 'wab-row' },
+          h('strong', null, 'Service'),
+          h(
+            Badge,
+            { tone: s.running ? 'success' : installed ? 'destructive' : 'secondary' },
+            s.running ? 'Running' : installed ? 'Not running' : 'Not installed'
+          )
+        ),
+        h(
+          'div',
+          { className: 'wab-muted wab-small' },
+          'The background process that keeps your numbers connected and delivers messages. It starts at login and restarts if it stops.'
+        ),
+        h(
+          'div',
+          { className: 'wab-muted wab-small' },
+          [
+            installed ? 'Installed' : 'Not installed',
+            s.running && s.pid ? 'PID ' + s.pid : '',
+            s.version ? 'version ' + s.version : '',
+            s.heartbeat_at ? 'heartbeat ' + fmtAge(nowSec() - s.heartbeat_at) + ' ago' : ''
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        ),
+        h(
+          'div',
+          { className: s.node ? 'wab-muted wab-small' : 'wab-error wab-small' },
+          s.node ? 'Node.js: ' + s.node : 'Node.js not found. Install Node.js, then install the service.'
+        ),
+        installed && !s.running
+          ? h(
               'div',
               { className: 'wab-muted wab-small' },
-              'Run the install command of the WhatsApp channel sidecar (wa_channel.py install).'
+              'Not running. Try Reinstall; details are written to ',
+              h('code', { className: 'wab-code' }, SERVICE_LOG_HINT)
             )
+          : null,
+        h(
+          'div',
+          { className: 'wab-actions' },
+          h(
+            Button,
+            {
+              size: 'sm',
+              outlined: installed,
+              disabled: busy !== '',
+              onClick: () => run('install', '/service/install', 'WhatsApp service installed')
+            },
+            busy === 'install' ? 'Installing…' : installed ? 'Reinstall' : 'Install service'
+          ),
+          installed
+            ? h(
+                Button,
+                { size: 'sm', outlined: true, destructive: true, disabled: busy !== '', onClick: uninstall },
+                busy === 'uninstall' ? 'Uninstalling…' : 'Uninstall service'
+              )
+            : null
+        )
+      )
+    )
+  }
+
+  function SkillCard() {
+    const app = useContext(AppCtx)
+    const [busy, run] = useServiceAction()
+    const s = app.service
+    if (!s) {
+      return null
+    }
+    const installed = !!s.skill_installed
+    return h(
+      Card,
+      null,
+      h(
+        CardContent,
+        { className: 'wab-account' },
+        h(
+          'div',
+          { className: 'wab-row' },
+          h('strong', null, 'Hermes skill'),
+          h(Badge, { tone: installed ? 'success' : 'secondary' }, installed ? 'Installed' : 'Not installed')
+        ),
+        h(
+          'div',
+          { className: 'wab-muted wab-small' },
+          'Lets Hermes agents list, read and answer your WhatsApp conversations. Installed into the Hermes skills folder.'
+        ),
+        h(
+          'div',
+          { className: 'wab-actions' },
+          h(
+            Button,
+            {
+              size: 'sm',
+              outlined: installed,
+              disabled: busy !== '',
+              onClick: () => run('skill-install', '/skill/install', 'Hermes skill installed')
+            },
+            busy === 'skill-install' ? 'Installing…' : installed ? 'Reinstall skill' : 'Install skill'
+          ),
+          installed
+            ? h(
+                Button,
+                {
+                  size: 'sm',
+                  outlined: true,
+                  destructive: true,
+                  disabled: busy !== '',
+                  onClick: () => run('skill-remove', '/skill/uninstall', 'Hermes skill removed')
+                },
+                busy === 'skill-remove' ? 'Removing…' : 'Remove skill'
+              )
+            : null
+        )
       )
     )
   }
@@ -1183,6 +1353,8 @@
             'No numbers yet. Add one above and scan the QR code with your phone.'
           )
         : app.accounts.map(a => h(AccountCard, { key: a.id, a })),
+      h(ServiceCard),
+      h(SkillCard),
       h(
         'div',
         { className: 'wab-muted wab-small wab-pad' },

@@ -6,52 +6,66 @@ A [Hermes](https://hermes-agent.nousresearch.com) plugin that turns WhatsApp int
 - **Chats + Kanban board.** A full chat UI (thread, media, reply, drafts, search) and a board of conversation states: New, In progress, Waiting, Muted, Closed.
 - **Independent WhatsApp channel.** A small background service (a macOS LaunchAgent) runs one vendored [Baileys](https://github.com/WhiskeySockets/Baileys) bridge per number. It has nothing to do with Hermes' native WhatsApp gateway, so you can keep a dedicated number (or several) for this inbox.
 - **Automations / dispatcher.** Rules react to inbound or outbound messages and conversation events, and dispatch to a Hermes agent or profile, a webhook, a script, or a built-in action. Agent replies can be saved as drafts for you to approve, sent immediately, or kept only in the run log.
-- **CLI + Hermes skill.** `scripts/wa.py` and the bundled `whatsapp-chat` skill let any Hermes agent list, read, draft, send, tag and re-state conversations. Everything shows up live in the UI.
+- **CLI + Hermes skill.** `plugin/scripts/wa.py` and the bundled `whatsapp-chat` skill let any Hermes agent list, read, draft, send, tag and re-state conversations. Everything shows up live in the UI.
 
 The desktop app is the full experience. The web dashboard has the board, the chat (thread, reply, drafts) and number status/QR. Settings and automations are desktop only.
 
 ## Requirements
 
 - macOS (the channel service is installed as a LaunchAgent).
-- A working Hermes install (desktop app and/or dashboard). Node 22 comes with it (`~/.hermes/node/bin/node`); the sidecar needs Node 20 or newer.
-- [uv](https://docs.astral.sh/uv/).
-- Python 3.11 (uv installs it for the repo `.venv`; never install into the Hermes venv).
+- A working Hermes install (desktop app and/or dashboard). Node 22 comes with it (`~/.hermes/node/bin/node`); the service needs Node 20 or newer.
+
+Nothing else: no Python environment to create, no repository to clone, no terminal commands. The plugin runs on Hermes' own Python and installs its Node dependencies by itself.
 
 ## Install
 
+1. In the Hermes desktop app open **Capabilities → Plugins → Install from Git** and enter:
+
+   ```
+   singleflo/hermes-whatsapp-chat#plugin
+   ```
+
+   Enable both halves (agent and desktop). The `#plugin` suffix makes Hermes install only the `plugin/` folder of the repository.
+
+   Prefer the terminal? One command does the same:
+
+   ```bash
+   hermes plugins install singleflo/hermes-whatsapp-chat#plugin --enable
+   ```
+
+2. If the Conversations page reports "Backend unreachable", restart the Hermes app: the backend routes mount only at startup.
+3. Open **Conversations → Settings → Numbers** (or the **Numbers** tab of the dashboard) and click **Install service**. This installs and starts the WhatsApp channel service (a LaunchAgent). On its first start the service downloads the bridge's Node dependencies (progress in `<data>/logs/npm.log`); numbers show "starting" until that finishes.
+4. Click **Add number** and scan the QR code: WhatsApp on your phone → Settings → Linked devices → Link a device.
+5. Optional: click **Install skill** in the same screen to give Hermes agents the CLI skill (see below).
+
+If something does not start, the service log is `~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log`.
+
+### What lives where
+
+| What | Where |
+|---|---|
+| Plugin code: backend, sidecar, vendored bridge, CLI, skill template | `~/.hermes/plugins/hermes-whatsapp-chat/` (the cloned `plugin/` folder; replaced on update) |
+| Desktop half | `~/.hermes/desktop-plugins/hermes-whatsapp-chat/plugin.js` (copied by Hermes from the plugin folder) |
+| Your data: database, WhatsApp sessions, media, uploads, logs, launchers | `~/.hermes/plugin-data/hermes-whatsapp-chat/` (survives update and removal) |
+| LaunchAgent | `~/Library/LaunchAgents/it.fl1.hermes-whatsapp-chat.channel.plist` |
+| Installed skill | `~/.hermes/skills/whatsapp-chat/SKILL.md` |
+
+The service and the CLI run through a small launcher, `<data>/bin/hwc-python`, written by **Install service**. It starts the same Python interpreter and import path as the Hermes dashboard backend, so no separate virtualenv is needed. `<data>/bin/wa` is the CLI wrapper the skill and the automation templates use.
+
+### Update
+
 ```bash
-git clone https://github.com/singleflo/hermes-whatsapp-chat.git
-cd hermes-whatsapp-chat
-
-# 1. Python env (FastAPI, pydantic, segno for QR codes) and the vendored bridge's Node deps
-uv sync --python 3.11
-npm ci --prefix sidecar/whatsapp-bridge
-
-# 2. Install the plugin: a REAL folder of symlinks under ~/.hermes/plugins/.
-#    Never symlink the whole plugin dir: the desktop app lists ~/.hermes/plugins/ with
-#    isDirectory() (false for symlinks) and would never copy the desktop half.
-P=~/.hermes/plugins/hermes-whatsapp-chat; mkdir -p $P/desktop
-ln -s "$PWD/plugin/plugin.yaml" $P/plugin.yaml; ln -s "$PWD/plugin/dashboard" $P/dashboard
-ln -s "$PWD/plugin/desktop/plugin.js" $P/desktop/plugin.js
-hermes plugins enable hermes-whatsapp-chat
+hermes plugins update hermes-whatsapp-chat
 ```
 
-3. Restart the Hermes app (the backend routes mount only at startup; `hermes gateway restart` also works).
-4. Install and start the WhatsApp channel service:
+An update re-clones the plugin folder, so downloaded Node dependencies are dropped and fetched again on the next service start. Then restart the Hermes app and click **Reinstall service** in **Settings → Numbers** (it rewrites the launchers and the LaunchAgent and restarts the service). If you use the skill, click **Install skill** again to refresh it. Your data is untouched.
 
-   ```bash
-   uv run python sidecar/wa_channel.py install
-   ```
+### Uninstall
 
-   If `node` is not on your `PATH`, point it at Hermes' Node: `WA_NODE=~/.hermes/node/bin/node uv run python sidecar/wa_channel.py install`.
-5. Open **Conversations** in the Hermes desktop app (or the **Conversations** tab of the dashboard), go to **Settings → Numbers** (desktop) or the **Numbers** tab (dashboard), add a number and scan the QR code: WhatsApp on your phone → Settings → Linked devices → Link a device.
-6. Optional: give Hermes agents the CLI skill:
+1. In **Settings → Numbers** log the numbers out (unlinks the devices on WhatsApp's side), then click **Uninstall service** (stops the service and removes the LaunchAgent). Click **Remove skill** if you installed it.
+2. Remove the plugin: **Capabilities → Plugins** (remove), or `hermes plugins remove hermes-whatsapp-chat`.
 
-   ```bash
-   uv run python sidecar/wa_channel.py install-skill
-   ```
-
-Check everything with `uv run python sidecar/wa_channel.py status` (service, accounts, state per number).
+Removing the plugin deletes only the plugin folder. Your data stays in `~/.hermes/plugin-data/hermes-whatsapp-chat/` until you delete it yourself.
 
 ## Using it
 
@@ -107,19 +121,19 @@ Safety nets: runs are skipped when a human took over (`agent_active` off), autom
 ## CLI for Hermes (and you)
 
 ```bash
-.venv/bin/python scripts/wa.py list [--state S] [--account ID] [--unread] [--json]
-.venv/bin/python scripts/wa.py show ID [--limit N] [--json]
-.venv/bin/python scripts/wa.py draft ID TEXT          # for a human to review (preferred)
-.venv/bin/python scripts/wa.py send ID TEXT           # real WhatsApp message
-.venv/bin/python scripts/wa.py state ID STATE [--reason R]
-.venv/bin/python scripts/wa.py tag ID +vip -spam
-.venv/bin/python scripts/wa.py takeover ID            # also: handback ID
-.venv/bin/python scripts/wa.py search QUERY [--account ID]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa list [--state S] [--account ID] [--unread] [--json]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa show ID [--limit N] [--json]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa draft ID TEXT          # for a human to review (preferred)
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa send ID TEXT           # real WhatsApp message
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa state ID STATE [--reason R]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa tag ID +vip -spam
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa takeover ID            # also: handback ID
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa search QUERY [--account ID]
 ```
 
-`ID` is the conversation id. The author of CLI messages is `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`. Exit code 0 is success, 1 an error (message on stderr). The bundled skill (`hermes-skill/whatsapp-chat/SKILL.md`) teaches agents these commands and the draft-first etiquette. Its command paths are absolute: edit the `WA=` line and the venv path if you cloned elsewhere.
+`ID` is the conversation id. The author of CLI messages is `agent:$HERMES_PROFILE` when that variable is set, otherwise `cli`. Exit code 0 is success, 1 an error (message on stderr). `bin/wa` is created by **Install service** (or **Install skill**) and runs `plugin/scripts/wa.py` on the plugin's Python. The skill template (`plugin/skill/whatsapp-chat/SKILL.md`) teaches agents these commands and the draft-first etiquette; **Install skill** renders it with the absolute `bin/wa` path into `~/.hermes/skills/whatsapp-chat/SKILL.md`.
 
-Service management lives in `sidecar/wa_channel.py`: `install`, `uninstall`, `status`, `install-skill`, `run` (what launchd runs).
+The service can also be driven from a terminal with `plugin/sidecar/wa_channel.py`: `install`, `uninstall`, `install-skill`, `status`, `run` (what launchd runs). These do exactly what the UI buttons do.
 
 ## Architecture
 
@@ -131,11 +145,11 @@ flowchart LR
   end
   API[plugin_api.py<br/>FastAPI routes + WS /events<br/>wa_core package]
   DB[(SQLite wa_board.db<br/>control plane)]
-  S[sidecar/wa_channel.py<br/>LaunchAgent supervisor]
+  S[plugin/sidecar/wa_channel.py<br/>LaunchAgent supervisor]
   B1[Baileys bridge<br/>number 1 :3017]
   B2[Baileys bridge<br/>number 2 :3018]
   A[Automations executor<br/>hermes CLI, webhook, script]
-  CLI[scripts/wa.py<br/>Hermes skill]
+  CLI[plugin/scripts/wa.py<br/>Hermes skill]
   D -->|/api/plugins/hermes-whatsapp-chat| API
   W -->|/api/plugins/hermes-whatsapp-chat| API
   API <--> DB
@@ -150,8 +164,8 @@ flowchart LR
 ```
 
 - **The database is the control plane.** The UI writes the desired state of each number (running, stopped, logged out, removed); the sidecar reconciles every second and writes status, QR codes and a heartbeat back. No extra port is opened for control.
-- **Backend**: `plugin/dashboard/plugin_api.py` holds only HTTP routes and the live event stream; all logic is in the `plugin/dashboard/wa_core/` package (accounts, conversations, rules engine, outbound, automations, settings, schema/migrations).
-- **Sidecar**: runs the supervisor loop, one bridge process per paired number (own session directory, port and media cache), the QR pairing subprocess, history ingest, timers (mute expiry, auto-close) and the automation executor on a small thread pool so message ingest never blocks.
+- **Backend**: `plugin/dashboard/plugin_api.py` holds only HTTP routes and the live event stream; all logic is in the `plugin/dashboard/wa_core/` package (accounts, conversations, rules engine, outbound, automations, settings, service install, schema/migrations).
+- **Sidecar**: runs the supervisor loop, one bridge process per paired number (own session directory, port and media cache), the QR pairing subprocess (QR codes rendered with a vendored copy of [segno](https://github.com/heuer/segno), BSD), history ingest, timers (mute expiry, auto-close) and the automation executor on a small thread pool so message ingest never blocks. It installs the bridge's Node dependencies (`npm ci --omit=dev`) itself when `node_modules` is missing.
 - **Hermes interaction** uses only public surfaces: the plugin router, the two UI SDKs, the `hermes` CLI and HTTP.
 
 ### Data locations
@@ -162,7 +176,8 @@ flowchart LR
 | WhatsApp sessions | `<data>/sessions/<account id>/` |
 | Received media | `<data>/wa-media/<account id>/` |
 | Uploads (outgoing files) | `<data>/uploads/<account id>/` |
-| Service log | `<data>/logs/channel.log` |
+| Launchers | `<data>/bin/hwc-python`, `<data>/bin/wa` |
+| Logs | `<data>/logs/channel.log`, `<data>/logs/npm.log` |
 | LaunchAgent | `~/Library/LaunchAgents/it.fl1.hermes-whatsapp-chat.channel.plist` |
 | Installed skill | `~/.hermes/skills/whatsapp-chat/` |
 
@@ -170,46 +185,53 @@ An existing v1 database (single number, `wa-session`) is migrated automatically 
 
 ## Updating the vendored bridge
 
-`sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`). To refresh it from a Hermes checkout:
+`plugin/sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `plugin/sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`). This is maintainer work, done in a clone of this repository. To refresh it from a Hermes checkout:
 
 ```bash
-sidecar/update_bridge.sh [HERMES_CHECKOUT]     # default ~/.hermes/hermes-agent
-npm ci --prefix sidecar/whatsapp-bridge
-uv run python sidecar/wa_channel.py install    # restarts the service
+plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]     # default ~/.hermes/hermes-agent
+npm ci --prefix plugin/sidecar/whatsapp-bridge
 ```
 
-The script stages everything in a temp dir first: if a patch no longer applies it fails and leaves the vendored copy untouched. `sidecar/whatsapp-bridge/UPSTREAM` records the upstream commit and applied patches.
+The script stages everything in a temp dir first: if a patch no longer applies it fails and leaves the vendored copy untouched. `plugin/sidecar/whatsapp-bridge/UPSTREAM` records the upstream commit and applied patches. Users get the new bridge through `hermes plugins update` plus **Reinstall service**.
 
 ## Hermes updates
 
-- The plugin and the channel service live in this repository and in `~/.hermes/plugin-data/`, outside Hermes' install tree, so `hermes update` does not touch them. The service runs from the repo `.venv` and the vendored bridge, not from the Hermes venv.
+- The plugin lives in `~/.hermes/plugins/` and its data in `~/.hermes/plugin-data/`, outside Hermes' install tree, so `hermes update` does not touch them.
+- The service runs through `<data>/bin/hwc-python`, which pins the Python interpreter and import path that were active when you clicked **Install service**. If a Hermes update moves or replaces that interpreter, click **Reinstall service** to regenerate the launcher.
 - The plugin only touches public Hermes surfaces (see above); the only internals it imports are guarded and fall back gracefully (`plugins.plugin_storage` for the data dir, the dashboard WebSocket auth check).
-- After a Hermes update: restart the Hermes app, then check `uv run python sidecar/wa_channel.py status`. If the Hermes `hermes` binary moved and automations cannot find it, set `WA_HERMES_BIN`.
-- Never edit the installed copy under `~/.hermes/desktop-plugins/`; `hermes plugins update` overwrites it. Edit this repo.
+- After a Hermes update: restart the Hermes app, check that the numbers are connected, and if automations cannot find the `hermes` binary set `WA_HERMES_BIN`.
+- Never edit the installed copies under `~/.hermes/plugins/` or `~/.hermes/desktop-plugins/`; `hermes plugins update` overwrites them. Edit the repository.
 
 ## Independence from Hermes' native WhatsApp
 
 This plugin never reads or writes Hermes' own WhatsApp session, config or gateway. The channel service has its own sessions, ports (from 3017 up) and database. Use numbers here that Hermes' native WhatsApp gateway does not use.
 
-## Uninstall
-
-```bash
-uv run python sidecar/wa_channel.py uninstall        # stop and remove the LaunchAgent
-hermes plugins disable hermes-whatsapp-chat
-rm -rf ~/.hermes/plugins/hermes-whatsapp-chat        # the symlink folder
-rm -rf ~/.hermes/skills/whatsapp-chat                # if you installed the skill
-```
-
-Your data stays in `~/.hermes/plugin-data/hermes-whatsapp-chat/` until you delete it. Log the numbers out first (Settings → Numbers → Log out) to unlink the devices on WhatsApp's side.
-
 ## Development
 
+Work in a clone; the plugin itself needs no environment, but tests and linters do.
+
 ```bash
+git clone https://github.com/singleflo/hermes-whatsapp-chat.git
+cd hermes-whatsapp-chat
+uv sync --python 3.11                                   # FastAPI, pydantic, pytest, ruff, ty
+npm ci --prefix plugin/sidecar/whatsapp-bridge          # the bridge's Node deps (the installed service does this itself)
+
 uv run pytest -q                                        # tests/test_plugin_api.py, tests/test_automations.py
-uv run ruff check . && uv run ty check plugin scripts sidecar tests
+uv run ruff check . && uv run ty check plugin tests
 pnpm lint && pnpm format:check                          # JS halves (hand-written, no build step)
-uv run python scripts/seed_demo.py --reset              # demo conversations (@demo.invalid; --remove to delete)
+uv run python plugin/scripts/seed_demo.py --reset       # demo conversations (@demo.invalid; --remove to delete)
 ```
+
+To run your working copy inside Hermes, either install the clone as a git URL (`hermes plugins install "file://$PWD#plugin" --enable`; it installs the committed state only), or use a dev alias: a **real folder of symlinks** under `~/.hermes/plugins/`, so edits apply live. Never symlink the whole plugin dir: the desktop app lists `~/.hermes/plugins/` with `isDirectory()` (false for symlinks) and would never copy the desktop half.
+
+```bash
+P=~/.hermes/plugins/hermes-whatsapp-chat; mkdir -p $P/desktop
+for f in plugin.yaml __init__.py dashboard sidecar scripts skill; do ln -s "$PWD/plugin/$f" $P/$f; done
+ln -s "$PWD/plugin/desktop/plugin.js" $P/desktop/plugin.js
+hermes plugins enable hermes-whatsapp-chat
+```
+
+Restart the Hermes app, then use **Install service** in the UI (or `uv run python plugin/sidecar/wa_channel.py install`). The plugin directory is always derived from the file location at runtime, so the alias resolves back into your clone.
 
 Conventions and architecture notes for contributors and agents are in [AGENTS.md](AGENTS.md).
 

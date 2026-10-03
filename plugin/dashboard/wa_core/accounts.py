@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from . import db, errors
+from . import db, errors, service
 
 HISTORY_MODES = ("off", "recent", "full")
 SETTABLE_DESIRED = ("running", "stopped", "logged_out")
@@ -323,15 +323,6 @@ def service_heartbeat(conn: sqlite3.Connection, *, pid: int, version: str, start
         )
 
 
-def _install_command() -> str:
-    repo = Path(__file__).resolve().parents[3]
-    script = repo / "sidecar" / "wa_channel.py"
-    if script.exists():
-        python = repo / ".venv" / "bin" / "python"
-        return f"{python if python.exists() else 'python3'} {script} install"
-    return "python3 sidecar/wa_channel.py install  # run from the hermes-whatsapp-chat repository"
-
-
 def service_info(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM service_status WHERE id = 1").fetchone()
     heartbeat = row["heartbeat_at"] if row else None
@@ -341,5 +332,8 @@ def service_info(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
         "version": row["version"] if row else None,
         "started_at": row["started_at"] if row else None,
         "heartbeat_at": heartbeat,
-        "install_command": _install_command(),
+        "installed": service.service_installed(),
+        "skill_installed": service.skill_installed(),
+        "node": service.find_node(),
+        "install_command": None,  # kept for compatibility; the UI installs the service itself
     }

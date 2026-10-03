@@ -11,7 +11,11 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
+import plistlib
+import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,7 +28,7 @@ from starlette.websockets import WebSocketDisconnect
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_FILE = REPO_ROOT / "plugin" / "dashboard" / "plugin_api.py"
-SEED_FILE = REPO_ROOT / "scripts" / "seed_demo.py"
+SEED_FILE = REPO_ROOT / "plugin" / "scripts" / "seed_demo.py"
 PREFIX = "/api/plugins/hermes-whatsapp-chat"
 CONTACT_JID = "393330001111@s.whatsapp.net"
 OWN_JID = "393990000000@s.whatsapp.net"
@@ -46,6 +50,7 @@ def _load(name: str, path: Path):
 @pytest.fixture
 def plugin(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))  # LaunchAgents plist lands in tmp, never the real one
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path / "wa_board.db"))
     return _load("hermes_dashboard_plugin_hermes_whatsapp_chat", PLUGIN_FILE)
 
@@ -273,7 +278,8 @@ def test_service_reports_running_only_for_a_fresh_heartbeat(client, core, db):
     body = client.get(f"{PREFIX}/service").json()
     assert body["running"] is False
     assert body["heartbeat_at"] is None
-    assert "wa_channel.py" in body["install_command"]
+    assert body["install_command"] is None
+    assert (body["installed"], body["skill_installed"]) == (False, False)
 
     core.accounts.service_heartbeat(db, pid=4242, version="2.0", started_at=NOW - 100, now=int(time.time()))
     body = client.get(f"{PREFIX}/service").json()
@@ -281,6 +287,184 @@ def test_service_reports_running_only_for_a_fresh_heartbeat(client, core, db):
 
     core.accounts.service_heartbeat(db, pid=4242, version="2.0", started_at=NOW - 100, now=int(time.time()) - 60)
     assert client.get(f"{PREFIX}/service").json()["running"] is False
+
+
+# --- Service + skill installer ---------------------------------------------------------
+
+PLUGIN_DIR = REPO_ROOT / "plugin"
+
+
+def completed(argv, code=0, stderr=""):
+    return subprocess.CompletedProcess(argv, code, "", stderr)
+
+
+@pytest.fixture
+def svc(core, tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+    results: list = []
+    node = tmp_path / "nodebin" / "node"
+
+    def fake_run(argv):
+        calls.append(list(argv))
+        result = results.pop(0) if results else completed(argv)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(core.service, "_run", fake_run)
+    monkeypatch.setattr(core.service, "find_node", lambda: str(node))
+    data = core.db.data_dir()
+    return SimpleNamespace(
+        calls=calls,
+        results=results,
+        node=node,
+        data=data,
+        py=data / "bin" / "hwc-python",
+        wa=data / "bin" / "wa",
+        plist=tmp_path / "fake-home" / "Library" / "LaunchAgents" / f"{core.service.LABEL}.plist",
+        skill=tmp_path / "home" / "skills" / "whatsapp-chat" / "SKILL.md",
+    )
+
+
+def shell_exports(path):
+    """name -> value of the `export NAME=value` lines of a launcher script."""
+    out = {}
+    for line in path.read_text().splitlines():
+        if line.startswith("export "):
+            name, value = shlex.split(line)[1].split("=", 1)
+            out[name] = value
+    return out
+
+
+def exec_argv(path):
+    (line,) = [l for l in path.read_text().splitlines() if l.startswith("exec ")]
+    return shlex.split(line)[1:]
+
+
+def test_service_install_writes_executable_launchers(client, svc):
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 200, r.text
+
+    assert svc.py.read_text().startswith("#!/bin/sh\n")
+    exports = shell_exports(svc.py)
+    path_entries = exports["PYTHONPATH"].split(os.pathsep)
+    assert path_entries and all(e in sys.path and os.path.isdir(e) for e in path_entries)
+    assert exports["HERMES_HOME"] == str(svc.data.parents[1])
+    assert exec_argv(svc.py) == [sys.executable, "$@"]
+
+    assert svc.wa.read_text().startswith("#!/bin/sh\n")
+    assert exec_argv(svc.wa) == [str(svc.py), str(PLUGIN_DIR / "scripts" / "wa.py"), "$@"]
+    assert all(os.access(p, os.X_OK) for p in (svc.py, svc.wa))
+    assert all(p.stat().st_mode & 0o777 == 0o755 for p in (svc.py, svc.wa))
+
+
+def test_service_install_writes_plist_and_loads_it_with_launchctl(client, svc, tmp_path):
+    body = client.post(f"{PREFIX}/service/install").json()
+    assert (body["installed"], body["node"]) == (True, str(svc.node))
+
+    plist = plistlib.loads(svc.plist.read_bytes())
+    assert plist["Label"] == "it.fl1.hermes-whatsapp-chat.channel"
+    assert plist["ProgramArguments"] == [str(svc.py), str(PLUGIN_DIR / "sidecar" / "wa_channel.py"), "run"]
+    assert plist["WorkingDirectory"] == str(PLUGIN_DIR)
+    env = plist["EnvironmentVariables"]
+    assert env["WA_NODE"] == str(svc.node)
+    assert env["HERMES_HOME"] == str(tmp_path / "home")
+    assert env["WA_ARCHIVE_DB"] == str(tmp_path / "wa_board.db")
+    assert env["PATH"] == f"{svc.node.parent}:/usr/bin:/bin:/usr/sbin:/sbin"
+    assert (plist["RunAtLoad"], plist["KeepAlive"], plist["ThrottleInterval"]) == (True, True, 10)
+    assert plist["StandardOutPath"] == plist["StandardErrorPath"] == str(svc.data / "logs" / "channel.log")
+
+    domain = f"gui/{os.getuid()}"
+    assert svc.calls == [
+        ["launchctl", "bootout", f"{domain}/it.fl1.hermes-whatsapp-chat.channel"],
+        ["launchctl", "bootstrap", domain, str(svc.plist)],
+    ]
+
+
+def test_service_install_omits_archive_db_env_when_unset(client, svc, monkeypatch):
+    monkeypatch.delenv("WA_ARCHIVE_DB")
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert "WA_ARCHIVE_DB" not in plistlib.loads(svc.plist.read_bytes())["EnvironmentVariables"]
+
+
+def test_service_install_without_node_is_503_and_changes_nothing(client, core, svc, monkeypatch):
+    monkeypatch.setattr(core.service, "find_node", lambda: None)
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "Node" in r.json()["detail"]
+    assert not svc.plist.exists() and not svc.py.exists() and svc.calls == []
+
+
+def test_service_install_bootstrap_failure_is_503_with_launchctl_message(client, svc):
+    svc.results[:] = [completed([], 3), completed([], 5, "Bootstrap failed: 5: Input/output error")]
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503
+    assert "Bootstrap failed: 5: Input/output error" in r.json()["detail"]
+
+
+def test_service_install_ignores_bootout_failure(client, svc):
+    svc.results[:] = [completed([], 3, "Boot-out failed: 3: No such process"), completed([], 0)]
+    assert client.post(f"{PREFIX}/service/install").status_code == 200
+    assert len(svc.calls) == 2
+
+
+def test_service_install_without_launchctl_is_503(client, svc):
+    svc.results[:] = [FileNotFoundError("launchctl"), FileNotFoundError("launchctl")]
+    r = client.post(f"{PREFIX}/service/install")
+    assert r.status_code == 503 and "launchctl" in r.json()["detail"]
+
+
+def test_service_uninstall_boots_out_and_removes_plist(client, svc):
+    client.post(f"{PREFIX}/service/install")
+    assert svc.plist.exists()
+    svc.calls.clear()
+
+    body = client.post(f"{PREFIX}/service/uninstall").json()
+    assert body["installed"] is False and not svc.plist.exists()
+    assert svc.calls == [["launchctl", "bootout", f"gui/{os.getuid()}/it.fl1.hermes-whatsapp-chat.channel"]]
+
+    assert client.post(f"{PREFIX}/service/uninstall").status_code == 200  # nothing installed: still fine
+
+
+def test_skill_install_renders_template_with_absolute_wa_path(client, svc):
+    template = (PLUGIN_DIR / "skill" / "whatsapp-chat" / "SKILL.md").read_text()
+    assert "{{WA_CLI}}" in template
+
+    r = client.post(f"{PREFIX}/skill/install")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "path": str(svc.skill)}
+    text = svc.skill.read_text()
+    assert "{{WA_CLI}}" not in text
+    assert text == template.replace("{{WA_CLI}}", shlex.quote(str(svc.wa)))
+    assert str(svc.wa) in text
+    assert svc.wa.is_file() and os.access(svc.wa, os.X_OK)  # launchers are written first
+
+
+def test_skill_uninstall_removes_skill_and_empty_dir(client, svc):
+    client.post(f"{PREFIX}/skill/install")
+    assert client.post(f"{PREFIX}/skill/uninstall").json() == {"ok": True}
+    assert not svc.skill.exists() and not svc.skill.parent.exists()
+    assert client.post(f"{PREFIX}/skill/uninstall").json() == {"ok": True}
+
+
+def test_skill_install_without_template_is_503(client, core, svc, monkeypatch):
+    monkeypatch.setattr(core.service, "plugin_dir", lambda: svc.data / "nowhere")
+    r = client.post(f"{PREFIX}/skill/install")
+    assert r.status_code == 503 and "template" in r.json()["detail"]
+
+
+def test_service_info_reports_installed_flags_and_node(client, svc):
+    body = client.get(f"{PREFIX}/service").json()
+    assert (body["installed"], body["skill_installed"], body["node"]) == (False, False, str(svc.node))
+    assert body["install_command"] is None
+
+    client.post(f"{PREFIX}/service/install")
+    body = client.get(f"{PREFIX}/service").json()
+    assert (body["installed"], body["skill_installed"]) == (True, False)
+
+    client.post(f"{PREFIX}/skill/install")
+    assert client.get(f"{PREFIX}/service").json()["skill_installed"] is True
+    client.post(f"{PREFIX}/skill/uninstall")
+    assert client.get(f"{PREFIX}/service").json()["skill_installed"] is False
 
 
 # --- Migration v1 -> v2 -----------------------------------------------------------

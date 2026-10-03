@@ -3,7 +3,8 @@
 Multi-number WhatsApp chat over the plugin's own SQLite DB. All logic lives in the ``wa_core``
 package next to this file (loaded by path, exposed as the module attribute ``core``); this module
 only maps HTTP to it: request models, error mapping, and the live ``WS /events`` stream.
-The sidecar (sidecar/wa_channel.py) feeds ``core.ingest`` and reconciles accounts from the DB.
+The sidecar (sidecar/wa_channel.py) feeds ``core.ingest`` and reconciles accounts from the DB;
+``/service/*`` and ``/skill/*`` install it (LaunchAgent) and the Hermes skill from the UI.
 """
 
 from __future__ import annotations
@@ -141,6 +142,32 @@ def health() -> dict[str, Any]:
 def service() -> dict[str, Any]:
     with _session("service read failed") as conn:
         return core.accounts.service_info(conn, _now())
+
+
+@router.post("/service/install")
+def install_service() -> dict[str, Any]:
+    with _session("service install failed") as conn:
+        core.service.install_service(now=_now())
+        return core.accounts.service_info(conn, _now())
+
+
+@router.post("/service/uninstall")
+def uninstall_service() -> dict[str, Any]:
+    with _session("service uninstall failed") as conn:
+        core.service.uninstall_service()
+        return core.accounts.service_info(conn, _now())
+
+
+@router.post("/skill/install")
+def install_skill() -> dict[str, Any]:
+    with _session("skill install failed"):
+        return {"ok": True, **core.service.install_skill(now=_now())}
+
+
+@router.post("/skill/uninstall")
+def uninstall_skill() -> dict[str, Any]:
+    with _session("skill uninstall failed"):
+        return core.service.uninstall_skill()
 
 
 @router.get("/accounts")

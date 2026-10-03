@@ -3,7 +3,7 @@ import reactHooks from 'eslint-plugin-react-hooks'
 import globals from 'globals'
 
 export default [
-  { ignores: ['.agents/**', '.venv/**', 'docs/**', 'sidecar/whatsapp-bridge/**'] },
+  { ignores: ['.agents/**', '.venv/**', 'docs/**', 'plugin/sidecar/whatsapp-bridge/**', 'plugin/sidecar/_vendor/**'] },
   js.configs.recommended,
   {
     files: ['plugin/**/*.js'],

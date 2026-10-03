@@ -1,7 +1,9 @@
 """Seed (or remove) demo conversations for hermes-whatsapp-chat.
 
-    uv run python scripts/seed_demo.py --reset      # replace demo data (default 400 chats)
-    uv run python scripts/seed_demo.py --remove     # delete demo data only
+    seed_demo.py --reset      # replace demo data (default 400 chats)
+    seed_demo.py --remove     # delete demo data only
+
+Run with the plugin backend's Python (<data>/bin/hwc-python).
 
 Demo chats live in a ``kind='demo'`` account labelled "Demo" (JIDs use the non-WhatsApp domain
 ``@demo.invalid``): replies to them are rejected and ``--remove`` deletes only that account's data.
@@ -19,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-PLUGIN_FILE = Path(__file__).resolve().parents[1] / "plugin" / "dashboard" / "plugin_api.py"
+PLUGIN_FILE = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
 DEMO_SUFFIX = "@demo.invalid"
 
 ACTIVE_COUNTS = {"new": 8, "in_progress": 9, "waiting": 7, "muted": 4}
