@@ -454,7 +454,9 @@ def _store(
 ) -> None:
     chosen, score = decide(cfg, scores)
     with db.write_txn(conn):
-        conv = conn.execute("SELECT id, account_id FROM conversations WHERE id = ?", (run["conversation_id"],)).fetchone()
+        conv = conn.execute(
+            "SELECT id, account_id, classification FROM conversations WHERE id = ?", (run["conversation_id"],)
+        ).fetchone()
         if conv is None:
             conn.execute(
                 "UPDATE jev_runs SET status = 'skipped', error = 'conversation not found', finished_at = ? WHERE id = ?",
@@ -488,6 +490,15 @@ def _store(
             conversation_id=conv["id"],
             payload={"fields": ["classification"]},
         )
+        # Classifying the same message again with the same outcome changes nothing: its actions already ran
+        # (re-running them would only repeat take over / escalate and eat the per-conversation rate limit).
+        previous = db.jloads(conv["classification"], None)
+        if (
+            isinstance(previous, dict)
+            and previous.get("message_id") == run["message_id"]
+            and previous.get("exit") == chosen
+        ):
+            return
         events.emit(
             conn,
             "conversation.classified",

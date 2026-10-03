@@ -471,6 +471,26 @@ def test_no_condition_reaching_its_minimum_chooses_else(env, conv):
     assert (result["exit"], result["score"]) == ("else", None)
 
 
+def test_reclassifying_the_same_message_with_the_same_exit_does_not_run_its_actions_again(env, conv):
+    configure(env)
+    inbound(env, conv)
+    env.post_results.append(answer({"person": 0.9, "agent": 0.1, "no_reply": 0.1}))
+    process(env)
+    for _ in range(2):  # "Classify now" twice on the same message
+        with env.core.db.write_txn(env.conn):
+            env.core.jev.enqueue_now(env.conn, conv, NOW + 10)
+        env.post_results.append(answer({"person": 0.92, "agent": 0.1, "no_reply": 0.1}))
+        process(env, NOW + 10)
+    assert len(event_rows(env, "conversation.classified")) == 1
+    assert classification(env, conv)["score"] == 0.92  # the stored scores are still refreshed
+    # a different outcome for the same message is news: its actions run
+    with env.core.db.write_txn(env.conn):
+        env.core.jev.enqueue_now(env.conn, conv, NOW + 20)
+    env.post_results.append(answer({"person": 0.1, "agent": 0.9, "no_reply": 0.1}))
+    process(env, NOW + 20)
+    assert [json.loads(e["payload"])["exit"] for e in event_rows(env, "conversation.classified")] == ["person", "agent"]
+
+
 def test_the_first_passing_condition_in_list_order_wins(env, conv):
     configure(env)
     inbound(env, conv)
