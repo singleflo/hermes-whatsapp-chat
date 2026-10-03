@@ -42,7 +42,7 @@ VENDOR_DIR = PLUGIN_DIR / "sidecar" / "_vendor"
 VERSION = "2.0.0"
 MIN_NODE_MAJOR = 20
 DEPS_ERROR = "Bridge dependencies failed to install (see logs/npm.log)"
-DEPS_RETRY_SECONDS = 300.0
+DEPS_RETRY_SECONDS = 30.0  # short: a plugin reinstall/update replaces the bridge dir under us
 NPM_TIMEOUT_SECONDS = 1200.0
 
 sys.path.insert(0, str(VENDOR_DIR))  # vendored segno (QR rendering)
