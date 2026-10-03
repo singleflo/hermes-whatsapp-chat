@@ -2359,7 +2359,8 @@ const set_selectStyle = { color: 'var(--ui-text-primary)' }
 // jsxs wrapper: set_h(type, props, ...children). Children are static, `key` is hoisted.
 function set_h(type, props, ...kids) {
   const { key, ...p } = props || {}
-  return jsxs(type, { ...p, children: kids }, key)
+  // Void elements (input, img, …) must not receive a children prop, not even [].
+  return kids.length === 0 ? jsx(type, p, key) : jsxs(type, { ...p, children: kids }, key)
 }
 
 function set_clone(o) {
