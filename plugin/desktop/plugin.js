@@ -2945,15 +2945,20 @@ function WaPage({ route, accountId }) {
 
 // Statusbar chip: the active number (first 4 letters of the number picked in the Conversations header,
 // or of the only number when there is one) + its unanswered "new" count and the age of the oldest,
-// plus a warning when the service is down or an account is not connected.
+// plus a warning when the service is down or an account is not connected. A click opens a short
+// summary of the situation (counts, numbers, the oldest new chats).
 function StatusChip() {
-  const account = useValue(getScope(useConnScope(), ROUTE, null).account)
-  const news = useApi(
-    'chip-new',
-    '/conversations?state=new&limit=100' + (account !== null ? '&account_id=' + account : '')
-  )
+  const scope = getScope(useConnScope(), ROUTE, null)
+  const account = useValue(scope.account)
+  const [open, setOpen] = useState(false)
+  const filter = account !== null ? '&account_id=' + account : ''
+  const news = useApi('chip-new', '/conversations?state=new&limit=100' + filter)
   const accounts = useApi('accounts', '/accounts')
   const service = useApi('service', '/service')
+  // Extra counts only while the summary is open.
+  const unread = useApi('chip-unread', '/conversations?unread_only=true&limit=1' + filter, { enabled: open })
+  const working = useApi('chip-progress', '/conversations?state=in_progress&limit=1' + filter, { enabled: open })
+  const waiting = useApi('chip-waiting', '/conversations?state=waiting&limit=1' + filter, { enabled: open })
 
   if (!news.data && !news.error) {
     return null
@@ -2969,33 +2974,89 @@ function StatusChip() {
 
   const serviceDown = Boolean(service.data && !service.data.running)
   const issues = numbers.filter(a => a.desired === 'running' && accountState(a) !== 'connected')
-  let text = short + ' ?'
-  let detail = ''
-  if (news.data) {
-    const oldest = fmtAge(Math.max(0, ...news.data.conversations.map(c => c.age_seconds || 0)))
-    const total = news.data.total
-    text = short + ' ' + total + (total > 0 && oldest ? ' · ' + oldest : '')
-    detail = total + ' new' + (total > 0 && oldest ? ' (oldest ' + oldest + ')' : '')
-  }
+  const newChats = news.data
+    ? [...news.data.conversations].sort((a, b) => (b.age_seconds || 0) - (a.age_seconds || 0))
+    : []
+  const oldest = newChats.length ? fmtAge(newChats[0].age_seconds || 0) : ''
+  const total = news.data ? news.data.total : null
+  const text = short + ' ' + (total === null ? '?' : total + (total > 0 && oldest ? ' · ' + oldest : ''))
   const warn =
     news.error && !news.data ? 'unreachable' : serviceDown ? 'service down' : issues.length ? 'not connected' : ''
   const tone = news.error && !news.data ? 'bad' : serviceDown ? 'bad' : issues.length ? 'warn' : 'good'
+  const count = q => (q.data && typeof q.data.total === 'number' ? String(q.data.total) : '…')
+  const row = (label, value, color) =>
+    h(
+      'div',
+      { key: label, style: { ...F.row, justifyContent: 'space-between', gap: 16, padding: '2px 8px', fontSize: 12 } },
+      h('span', { style: T.secondary }, label),
+      h('span', { style: { fontVariantNumeric: 'tabular-nums', color: color || 'var(--ui-text-primary)' } }, value)
+    )
+  const openChat = id => {
+    scope.selected.set(id)
+    scope.tab.set('chats')
+    host.navigate(ROUTE)
+  }
+
   return h(
-    'button',
-    {
-      type: 'button',
-      className: 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]',
-      style: T.muted,
-      title: 'WhatsApp · ' + name + (detail ? ': ' + detail : '') + (warn ? ' · ' + warn : ''),
-      onClick: () => {
-        haptic('tap')
-        host.navigate(ROUTE)
-      }
-    },
-    h(StatusDot, { tone }),
-    active ? h(AccountDot, { account: active }) : null,
-    h('span', null, text),
-    warn ? h('span', { style: { color: tone === 'bad' ? 'var(--ui-red)' : 'var(--ui-orange)' } }, '· ' + warn) : null
+    DropdownMenu,
+    { open, onOpenChange: setOpen },
+    h(
+      DropdownMenuTrigger,
+      { asChild: true },
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]',
+          style: T.muted,
+          title: 'WhatsApp · ' + name + (total !== null ? ': ' + total + ' new' : '') + (warn ? ' · ' + warn : ''),
+          onClick: () => haptic('tap')
+        },
+        h(StatusDot, { tone }),
+        active ? h(AccountDot, { account: active }) : null,
+        h('span', null, text),
+        warn
+          ? h('span', { style: { color: tone === 'bad' ? 'var(--ui-red)' : 'var(--ui-orange)' } }, '· ' + warn)
+          : null
+      )
+    ),
+    h(
+      DropdownMenuContent,
+      { align: 'end', side: 'top', style: { minWidth: 240 } },
+      h('div', { style: { padding: '4px 8px', fontSize: 12, fontWeight: 600 } }, 'WhatsApp · ' + name),
+      row('New (no answer yet)', total === null ? '…' : total + (total > 0 && oldest ? ' · oldest ' + oldest : '')),
+      row('Unread', count(unread)),
+      row('In progress', count(working)),
+      row('Waiting for the contact', count(waiting)),
+      h(DropdownMenuSeparator, null),
+      row(
+        'Service',
+        service.data ? (service.data.running ? 'Running' : 'Not running') : '…',
+        serviceDown ? 'var(--ui-red)' : null
+      ),
+      numbers.map(a => {
+        const st = accountState(a)
+        return row(a.label, ACCOUNT_STATE_LABELS[st] || st, st === 'connected' ? null : accountStateColor(st))
+      }),
+      newChats.length ? h(DropdownMenuSeparator, null) : null,
+      newChats
+        .slice(0, 3)
+        .map(c =>
+          h(
+            DropdownMenuItem,
+            { key: c.id, onSelect: () => openChat(c.id) },
+            h('span', { style: { ...F.ellipsis, minWidth: 0, flex: '1 1 auto' } }, displayName(c)),
+            h('span', { style: T.muted }, fmtAge(c.age_seconds || 0))
+          )
+        ),
+      h(DropdownMenuSeparator, null),
+      h(
+        DropdownMenuItem,
+        { onSelect: () => host.navigate(ROUTE) },
+        h(Codicon, { name: 'comment-discussion', size: '0.8rem' }),
+        'Open Conversations'
+      )
+    )
   )
 }
 
