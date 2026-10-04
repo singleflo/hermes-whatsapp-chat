@@ -17,6 +17,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   ErrorState,
   haptic,
@@ -60,7 +61,7 @@ function getScope(conn, route, accountId) {
   const key = conn + '\0' + route
   let scope = scopes.get(key)
   if (!scope) {
-    scope = { tab: atom('chats'), selected: atom(null), account: atom(accountId) }
+    scope = { tab: atom('chats'), selected: atom(null), account: atom(accountId), newChat: atom(false) }
     scopes.set(key, scope)
   }
   return scope
@@ -2712,9 +2713,11 @@ function NewChatPanel({ accountId, onClose, onOpen }) {
   )
 }
 
-function ChatsView({ accountId, selected, onSelect }) {
+function ChatsView({ accountId, selected, onSelect, newChatAtom }) {
   const [stateFilter, setStateFilter] = useState('')
-  const [newChat, setNewChat] = useState(false)
+  // In the route scope so the header menu ("New chat…") can open it too.
+  const newChat = useValue(newChatAtom)
+  const setNewChat = useCallback(value => newChatAtom.set(value), [newChatAtom])
   const [infoOpen, setInfoOpen] = useState(() => Boolean(ctxRef.storage.get('infoOpen', false)))
 
   const setInfo = useCallback(value => {
@@ -2774,10 +2777,16 @@ function ChatsView({ accountId, selected, onSelect }) {
   )
 }
 
-// Header number switcher (Kanban board-switcher style): "All numbers" or one WhatsApp number.
+// Header switcher in the workspace tab row, like Kanban's board switcher: "Conversations",
+// the number ("All numbers" or one WhatsApp number), the unread count, and a menu with
+// the numbers plus the page actions.
 function NumberSwitcher({ scope }) {
   const account = useValue(scope.account)
   const accounts = useApi('accounts', '/accounts')
+  const unread = useApi(
+    'header-unread',
+    '/conversations?unread_only=true&limit=1' + (account !== null ? '&account_id=' + account : '')
+  )
   const list = useMemo(
     () => ((accounts.data && accounts.data.accounts) || []).filter(a => a.desired !== 'removed'),
     [accounts.data]
@@ -2792,10 +2801,12 @@ function NumberSwitcher({ scope }) {
   }, [account, accounts.data, current, scope])
 
   const label = current ? current.label : 'All numbers'
+  const total = unread.data && typeof unread.data.total === 'number' ? unread.data.total : null
   const choose = id => {
     scope.account.set(id)
     scope.selected.set(null)
   }
+  const muted = { color: 'var(--ui-text-tertiary)', flexShrink: 0 }
 
   return h(
     DropdownMenu,
@@ -2806,15 +2817,27 @@ function NumberSwitcher({ scope }) {
       h(
         Button,
         {
-          'aria-label': 'WhatsApp number: ' + label,
+          'aria-label': 'Conversations: ' + label,
+          title: 'Switch number',
           className: 'h-full min-w-0 max-w-full gap-1.5 px-2',
           size: 'sm',
           variant: 'ghost'
         },
-        h(Codicon, { name: 'device-mobile', size: '0.8125rem' }),
+        h(Codicon, { name: 'comment-discussion', size: '0.8125rem', style: muted }),
+        h('span', { style: { ...muted, fontSize: 11, fontWeight: 500 } }, 'Conversations'),
         current ? h(AccountDot, { account: current }) : null,
-        h('span', { style: { ...F.ellipsis, fontSize: 12, fontWeight: 500 } }, label),
-        h(Codicon, { name: 'chevron-down', size: '0.8125rem' })
+        h('span', { style: { ...F.ellipsis, minWidth: 0, fontSize: 12, fontWeight: 500 } }, label),
+        total !== null
+          ? h(
+              'span',
+              {
+                title: total + ' unread',
+                style: { color: 'var(--ui-text-quaternary)', fontSize: 11, fontVariantNumeric: 'tabular-nums' }
+              },
+              total
+            )
+          : null,
+        h(Codicon, { name: 'chevron-down', size: '0.8125rem', style: muted })
       )
     ),
     h(
@@ -2838,7 +2861,33 @@ function NumberSwitcher({ scope }) {
             : h('span', { style: { color: accountStateColor(st), fontSize: 10 } }, ACCOUNT_STATE_LABELS[st] || st),
           a.id === account ? h(Codicon, { className: 'ml-auto', name: 'check', size: '0.8rem' }) : null
         )
-      })
+      }),
+      h(DropdownMenuSeparator, null),
+      h(
+        DropdownMenuItem,
+        {
+          onSelect: () => {
+            scope.tab.set('chats')
+            scope.newChat.set(true)
+          }
+        },
+        h(Codicon, { name: 'add', size: '0.8rem' }),
+        'New chat…'
+      ),
+      h(
+        DropdownMenuItem,
+        { onSelect: () => scope.tab.set('board') },
+        h(Codicon, { name: 'project', size: '0.8rem' }),
+        'Board'
+      ),
+      h(
+        DropdownMenuItem,
+        { onSelect: () => scope.tab.set('settings') },
+        h(Codicon, { name: 'settings-gear', size: '0.8rem' }),
+        'Settings…'
+      ),
+      h(DropdownMenuSeparator, null),
+      h(DropdownMenuItem, { onSelect: () => refresh() }, h(Codicon, { name: 'refresh', size: '0.8rem' }), 'Refresh')
     )
   )
 }
@@ -2888,7 +2937,7 @@ function WaPage({ route, accountId }) {
     ),
     h(BackendBanner, {}),
     h(ServiceBanner, {}),
-    tab === 'chats' ? h(ChatsView, { accountId: account, selected, onSelect: open }) : null,
+    tab === 'chats' ? h(ChatsView, { accountId: account, selected, onSelect: open, newChatAtom: scope.newChat }) : null,
     tab === 'board' ? h(BoardView, { accountId: account, onOpen: open }) : null,
     tab === 'settings' ? h('div', { style: { ...F.fill, overflowY: 'auto' } }, jsx(SettingsPage, {})) : null
   )
