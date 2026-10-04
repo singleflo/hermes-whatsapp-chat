@@ -2943,10 +2943,15 @@ function WaPage({ route, accountId }) {
   )
 }
 
-// Statusbar chip: unanswered "new" count + age of the oldest, plus a warning when
-// the service is down or an account is not connected.
+// Statusbar chip: the active number (first 4 letters of the number picked in the Conversations header,
+// or of the only number when there is one) + its unanswered "new" count and the age of the oldest,
+// plus a warning when the service is down or an account is not connected.
 function StatusChip() {
-  const news = useApi('chip-new', '/conversations?state=new&limit=100')
+  const account = useValue(getScope(useConnScope(), ROUTE, null).account)
+  const news = useApi(
+    'chip-new',
+    '/conversations?state=new&limit=100' + (account !== null ? '&account_id=' + account : '')
+  )
   const accounts = useApi('accounts', '/accounts')
   const service = useApi('service', '/service')
 
@@ -2954,15 +2959,21 @@ function StatusChip() {
     return null
   }
 
+  const all = (accounts.data ? accounts.data.accounts : []).filter(a => a.desired !== 'removed')
+  const numbers = all.filter(a => a.kind !== 'demo')
+  const active = all.find(a => a.id === account) || (account === null && numbers.length === 1 ? numbers[0] : null)
+  const name = active ? active.label : 'All numbers'
+  const short = active ? active.label.replace(/\s+/g, '').slice(0, 4) : 'All'
+
   const serviceDown = Boolean(service.data && !service.data.running)
-  const issues = (accounts.data ? accounts.data.accounts : []).filter(
-    a => a.kind !== 'demo' && a.desired === 'running' && accountState(a) !== 'connected'
-  )
-  let text = 'WA ?'
-  let oldest = ''
+  const issues = numbers.filter(a => a.desired === 'running' && accountState(a) !== 'connected')
+  let text = short + ' ?'
+  let detail = ''
   if (news.data) {
-    oldest = fmtAge(Math.max(0, ...news.data.conversations.map(c => c.age_seconds || 0)))
-    text = 'WA ' + news.data.total + (news.data.total > 0 && oldest ? ' · ' + oldest : '')
+    const oldest = fmtAge(Math.max(0, ...news.data.conversations.map(c => c.age_seconds || 0)))
+    const total = news.data.total
+    text = short + ' ' + total + (total > 0 && oldest ? ' · ' + oldest : '')
+    detail = total + ' new' + (total > 0 && oldest ? ' (oldest ' + oldest + ')' : '')
   }
   const warn =
     news.error && !news.data ? 'unreachable' : serviceDown ? 'service down' : issues.length ? 'not connected' : ''
@@ -2973,13 +2984,14 @@ function StatusChip() {
       type: 'button',
       className: 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]',
       style: T.muted,
-      title: warn ? 'WhatsApp: ' + warn : 'Conversations',
+      title: 'WhatsApp · ' + name + (detail ? ': ' + detail : '') + (warn ? ' · ' + warn : ''),
       onClick: () => {
         haptic('tap')
         host.navigate(ROUTE)
       }
     },
     h(StatusDot, { tone }),
+    active ? h(AccountDot, { account: active }) : null,
     h('span', null, text),
     warn ? h('span', { style: { color: tone === 'bad' ? 'var(--ui-red)' : 'var(--ui-orange)' } }, '· ' + warn) : null
   )
