@@ -2963,7 +2963,9 @@ function StatusChip() {
   const numbers = all.filter(a => a.kind !== 'demo')
   const active = all.find(a => a.id === account) || (account === null && numbers.length === 1 ? numbers[0] : null)
   const name = active ? active.label : 'All numbers'
-  const short = active ? active.label.replace(/\s+/g, '').slice(0, 4) : 'All'
+  // "Persevida" -> "Pers."; labels of 4 letters or fewer stay whole.
+  const compact = active ? active.label.replace(/\s+/g, '') : ''
+  const short = active ? (compact.length > 4 ? compact.slice(0, 4) + '.' : compact) : 'All'
 
   const serviceDown = Boolean(service.data && !service.data.running)
   const issues = numbers.filter(a => a.desired === 'running' && accountState(a) !== 'connected')
