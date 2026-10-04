@@ -2824,7 +2824,7 @@ function NumberSwitcher({ scope }) {
           variant: 'ghost'
         },
         h(Codicon, { name: 'comment-discussion', size: '0.8125rem', style: muted }),
-        h('span', { style: { ...muted, fontSize: 11, fontWeight: 500 } }, 'Conversations'),
+        h('span', { style: { ...muted, fontSize: 11, fontWeight: 500 } }, 'Chats'),
         current ? h(AccountDot, { account: current }) : null,
         h('span', { style: { ...F.ellipsis, minWidth: 0, fontSize: 12, fontWeight: 500 } }, label),
         total !== null
