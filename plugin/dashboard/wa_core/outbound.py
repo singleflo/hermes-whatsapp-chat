@@ -12,7 +12,8 @@ from typing import Any
 
 from . import accounts, bridge, conversations, db, errors, events, settings
 
-WA_JID_SUFFIXES = ("@s.whatsapp.net", "@lid")
+WA_PERSON_SUFFIXES = ("@s.whatsapp.net", "@lid")
+WA_JID_SUFFIXES = (*WA_PERSON_SUFFIXES, "@g.us")
 SEND_TIMEOUT_SECONDS = 70
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
 
@@ -329,7 +330,7 @@ def send_read_receipts(conn: sqlite3.Connection, conversation_id: int, *, now: i
     except errors.WaError:
         return 0
     rows = conn.execute(
-        "SELECT id, wa_id, remote_jid FROM messages WHERE conversation_id = ? AND direction = 'in'"
+        "SELECT id, wa_id, remote_jid, participant FROM messages WHERE conversation_id = ? AND direction = 'in'"
         " AND source = 'live' AND wa_id IS NOT NULL AND read_at IS NULL ORDER BY ts, id LIMIT ?",
         (conversation_id, READ_RECEIPT_BATCH),
     ).fetchall()
@@ -339,7 +340,12 @@ def send_read_receipts(conn: sqlite3.Connection, conversation_id: int, *, now: i
     if not settings.get_settings(conn).privacy.send_read_receipts:
         _mark_read(conn, ids, now)
         return 0
-    keys = [{"remoteJid": r["remote_jid"] or conv["chat_jid"], "id": r["wa_id"], "fromMe": False} for r in rows]
+    keys = []
+    for r in rows:
+        key = {"remoteJid": r["remote_jid"] or conv["chat_jid"], "id": r["wa_id"], "fromMe": False}
+        if r["participant"]:  # group messages are receipted against their sender
+            key["participant"] = r["participant"]
+        keys.append(key)
     try:
         status, data = bridge.bridge_request(
             int(account["port"]), "POST", "/read", {"keys": keys}, timeout=READ_RECEIPT_TIMEOUT_SECONDS

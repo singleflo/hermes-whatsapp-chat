@@ -13,7 +13,7 @@
   const fetchJSON = SDK.fetchJSON
   const API = '/api/plugins/hermes-whatsapp-chat'
   // Bump together with API_VERSION in wa_core/service.py: the UI is newer than a backend that reports less.
-  const REQUIRED_API_VERSION = 9
+  const REQUIRED_API_VERSION = 10
   const RESTART_TITLE = 'Restart the Hermes dashboard to finish installing or updating WhatsApp Chat'
   const SERVICE_START_TIMEOUT_MS = 30000
 
@@ -50,7 +50,31 @@
   const DEFAULT_DROP_MUTE_HOURS = 24
   const SERVICE_FRESH_SECONDS = 15
   const MAX_LIST_LIMIT = 200
-  const WA_JID_RE = /@(s\.whatsapp\.net|lid)$/
+  const WA_JID_RE = /@(s\.whatsapp\.net|lid|g\.us)$/
+  const LIST_LABELS = {
+    admin: 'Admin',
+    work: 'Work',
+    personal: 'Personal',
+    unclassified: 'To classify',
+    ignored: 'Ignored'
+  }
+  const LIST_TONES = {
+    admin: 'secondary',
+    work: 'default',
+    personal: 'success',
+    unclassified: 'warning',
+    ignored: 'outline'
+  }
+  // Group senders get a stable colour from this fixed list (hashed by sender jid).
+  const SENDER_COLORS = [
+    'var(--color-primary)',
+    'var(--color-success)',
+    'var(--color-warning)',
+    'var(--color-destructive)',
+    'color-mix(in srgb, var(--color-warning) 50%, var(--color-destructive))',
+    'color-mix(in srgb, var(--color-destructive) 50%, var(--color-primary))',
+    'color-mix(in srgb, var(--color-success) 50%, var(--color-primary))'
+  ]
   const TABS = [
     ['board', 'Board'],
     ['chats', 'Chats'],
@@ -157,11 +181,44 @@
 
   const convName = c =>
     c.contact_name ||
+    (c.is_group ? 'Group' : '') ||
     (c.phone
       ? '+' + String(c.phone).replace(/^\+/, '')
       : /@lid$/.test(c.chat_jid || '')
         ? 'Unknown contact'
         : c.chat_jid)
+
+  // Group, list and silenced marks of a conversation card.
+  function convMarks(c) {
+    return [
+      c.is_group ? h(Badge, { key: 'group', tone: 'outline' }, 'Group') : null,
+      c.list ? h(Badge, { key: 'list', tone: LIST_TONES[c.list] || 'outline' }, LIST_LABELS[c.list] || c.list) : null,
+      c.silenced ? h(Badge, { key: 'silenced', tone: 'outline' }, 'Silenced') : null
+    ]
+  }
+
+  function senderColor(key) {
+    let hash = 0
+    String(key)
+      .split('')
+      .forEach(ch => {
+        hash = (hash * 31 + ch.charCodeAt(0)) >>> 0
+      })
+    return SENDER_COLORS[hash % SENDER_COLORS.length]
+  }
+
+  // Phone number of a group sender when WhatsApp told us (digits, or a phone jid), else ''.
+  function senderPhone(m) {
+    if (m.sender_phone) {
+      return '+' + String(m.sender_phone).replace(/^\+/, '')
+    }
+    const jid = String(m.sender_jid || '')
+    return /^\d+@s\.whatsapp\.net$/.test(jid) ? '+' + jid.split('@')[0] : ''
+  }
+
+  function senderLabel(m) {
+    return m.sender_name || senderPhone(m) || 'Unknown participant'
+  }
 
   function dotClass(color) {
     return 'wab-dot wab-dot--' + (/^[a-z]+$/.test(String(color)) ? color : 'blue')
@@ -330,7 +387,8 @@
         card.priority >= 2 ? h(Badge, { tone: 'destructive' }, 'Escalated') : null,
         !card.agent_active ? h(Badge, { tone: 'warning' }, 'Human') : null,
         card.has_draft ? h(Badge, { tone: 'outline' }, 'Draft') : null,
-        unknownState ? h(Badge, { tone: 'outline' }, card.state) : null
+        unknownState ? h(Badge, { tone: 'outline' }, card.state) : null,
+        convMarks(card)
       ),
       h('div', { className: 'wab-preview' }, card.last_message_preview),
       h(
@@ -455,6 +513,7 @@
         h('span', { className: 'wab-muted wab-small' }, fmtAge(card.age_seconds)),
         card.unread_count > 0 ? h(Badge, { tone: 'default' }, String(card.unread_count)) : null
       ),
+      card.is_group || card.list || card.silenced ? h('div', { className: 'wab-row' }, convMarks(card)) : null,
       h(
         'div',
         { className: 'wab-row wab-nowrap' },
@@ -508,7 +567,7 @@
     )
   }
 
-  function MessageBubble({ m, canSend }) {
+  function MessageBubble({ m, canSend, sender }) {
     const app = useContext(AppCtx)
     const who = authorLabel(m)
     const media = m.media || []
@@ -523,6 +582,13 @@
           (m.status === 'pending' ? ' wab-msg--pending' : '')
       },
       who ? h('div', { className: 'wab-msg-author' }, who) : null,
+      sender
+        ? h(
+            'div',
+            { className: 'wab-msg-author', title: sender.title, style: { color: sender.color, fontWeight: 600 } },
+            sender.label
+          )
+        : null,
       media.map(item => h(MediaItem, { key: item.index, messageId: m.id, item })),
       m.body ? h('div', { className: 'wab-msg-body' }, m.body) : null,
       h(
@@ -647,7 +713,7 @@
       return 'Demo chat: replies are disabled'
     }
     if (!WA_JID_RE.test(jid)) {
-      return 'Replies are only possible to direct WhatsApp chats'
+      return 'Replies are only possible to WhatsApp chats'
     }
     if (account.desired !== 'running') {
       return 'Number "' + account.label + '" is stopped'
@@ -785,6 +851,26 @@
       )
     }
 
+    // Group threads name the sender once per run of consecutive messages from the same person.
+    let lastSender = ''
+    const bubbles = messages.map(m => {
+      if (m.status === 'draft') {
+        lastSender = ''
+        return h(DraftBubble, { key: m.id, m, canSend, reason })
+      }
+      let sender = null
+      if (conv.is_group && m.direction === 'in') {
+        const senderKey = m.sender_jid || m.sender_name || '?'
+        if (senderKey !== lastSender) {
+          sender = { label: senderLabel(m), title: senderPhone(m), color: senderColor(senderKey) }
+        }
+        lastSender = senderKey
+      } else {
+        lastSender = ''
+      }
+      return h(MessageBubble, { key: m.id, m, canSend, sender })
+    })
+
     return h(
       'div',
       { className: 'wab-thread-pane' },
@@ -798,6 +884,7 @@
           h(AccountDot, { color: conv.account_color }),
           h('strong', null, convName(conv)),
           h(Badge, { tone: 'outline' }, stateLabel(conv.state)),
+          convMarks(conv),
           conv.priority >= 2 ? h(Badge, { tone: 'destructive' }, 'Escalated') : null,
           !conv.agent_active ? h(Badge, { tone: 'warning' }, 'Human') : null,
           conv.state === 'muted' && conv.muted_until
@@ -808,7 +895,11 @@
           'div',
           { className: 'wab-row wab-muted wab-small' },
           h('span', null, conv.account_label),
-          conv.phone ? h('span', null, '+' + String(conv.phone).replace(/^\+/, '')) : null,
+          conv.is_group
+            ? h('span', null, 'Group · ' + (d.participants || conv.participants || []).length + ' participants')
+            : conv.phone
+              ? h('span', null, '+' + String(conv.phone).replace(/^\+/, ''))
+              : null,
           (conv.tags || []).map(t => h(Badge, { key: t, tone: 'secondary' }, t))
         ),
         h('div', { className: 'wab-actions' }, actions),
@@ -848,11 +939,7 @@
         messages.length === 0 && latest.data
           ? h('div', { className: 'wab-muted wab-center' }, 'No messages yet')
           : null,
-        messages.map(m =>
-          m.status === 'draft'
-            ? h(DraftBubble, { key: m.id, m, canSend, reason })
-            : h(MessageBubble, { key: m.id, m, canSend })
-        )
+        bubbles
       ),
       h(Composer, {
         canSend,

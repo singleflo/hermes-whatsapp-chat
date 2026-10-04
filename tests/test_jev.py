@@ -234,6 +234,14 @@ def _old_db(env, monkeypatch, version: int) -> Path:
         (CONTACT_JID, NOW),
     )
     conn.execute("ALTER TABLE automation_rules DROP COLUMN managed_by")
+    conn.execute("DROP TABLE contact_lists")
+    for column in ("is_group", "list_override", "silenced_until", "participants", "group_refreshed_at"):
+        conn.execute(f"ALTER TABLE conversations DROP COLUMN {column}")
+    for column in ("new_contact_list", "new_group_list"):
+        conn.execute(f"ALTER TABLE accounts DROP COLUMN {column}")
+    if version != 2:
+        for column in ("sender_jid", "sender_name", "participant"):
+            conn.execute(f"ALTER TABLE messages DROP COLUMN {column}")
     if version < 4:
         conn.execute("DROP TABLE jev_runs")
         conn.execute("ALTER TABLE conversations DROP COLUMN classification")
@@ -257,11 +265,12 @@ def _old_db(env, monkeypatch, version: int) -> Path:
 
 
 @pytest.mark.parametrize("version", [2, 3, 4])
-def test_old_schema_migrates_to_v5_keeping_rows_and_adding_jev(env, monkeypatch, version):
+def test_old_schema_migrates_to_v6_keeping_rows_and_adding_jev(env, monkeypatch, version):
     _old_db(env, monkeypatch, version)
     conn = env.core.db.connect()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("SELECT list FROM contact_lists WHERE jid = ?", (CONTACT_JID,)).fetchone()[0] == "unclassified"
         cols = [r[1] for r in conn.execute("PRAGMA table_info(conversations)")]
         assert "classification" in cols
         assert conn.execute("SELECT COUNT(*) FROM jev_runs").fetchone()[0] == 0

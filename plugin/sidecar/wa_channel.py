@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
@@ -63,6 +64,9 @@ HISTORY_INGEST_PER_TICK = 300
 HTTP_TIMEOUT = 5.0
 AUTOMATION_THREADS = 2
 JEV_THREADS = 1
+GROUP_REFRESH_PER_TICK = 3  # group metadata fetches per tick (each is a WhatsApp round trip)
+GROUP_REFRESH_SECONDS = 6 * 3600  # a group's subject/participants are re-read at most this often
+GROUP_INFO_TIMEOUT = 10.0
 CODE_CHECK_SECONDS = 5.0
 PLUGIN_GONE_SECONDS = 120.0  # plugin.yaml missing this long = removed (shorter = a reinstall in progress)
 
@@ -103,6 +107,19 @@ def code_fingerprint(plugin_dir: Path) -> tuple[Any, ...] | None:
         return (manifest, channel, core_dir.stat().st_mtime_ns, files)
     except OSError:
         return None
+
+
+def stale_groups(conn: sqlite3.Connection, now: int) -> list[sqlite3.Row]:
+    """The (at most GROUP_REFRESH_PER_TICK) group conversations of connected numbers whose metadata was never
+    read or is older than GROUP_REFRESH_SECONDS, never-read first, then oldest first."""
+    return conn.execute(
+        "SELECT c.id, c.chat_jid, a.port FROM conversations c"
+        " JOIN accounts a ON a.id = c.account_id JOIN account_status s ON s.account_id = a.id"
+        " WHERE c.is_group = 1 AND a.kind = 'whatsapp' AND a.desired = 'running' AND s.state = 'connected'"
+        " AND (c.group_refreshed_at IS NULL OR c.group_refreshed_at < ?)"
+        " ORDER BY COALESCE(c.group_refreshed_at, 0), c.id LIMIT ?",
+        (now - GROUP_REFRESH_SECONDS, GROUP_REFRESH_PER_TICK),
+    ).fetchall()
 
 
 def log(msg: str) -> None:
@@ -193,14 +210,14 @@ _UNSET: Any = object()
 
 
 def bridge_env(account: dict) -> dict[str, str]:
-    # `*` admits every DM and every owner-typed chat; groups are never forwarded.
+    # `*` admits every DM and every owner-typed chat (groups included: WHATSAPP_GROUP_POLICY=open).
     media = core.accounts.media_dir(account)
     return {
         **os.environ,
         "WHATSAPP_MODE": "bot",
         "WHATSAPP_DM_POLICY": "allowlist",
         "WHATSAPP_ALLOWED_USERS": "*",
-        "WHATSAPP_GROUP_POLICY": "disabled",
+        "WHATSAPP_GROUP_POLICY": "open",
         "WHATSAPP_FORWARD_OWNER_MESSAGES": "true",
         "HERMES_IMAGE_CACHE_DIR": str(media / "image"),
         "HERMES_DOCUMENT_CACHE_DIR": str(media / "document"),
@@ -745,6 +762,29 @@ class Supervisor:
                 log(f"jev: worker failed: {exc!r}")
         self.jev_slot = self.pool.submit(core.jev.process_due, core.db.connect, int(time.time()))
 
+    def _refresh_groups(self, conn: sqlite3.Connection, now: int) -> None:
+        """Read the subject and participants of the stalest groups from their bridge (outside any
+        transaction). A failing group is stamped too, so it is retried after the interval, not every tick."""
+        for row in stale_groups(conn, now):
+            ok = False
+            try:
+                path = "/chat/" + urllib.parse.quote(row["chat_jid"], safe="")
+                status, data = core.bridge.bridge_request(int(row["port"]), "GET", path, timeout=GROUP_INFO_TIMEOUT)
+                # The bridge answers 200 with no participantDetails when WhatsApp refused the metadata call.
+                if status == 200 and isinstance(data, dict) and isinstance(data.get("participantDetails"), list):
+                    core.groups.apply_metadata(conn, row["id"], data, now)
+                    ok = True
+                else:
+                    log(f"group {row['id']}: no metadata (HTTP {status})")
+            except sqlite3.Error:
+                raise
+            except (core.bridge.BridgeUnavailable, OSError) as exc:
+                log(f"group {row['id']}: bridge unreachable: {exc}")
+            except Exception as exc:
+                log(f"group {row['id']}: metadata refresh failed: {exc!r}")
+            if not ok:
+                core.groups.mark_refresh_failed(conn, row["id"], now)
+
     def tick(self) -> None:
         if IS_WINDOWS and STOP_MARKER.exists():  # Windows stop request (no launchctl/systemctl to ask)
             log("stop requested")
@@ -800,6 +840,7 @@ class Supervisor:
                     log(f"repair: db error: {exc}")
                 except Exception as exc:
                     log(f"account {account['id']}: repair failed: {exc!r}")
+        self._refresh_groups(conn, now)
         self._automations()
         self._jev()
 

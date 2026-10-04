@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from . import db, errors, service
+from . import db, errors, lists, service
 
 HISTORY_MODES = ("off", "recent", "full")
 SETTABLE_DESIRED = ("running", "stopped", "logged_out")
@@ -80,6 +80,8 @@ def _account_dict(row: sqlite3.Row, status: sqlite3.Row | None) -> dict[str, Any
         "hermes_profile": row["hermes_profile"],
         "restart_requested_at": row["restart_requested_at"],
         "delete_conversations": bool(row["delete_conversations"]),
+        "new_contact_list": row["new_contact_list"],
+        "new_group_list": row["new_group_list"],
         "paired": is_paired(row),
         "status": _status_dict(status) if row["kind"] == "whatsapp" else None,
         "created_at": row["created_at"],
@@ -157,7 +159,7 @@ def create_account(
 
 
 def update_account(conn: sqlite3.Connection, account_id: int, *, now: int, **fields: Any) -> dict[str, Any]:
-    unknown = set(fields) - {"label", "color", "history_mode", "hermes_profile"}
+    unknown = set(fields) - {"label", "color", "history_mode", "hermes_profile", "new_contact_list", "new_group_list"}
     if unknown:
         raise errors.Invalid(f"cannot update fields: {sorted(unknown)}")
     clean: dict[str, Any] = {}
@@ -170,6 +172,9 @@ def update_account(conn: sqlite3.Connection, account_id: int, *, now: int, **fie
     if "hermes_profile" in fields:
         profile = str(fields["hermes_profile"] or "").strip()
         clean["hermes_profile"] = profile or None
+    for key in ("new_contact_list", "new_group_list"):
+        if key in fields:
+            clean[key] = lists.clean_list(fields[key])
     with db.write_txn(conn):
         _require(conn, account_id)
         if clean:

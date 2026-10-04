@@ -6,7 +6,7 @@ import re
 import sqlite3
 from typing import Any, Literal
 
-from . import accounts, bridge, conversations, db, errors, events, outbound
+from . import accounts, bridge, conversations, db, errors, events, lists, outbound
 
 MAX_CHECK = 50
 MAX_NEW_CHATS_PER_HOUR = 10
@@ -156,6 +156,7 @@ def _create(
             (account_id, jid, name, phone, now, now, now),
         )
         conversation_id = cur.lastrowid or 0
+        lists.ensure_contact_list(conn, jid, {"id": account_id}, is_group=False, now=now)
         conn.execute(
             "INSERT INTO conversation_state_log (conversation_id, from_state, to_state, actor, reason, at)"
             " VALUES (?,NULL,'in_progress',?,?,?)",
@@ -218,7 +219,7 @@ def start_conversation(
     jid = answer.get("jid")
     if not answer.get("exists"):
         raise errors.NotOnWhatsApp(f"+{digits} is not on WhatsApp")
-    if not isinstance(jid, str) or not jid.endswith(outbound.WA_JID_SUFFIXES):
+    if not isinstance(jid, str) or not jid.endswith(outbound.WA_PERSON_SUFFIXES):
         raise errors.BadGateway("bridge check failed: no WhatsApp address returned")
     existing = _existing(conn, account["id"], digits, jid)
     if existing is not None:

@@ -2,7 +2,7 @@
 
 Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher written by the plugin's Install service)
 
-    list [--state S] [--account ID] [--unread] [--limit N] [--json]
+    list [--state S] [--account ID] [--unread] [--limit N] [--list LIST|all] [--groups|--direct] [--json]
     show ID [--limit N] [--json]
     send ID TEXT              send now (only when the user explicitly asked)
     draft ID TEXT             store a draft for the human to review
@@ -10,6 +10,8 @@ Run with the plugin backend's Python: <data>/bin/wa <command>   (launcher writte
     tag ID +a -b
     takeover ID | handback ID
     search QUERY [--account ID]
+    set-list ID LIST [--this-number]   move a contact or group to a list (admin work personal unclassified ignored)
+    silence ID [--hours N] | unsilence ID   no notifications for N hours (default: forever) / undo
     check PHONE [PHONE ...] [--account ID|LABEL] [--json]
                               is the number on WhatsApp? exit 0 all are, 2 when one is not
     send-to PHONE TEXT [--account ID|LABEL] [--name NAME] [--json]
@@ -106,6 +108,8 @@ def cmd_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         account_id=args.account,
         state=args.state,
         unread_only=args.unread,
+        list_id=args.list,
+        kind="group" if args.groups else "direct" if args.direct else None,
         limit=args.limit,
         now=int(time.time()),
     )
@@ -116,19 +120,23 @@ def cmd_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     if not cards:
         print("no conversations")
         return
-    rows = [["ID", "ACCOUNT", "STATE", "UNREAD", "AGE", "CONTACT", "LAST MESSAGE"]]
+    rows = [["ID", "ACCOUNT", "STATE", "LIST", "UNREAD", "AGE", "CONTACT", "LAST MESSAGE"]]
     for c in cards:
-        who = c.get("contact_name") or c.get("phone") or c["chat_jid"]
+        who = c.get("contact_name") or c.get("phone") or ("Group" if c.get("is_group") else c["chat_jid"])
+        if c.get("is_group"):
+            who = f"[group] {who}"
         arrow = "<" if c.get("last_message_direction") == "in" else ">"
         draft = " [draft]" if c.get("has_draft") else ""
+        silenced = " (silenced)" if c.get("silenced") else ""
         rows.append(
             [
                 str(c["id"]),
                 str(c.get("account_label") or c["account_id"]),
                 c["state"] + ("*" if c.get("priority") else ""),
+                str(c.get("list") or "-") + ("!" if c.get("list_scope") == "number" else ""),
                 str(c.get("unread_count") or 0),
                 fmt_age(c.get("age_seconds")),
-                one_line(who, 24),
+                one_line(who, 28) + silenced,
                 f"{arrow} {one_line(c.get('last_message_preview'), 60)}{draft}",
             ]
         )
@@ -140,6 +148,9 @@ def render_message(m: dict) -> str:
     media = "".join(f" [media: {x.get('type') or x.get('mime') or 'file'}]" for x in m.get("media") or [])
     status = m["status"]
     head = f"[{fmt_time(m['ts'])}] #{m['id']} {m['author']} ({status})"
+    sender = m.get("sender_name") or (f"+{m['sender_phone']}" if m.get("sender_phone") else m.get("sender_jid"))
+    if m["direction"] == "in" and sender:  # group message: who wrote it
+        head += f" from {sender}" + (f" (+{m['sender_phone']})" if m.get("sender_name") and m.get("sender_phone") else "")
     if m.get("error"):
         head += f" error: {m['error']}"
     body = (m.get("body") or "").rstrip()
@@ -156,13 +167,22 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         return
     c = detail["conversation"]
     acc = detail.get("account") or {}
-    who = c.get("contact_name") or c.get("phone") or c["chat_jid"]
-    print(f"Conversation #{c['id']}: {who} ({c['chat_jid']})")
+    who = c.get("contact_name") or c.get("phone") or ("Group" if c.get("is_group") else c["chat_jid"])
+    print(f"{'Group' if c.get('is_group') else 'Conversation'} #{c['id']}: {who} ({c['chat_jid']})")
     print(f"Account: {acc.get('label') or c['account_id']} ({acc.get('kind') or '?'})")
     print(
         f"State: {c['state']}  agent_active: {c['agent_active']}  unread: {c['unread_count']}"
         f"  tags: {','.join(c.get('tags') or []) or '-'}"
     )
+    silenced = "  silenced: " + (
+        "forever" if c["silenced_until"] >= core.lists.SILENCE_FOREVER else f"until {fmt_time(c['silenced_until'])}"
+    ) if c.get("silenced") else ""
+    print(f"List: {core.lists.LIST_LABELS.get(c.get('list'), c.get('list'))} ({c.get('list')}"
+          f"{', only this number' if c.get('list_scope') == 'number' else ''}){silenced}")
+    if c.get("is_group"):
+        people = c.get("participants") or []
+        names = ", ".join(one_line(p.get("name") or (f"+{p['phone']}" if p.get("phone") else p["jid"]), 24) for p in people[:12])
+        print(f"Participants: {len(people)}" + (f" ({names}{', ...' if len(people) > 12 else ''})" if names else ""))
     print(f"Allowed next states: {', '.join(detail.get('allowed_states') or []) or '-'}")
     print()
     if msgs["has_more"]:
@@ -214,6 +234,25 @@ def cmd_takeover(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
 def cmd_handback(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     s = core.conversations.handback(conn, args.id, now=int(time.time()), actor=author())
     emit(args, s, summary_text(s))
+
+
+def cmd_set_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    effective = core.lists.set_list(
+        conn, args.id, args.list, "number" if args.this_number else "contact", now=int(time.time()), actor=author()
+    )
+    scope = "only this number" if args.this_number else "every number"
+    emit(args, {"id": args.id, "list": effective, "scope": scope}, f"#{args.id} list={effective} ({scope})")
+
+
+def cmd_silence(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    until = core.lists.silence(conn, args.id, args.hours, now=int(time.time()))
+    text = "forever" if until >= core.lists.SILENCE_FOREVER else f"until {fmt_time(until)}"
+    emit(args, {"id": args.id, "silenced_until": until}, f"#{args.id} silenced {text}")
+
+
+def cmd_unsilence(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    core.lists.unsilence(conn, args.id, now=int(time.time()))
+    emit(args, {"id": args.id, "silenced_until": None}, f"#{args.id} not silenced")
 
 
 # --- new chat --------------------------------------------------------------------------
@@ -419,6 +458,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", help="new|in_progress|waiting|muted|closed")
     p.add_argument("--account", type=int, help="account id")
     p.add_argument("--unread", action="store_true", help="only conversations with unread messages")
+    p.add_argument("--list", help="admin|work|personal|unclassified|ignored|all (default: every list except ignored)")
+    kind = p.add_mutually_exclusive_group()
+    kind.add_argument("--groups", action="store_true", help="only WhatsApp groups")
+    kind.add_argument("--direct", action="store_true", help="only direct chats")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(fn=cmd_list)
 
@@ -456,6 +499,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("handback", parents=[common], help="hand the conversation back to the agent")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_handback)
+
+    p = sub.add_parser("set-list", parents=[common], help="move a contact or group to a list")
+    p.add_argument("id", type=int)
+    p.add_argument("list", help="admin|work|personal|unclassified|ignored")
+    p.add_argument("--this-number", action="store_true", help="only this conversation (number), not the contact")
+    p.set_defaults(fn=cmd_set_list)
+
+    p = sub.add_parser("silence", parents=[common], help="no notifications for a conversation")
+    p.add_argument("id", type=int)
+    p.add_argument("--hours", type=int, help="1-8760; default: forever")
+    p.set_defaults(fn=cmd_silence)
+
+    p = sub.add_parser("unsilence", parents=[common], help="notifications on again")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_unsilence)
 
     p = sub.add_parser("search", parents=[common], help="search message bodies")
     p.add_argument("query")

@@ -397,6 +397,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     senderName: senderId.replace(/@.*/, ''),
     chatName: chatId.replace(/@.*/, ''),
     isGroup: chatId.endsWith('@g.us'),
+    participant: key?.participant || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.participant || '',
     body: chosenText,
     hasMedia: false,
     mediaType: 'poll_update',
@@ -444,12 +445,13 @@ const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 // Convert one history-sync WAMessage into the same event shape as the live
-// queue (see extractBridgeEvent).  Only 1:1 text messages are kept; media is
+// queue (see extractBridgeEvent).  Only text messages of 1:1 and group chats are kept; media is
 // never downloaded, so hasMedia is false and mediaType is kept as a hint.
 async function buildHistoryEvent(msg, botIds) {
   if (!msg?.message || !msg.key?.remoteJid) return null;
   const chatId = msg.key.remoteJid;
-  if (!chatId.endsWith('@s.whatsapp.net') && !chatId.endsWith('@lid')) return null;
+  const isGroup = chatId.endsWith('@g.us');
+  if (!isGroup && !chatId.endsWith('@s.whatsapp.net') && !chatId.endsWith('@lid')) return null;
   const senderId = msg.key.participant || chatId;
   const senderAltId = normalizeWhatsAppId(msg.key.participantAlt || msg.key.remoteJidAlt || '');
   const resolvedSenderId = senderAltId.endsWith('@s.whatsapp.net') ? senderAltId : senderId;
@@ -459,7 +461,7 @@ async function buildHistoryEvent(msg, botIds) {
     senderId: resolvedSenderId,
     senderNumber: resolvedSenderId.replace(/@.*/, ''),
     botIds,
-    isGroup: false,
+    isGroup,
   });
   if (event.mediaType === 'reaction' || event.mediaType === 'poll_update') return null;
   // Drop the generated "[image received]" / "[Sticker]" stand-ins: only real text counts.
@@ -469,6 +471,8 @@ async function buildHistoryEvent(msg, botIds) {
   if (!body || !body.trim()) return null;
   event.body = body;
   event.fromOwner = !!msg.key.fromMe;
+  // Raw key participant (group sender, '' in DMs): the sidecar needs it for group read receipts.
+  event.participant = msg.key.participant || '';
   event.history = true;
   event.hasMedia = false;
   event.mediaUrls = [];
@@ -660,10 +664,11 @@ async function startSocket() {
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        // Owner messages in groups are forwarded like DMs (same owner gate); only status chats are dropped.
+        if (chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
@@ -847,6 +852,8 @@ async function startSocket() {
         lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
+      // Raw key participant (group sender, '' in DMs): the sidecar needs it for group read receipts.
+      event.participant = msg.key.participant || '';
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -1258,10 +1265,22 @@ app.get('/chat/:id', async (req, res) => {
   if (isGroup && sock) {
     try {
       const metadata = await sock.groupMetadata(chatId);
+      const phoneJid = (p) => (p.phoneNumber
+        || (typeof p.id === 'string' && p.id.endsWith('@s.whatsapp.net') ? p.id : '')
+        || null);
+      const lidJid = (p) => (p.lid
+        || (typeof p.id === 'string' && p.id.endsWith('@lid') ? p.id : '')
+        || null);
       return res.json({
         name: metadata.subject,
         isGroup: true,
         participants: metadata.participants.map(p => p.id),
+        participantDetails: metadata.participants.map(p => ({
+          id: p.id,
+          phone: phoneJid(p),
+          lid: lidJid(p),
+          admin: p.admin === 'admin' || p.admin === 'superadmin' ? p.admin : null,
+        })),
       });
     } catch {
       // Fall through to default
@@ -1315,7 +1334,7 @@ app.get('/health', (req, res) => {
 });
 
 // Drain history-sync messages (WHATSAPP_SYNC_HISTORY=recent|full).
-// Same event shape as /messages plus `history: true`; text-only 1:1 chats.
+// Same event shape as /messages plus `history: true`; text-only 1:1 and group chats.
 app.get('/history', (req, res) => {
   const requested = parseInt(String(req.query.limit ?? ''), 10);
   const limit = Number.isFinite(requested) && requested > 0

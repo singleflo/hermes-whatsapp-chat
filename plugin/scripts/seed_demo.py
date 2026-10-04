@@ -60,6 +60,13 @@ OUTBOUND = [
     "Documents sent, please confirm that you received them.",
 ]
 TAGS = ["case", "order", "complaint", "info", "quote"]
+# Two demo groups (state, index within that state) replace two ordinary demo chats, so counts stay the same.
+GROUPS = {("in_progress", 5): ("Team Ops (demo)", "work"), ("waiting", 3): ("Family trip (demo)", "personal")}
+GROUP_PEOPLE = [
+    ("Alice Martin", "393201110001"), ("Lucas Silva", "393201110002"), ("Sofia Rossi", "393201110003"),
+    ("Marco Ricci", "393201110004"), ("Elena Costa", "393201110005"),
+]
+LIST_WEIGHTS = (("work", 60), ("personal", 20), ("unclassified", 15), ("admin", 5))
 
 
 def _load_api():
@@ -91,6 +98,8 @@ def seed(conn: sqlite3.Connection, count: int, now: int) -> dict[str, int]:
     states += ["closed"] * (count - active_total)
     counts = {s: 0 for s in (*ACTIVE_COUNTS, "closed")}
     in_progress_seen = 0
+    list_rng = random.Random(7)  # separate stream: lists and groups never change the chats of earlier releases
+    groups_made = 0
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -126,23 +135,35 @@ def seed(conn: sqlite3.Connection, count: int, now: int) -> dict[str, int]:
                 if in_progress_seen == 4:
                     tags = ["urgent"]
 
+            group = GROUPS.get((state, index))
+            list_id = list_rng.choices([n for n, _ in LIST_WEIGHTS], [w for _, w in LIST_WEIGHTS])[0]
+            name = rng.choice(NAMES)  # always drawn: the other demo chats stay what they were
+            if state == "closed" and index == 0:
+                list_id = "ignored"  # one hidden chat to try the Ignored filter
+            if group:
+                groups_made += 1
+                jid, name, phone, list_id = f"demo-group-{groups_made}{DEMO_SUFFIX}", group[0], None, group[1]
             conv_id = conn.execute(
                 "INSERT INTO conversations (account_id, chat_jid, contact_name, phone, state, priority, muted_until,"
-                " last_message_at, last_inbound_at, unread_count, agent_active, tags, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (account_id, jid, rng.choice(NAMES), phone, state, priority, muted_until, last_at, last_inbound_at,
-                 unread, agent_active, json.dumps(tags), msgs[0][2], last_at),
+                " last_message_at, last_inbound_at, unread_count, agent_active, tags, created_at, updated_at,"
+                " is_group, participants)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (account_id, jid, name, phone, state, priority, muted_until, last_at, last_inbound_at,
+                 unread, agent_active, json.dumps(tags), msgs[0][2], last_at, 1 if group else 0,
+                 json.dumps([{"jid": f"{p}@s.whatsapp.net", "phone": p, "admin": i == 0}
+                             for i, (_, p) in enumerate(GROUP_PEOPLE)]) if group else None),
             ).lastrowid
-            conn.executemany(
-                "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status)"
-                " VALUES (?,?,NULL,?,?,?,?,?)",
-                [(conv_id, account_id, d, "contact" if d == "in" else "user", b, t,
-                  "received" if d == "in" else "sent") for d, b, t in msgs],
-            )
             conn.execute(
-                "INSERT INTO conversation_state_log (conversation_id, from_state, to_state, actor, reason, at)"
-                " VALUES (?,NULL,?,'auto','seed',?)",
-                (conv_id, state, last_at),
+                "INSERT OR REPLACE INTO contact_lists (jid, list, updated_at) VALUES (?,?,?)", (jid, list_id, now)
+            )
+            conn.executemany(
+                "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status,"
+                " sender_jid, sender_name) VALUES (?,?,NULL,?,?,?,?,?,?,?)",
+                [(conv_id, account_id, d, "contact" if d == "in" else "user", b, t,
+                  "received" if d == "in" else "sent",
+                  *((f"{GROUP_PEOPLE[k % len(GROUP_PEOPLE)][1]}@s.whatsapp.net", GROUP_PEOPLE[k % len(GROUP_PEOPLE)][0])
+                    if group and d == "in" else (None, None)))
+                 for k, (d, b, t) in enumerate(msgs)],
             )
         conn.execute("COMMIT")
     except BaseException:
@@ -157,8 +178,9 @@ def remove_demo(conn: sqlite3.Connection) -> int:
     try:
         accounts = "SELECT id FROM accounts WHERE kind = 'demo'"
         convs = f"SELECT id FROM conversations WHERE account_id IN ({accounts})"
-        for table in ("messages", "conversation_state_log", "automation_runs", "events"):
+        for table in ("messages", "conversation_state_log", "automation_runs", "jev_runs", "events"):
             conn.execute(f"DELETE FROM {table} WHERE conversation_id IN ({convs})")
+        conn.execute(f"DELETE FROM contact_lists WHERE jid IN (SELECT chat_jid FROM conversations WHERE account_id IN ({accounts}))")
         removed = conn.execute(f"DELETE FROM conversations WHERE account_id IN ({accounts})").rowcount
         conn.execute(f"DELETE FROM account_status WHERE account_id IN ({accounts})")
         conn.execute("DELETE FROM accounts WHERE kind = 'demo'")

@@ -6,7 +6,7 @@ import json
 import sqlite3
 from typing import Any, Iterable
 
-from . import accounts, db, errors, events, media, settings
+from . import accounts, db, errors, events, groups, lists, media, settings
 
 # Single source of column order. Keep exhaustive + fallback: a state missing here must
 # land in the fallback column, never be dropped.
@@ -32,12 +32,14 @@ _LAST_ID = (
 )
 _CARD_SELECT = (
     "SELECT c.*, a.label AS account_label, a.color AS account_color,"
+    f" {lists.EFFECTIVE_SQL} AS eff_list,"
     " lm.body AS lm_body, lm.direction AS lm_direction, lm.author AS lm_author, lm.meta AS lm_meta,"
     " lm.status AS lm_status, lm.source AS lm_source,"
     " EXISTS(SELECT 1 FROM messages d WHERE d.conversation_id = c.id AND d.status = 'draft') AS has_draft"
-    " FROM conversations c LEFT JOIN accounts a ON a.id = c.account_id"
+    f" FROM conversations c LEFT JOIN accounts a ON a.id = c.account_id {lists.JOIN_SQL}"
     f" LEFT JOIN messages lm ON lm.id = {_LAST_ID}"
 )
+_COUNT_FROM = f"FROM conversations c {lists.JOIN_SQL}"
 
 
 # --- Helpers -------------------------------------------------------------------
@@ -105,6 +107,11 @@ def _card(row: sqlite3.Row, now: int, urgency_hours: int) -> dict[str, Any]:
         "tags": tags,
         "urgency": urgency,
         "has_draft": bool(row["has_draft"]),
+        "is_group": bool(row["is_group"]),
+        "list": row["eff_list"],
+        "list_scope": "number" if row["list_override"] else "contact",
+        "silenced_until": row["silenced_until"],
+        "silenced": lists.is_silenced(row["silenced_until"], now),
     }
 
 
@@ -124,6 +131,9 @@ def message_dict(row: sqlite3.Row) -> dict[str, Any]:
         "error": row["error"],
         "rule_id": row["rule_id"],
         "media": media.message_media(row["meta"]),
+        "sender_jid": row["sender_jid"],
+        "sender_name": row["sender_name"],
+        "sender_phone": groups.phone_digits(row["sender_jid"]),
     }
 
 
@@ -134,7 +144,16 @@ def get_message(conn: sqlite3.Connection, message_id: int) -> dict[str, Any]:
     return message_dict(row)
 
 
-def _filters(account_id: int | None, q: str | None, extra: str = "", args: list | None = None) -> tuple[str, list]:
+def _filters(
+    account_id: int | None,
+    q: str | None,
+    extra: str = "",
+    args: list | None = None,
+    *,
+    list_id: str | None = None,
+    kind: str | None = None,
+) -> tuple[str, list]:
+    """WHERE clause. ``list_id``: a list id, ``all`` or None (= every list except Ignored); ``kind``: group|direct."""
     clauses, params = ([extra] if extra else []), list(args or [])
     if account_id is not None:
         clauses.append("c.account_id = ?")
@@ -144,6 +163,16 @@ def _filters(account_id: int | None, q: str | None, extra: str = "", args: list 
             "(c.contact_name LIKE ? ESCAPE '\\' OR c.phone LIKE ? ESCAPE '\\' OR c.chat_jid LIKE ? ESCAPE '\\')"
         )
         params += [like_pattern(q)] * 3
+    if list_id is None:
+        clauses.append(f"{lists.EFFECTIVE_SQL} != 'ignored'")
+    elif list_id != "all":
+        clauses.append(f"{lists.EFFECTIVE_SQL} = ?")
+        params.append(lists.clean_list(list_id))
+    if kind is not None:
+        if kind not in ("group", "direct"):
+            raise errors.Invalid("type must be 'group' or 'direct'")
+        clauses.append("c.is_group = ?")
+        params.append(1 if kind == "group" else 0)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -172,26 +201,33 @@ def get_card(conn: sqlite3.Connection, conversation_id: int, now: int) -> dict[s
 
 
 def get_board(
-    conn: sqlite3.Connection, *, account_id: int | None = None, q: str = "", include_closed: bool = False, now: int
+    conn: sqlite3.Connection,
+    *,
+    account_id: int | None = None,
+    q: str = "",
+    include_closed: bool = False,
+    list_id: str | None = None,
+    kind: str | None = None,
+    now: int,
 ) -> dict[str, Any]:
     """Columns + cards. Two queries at most; the last message is one correlated subquery per row."""
     run_timers(conn, now)
     cfg = settings.get_settings(conn)
     by_col: dict[str, list[dict]] = {name: [] for name in BOARD_COLUMNS}
-    where, args = _filters(account_id, q, "c.state != 'closed'")
+    where, args = _filters(account_id, q, "c.state != 'closed'", list_id=list_id, kind=kind)
     rows = conn.execute(_CARD_SELECT + where + " ORDER BY c.priority DESC, c.last_message_at ASC, c.id", args).fetchall()
     for row in rows:
         column = row["state"] if row["state"] in by_col else FALLBACK_COLUMN
         by_col[column].append(_card(row, now, cfg.board.urgency_hours))
     if include_closed:
-        where, args = _filters(account_id, q, "c.state = 'closed'")
+        where, args = _filters(account_id, q, "c.state = 'closed'", list_id=list_id, kind=kind)
         rows = conn.execute(
             _CARD_SELECT + where + " ORDER BY c.last_message_at DESC, c.id DESC LIMIT ?", (*args, cfg.board.closed_limit)
         ).fetchall()
         by_col["closed"] = [_card(row, now, cfg.board.urgency_hours) for row in rows]
-    where, args = _filters(account_id, q)
+    where, args = _filters(account_id, q, list_id=list_id, kind=kind)
     counts = {name: 0 for name in BOARD_COLUMNS}
-    sql = "SELECT c.state AS state, COUNT(*) AS n FROM conversations c" + where + " GROUP BY c.state"
+    sql = f"SELECT c.state AS state, COUNT(*) AS n {_COUNT_FROM}" + where + " GROUP BY c.state"
     for row in conn.execute(sql, args):
         counts[row["state"]] = row["n"]
     return {"columns": [{"name": name, "cards": by_col[name]} for name in BOARD_COLUMNS], "counts": counts, "now": now}
@@ -204,6 +240,8 @@ def list_conversations(
     state: str | None = None,
     q: str = "",
     unread_only: bool = False,
+    list_id: str | None = None,
+    kind: str | None = None,
     limit: int = 50,
     offset: int = 0,
     now: int,
@@ -215,8 +253,8 @@ def list_conversations(
         args.append(state)
     if unread_only:
         extra.append("c.unread_count > 0")
-    where, params = _filters(account_id, q, " AND ".join(extra), args)
-    total = conn.execute("SELECT COUNT(*) FROM conversations c" + where, params).fetchone()[0]
+    where, params = _filters(account_id, q, " AND ".join(extra), args, list_id=list_id, kind=kind)
+    total = conn.execute(f"SELECT COUNT(*) {_COUNT_FROM}" + where, params).fetchone()[0]
     rows = conn.execute(
         _CARD_SELECT + where + " ORDER BY c.last_message_at DESC, c.id DESC LIMIT ? OFFSET ?",
         (*params, max(1, min(limit, 500)), max(0, offset)),
@@ -250,6 +288,7 @@ def get_conversation(conn: sqlite3.Connection, conversation_id: int, *, now: int
             "previous_state": row["previous_state"],
             "created_at": row["created_at"],
             "classification": classification,
+            "participants": groups.participant_view(conn, row) if row["is_group"] else [],
         },
         "account": account,
         "allowed_states": sorted(allowed_from(row["state"])),

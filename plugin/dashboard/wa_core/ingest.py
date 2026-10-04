@@ -6,7 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import contacts, conversations, db, errors, events, media, outbound, settings
+from . import contacts, conversations, db, errors, events, lists, media, outbound, settings
 
 NON_SUBSTANTIVE_MEDIA = {"reaction", "poll_update"}
 WA_PHONE_SUFFIX = "@s.whatsapp.net"
@@ -17,10 +17,13 @@ def _jid_number(jid: str) -> str:
 
 
 def canonical_jid(event: dict) -> str:
-    """Conversation key: the contact's phone JID when the bridge provides one.
+    """Conversation key: the contact's phone JID when the bridge provides one; a group's own chat JID.
 
-    The bridge puts the phone JID in ``senderId`` when the chat is addressed by LID.
+    The bridge puts the phone JID in ``senderId`` when the chat is addressed by LID. In a group ``senderId`` is
+    the author of the message, never the conversation.
     """
+    if _is_group(event):
+        return str(event.get("chatId") or "")
     own = {_jid_number(b) for b in event.get("botIds") or []}
     for candidate in (event.get("senderId"), event.get("chatId")):
         if candidate and candidate.endswith(WA_PHONE_SUFFIX) and _jid_number(candidate) not in own:
@@ -40,7 +43,8 @@ def event_ts(raw: Any, now: int) -> int:
 
 
 def _is_group(event: dict) -> bool:
-    return bool(event.get("isGroup")) or str(event.get("chatId") or "").endswith("@g.us")
+    """A group chat is recognised by its chat JID (the bridge's ``isGroup`` flag is derived from it)."""
+    return str(event.get("chatId") or "").endswith("@g.us")
 
 
 def _meta(event: dict) -> str | None:
@@ -64,11 +68,14 @@ def _insert_message(
     source: str,
     meta: str | None,
     remote_jid: str | None,
+    sender_jid: str | None = None,
+    sender_name: str | None = None,
+    participant: str | None = None,
     read_at: int | None = None,
 ) -> int:
     cur = conn.execute(
         "INSERT INTO messages (conversation_id, account_id, wa_id, direction, author, body, ts, status, source, meta,"
-        " remote_jid, read_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        " remote_jid, read_at, sender_jid, sender_name, participant) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             conv_id,
             account_id,
@@ -82,6 +89,9 @@ def _insert_message(
             meta,
             remote_jid,
             read_at,
+            sender_jid,
+            sender_name,
+            participant,
         ),
     )
     return cur.lastrowid or 0
@@ -98,13 +108,15 @@ def _create_conversation(
     now: int,
     unread: int,
     last_inbound_at: int | None,
+    is_group: bool = False,
 ) -> sqlite3.Row:
     phone = _jid_number(jid) if jid.endswith(WA_PHONE_SUFFIX) else None
     cur = conn.execute(
         "INSERT INTO conversations (account_id, chat_jid, contact_name, phone, state, unread_count, last_message_at,"
-        " last_inbound_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (account_id, jid, name, phone, state, unread, ts, last_inbound_at, ts, now),
+        " last_inbound_at, created_at, updated_at, is_group) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (account_id, jid, name, phone, state, unread, ts, last_inbound_at, ts, now, 1 if is_group else 0),
     )
+    lists.ensure_contact_list(conn, jid, {"id": account_id}, is_group=is_group, now=now)
     return conversations.get_row(conn, cur.lastrowid or 0)
 
 
@@ -115,7 +127,14 @@ def _announce_created(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> N
         " VALUES (?,NULL,?,'auto','first message',?)",
         (row["id"], row["state"], now),
     )
-    events.emit(conn, "conversation.created", now=now, account_id=row["account_id"], conversation_id=row["id"])
+    events.emit(
+        conn,
+        "conversation.created",
+        now=now,
+        account_id=row["account_id"],
+        conversation_id=row["id"],
+        payload=lists.event_flags(conn, row["id"], now),
+    )
     events.emit(
         conn,
         "conversation.state_changed",
@@ -155,15 +174,30 @@ def _adopt_own_jid(conn: sqlite3.Connection, account_id: int, event: dict, now: 
     )
 
 
+def _group_sender(account: sqlite3.Row, event: dict, from_owner: bool) -> dict[str, Any]:
+    """Sender columns of a group message: canonical sender JID, display name and the raw participant (receipts)."""
+    participant = str(event.get("participant") or "") or None
+    if from_owner:
+        own = contacts.own_number(account)
+        return {"sender_jid": f"{own}{WA_PHONE_SUFFIX}" if own else None, "sender_name": None, "participant": participant}
+    raw = str(event.get("senderId") or participant or "")
+    name = str(event.get("senderName") or "").strip()
+    return {
+        "sender_jid": contacts.resolve_jid(account, raw) if raw else None,
+        "sender_name": name if name and not name.lstrip("+").isdigit() else None,
+        "participant": participant,
+    }
+
+
 def ingest_event(
     conn: sqlite3.Connection, account_id: int, event: dict, now: int, *, source: str = "live"
 ) -> int | None:
     """Store one bridge message event.
 
-    Returns the new message id; None for groups, system/self/broadcast chats, empty jids and duplicates.
+    Returns the new message id; None for system/self/broadcast chats, empty jids and duplicates. Groups are
+    conversations keyed by their ``@g.us`` chat JID; each message carries its sender.
     """
-    if _is_group(event):
-        return None
+    is_group = _is_group(event)
     jid = canonical_jid(event)
     if not jid:
         return None
@@ -190,8 +224,11 @@ def ingest_event(
         jid = contacts.resolve_jid(account, jid)
         if contacts.is_ignored_jid(jid, contacts.own_number(account)):
             return None
-        raw_name = event.get("contactName") or (None if from_owner else event.get("senderName"))
-        contact_name = raw_name if raw_name and not str(raw_name).lstrip("+").isdigit() else None
+        if is_group:
+            contact_name = None  # the subject comes from group metadata, never from a sender's name
+        else:
+            raw_name = event.get("contactName") or (None if from_owner else event.get("senderName"))
+            contact_name = raw_name if raw_name and not str(raw_name).lstrip("+").isdigit() else None
         if wa_id and conn.execute(
             "SELECT 1 FROM messages WHERE account_id = ? AND wa_id = ?", (account_id, wa_id)
         ).fetchone():
@@ -199,13 +236,17 @@ def ingest_event(
         row = conn.execute(
             "SELECT * FROM conversations WHERE account_id = ? AND chat_jid = ?", (account_id, jid)
         ).fetchone()
-        common = {"wa_id": wa_id, "direction": direction, "body": body, "ts": ts, "meta": meta, "remote_jid": remote_jid}
+        common: dict[str, Any] = {
+            "wa_id": wa_id, "direction": direction, "body": body, "ts": ts, "meta": meta, "remote_jid": remote_jid,
+        }
+        if is_group:
+            common.update(_group_sender(account, event, from_owner))
 
         if source == "history":
             if row is None:
                 row = _create_conversation(
                     conn, account_id, jid, state="closed", name=contact_name, ts=ts, now=now, unread=0,
-                    last_inbound_at=None,
+                    last_inbound_at=None, is_group=is_group,
                 )
             elif contact_name:
                 conn.execute(
@@ -229,9 +270,9 @@ def ingest_event(
 
         rules = settings.get_settings(conn).rules
         if from_owner:
-            return _ingest_owner(conn, account_id, row, jid, common, rules, now)
+            return _ingest_owner(conn, account_id, row, jid, common, rules, now, is_group=is_group)
         return _ingest_inbound(
-            conn, account_id, row, jid, common, rules, contact_name, media_type, now
+            conn, account_id, row, jid, common, rules, contact_name, media_type, now, is_group=is_group
         )
 
 
@@ -245,12 +286,15 @@ def _ingest_inbound(
     contact_name: str | None,
     media_type: str | None,
     now: int,
+    *,
+    is_group: bool = False,
 ) -> int:
     ts, body = common["ts"], common["body"]
     created = row is None
     if row is None:
         row = _create_conversation(
-            conn, account_id, jid, state="new", name=contact_name, ts=ts, now=now, unread=1, last_inbound_at=ts
+            conn, account_id, jid, state="new", name=contact_name, ts=ts, now=now, unread=1, last_inbound_at=ts,
+            is_group=is_group,
         )
     message_id = _insert_message(conn, row["id"], account_id, author="contact", source="live", **common)
     if created:
@@ -273,7 +317,7 @@ def _ingest_inbound(
         account_id=account_id,
         conversation_id=row["id"],
         message_id=message_id,
-        payload={"author": "contact"},
+        payload={"author": "contact", **lists.event_flags(conn, row["id"], now)},
     )
     return message_id
 
@@ -286,17 +330,20 @@ def _ingest_owner(
     common: dict[str, Any],
     rules: settings.Rules,
     now: int,
+    *,
+    is_group: bool = False,
 ) -> int:
     ts = common["ts"]
     last_inbound = row["last_inbound_at"] if row is not None else None
     window = rules.auto_reply_window_seconds
-    is_auto = last_inbound is not None and window > 0 and 0 <= ts - last_inbound <= window
+    # WhatsApp Business away/greeting echoes exist only in direct chats; in a group the owner is a participant.
+    is_auto = not is_group and last_inbound is not None and window > 0 and 0 <= ts - last_inbound <= window
     author = "auto_reply" if is_auto else "phone"
     created = row is None
     if row is None:
         row = _create_conversation(
             conn, account_id, jid, state="new" if is_auto else "waiting", name=None, ts=ts, now=now, unread=0,
-            last_inbound_at=None,
+            last_inbound_at=None, is_group=is_group,
         )
     message_id = _insert_message(conn, row["id"], account_id, author=author, source="live", **common)
     if created:

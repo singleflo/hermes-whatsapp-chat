@@ -46,7 +46,7 @@ const ROUTE = '/wa-board'
 const POLL_MS = 5000
 const PAGE_SIZE = 50
 const HEARTBEAT_STALE_S = 15
-const WA_JID_RE = /@(s\.whatsapp\.net|lid)$/
+const WA_JID_RE = /@(s\.whatsapp\.net|lid|g\.us)$/
 
 // Set by register(); handlers read it imperatively, never from render closures.
 let ctxRef = null
@@ -93,6 +93,52 @@ const $restart = atom(null)
 //   SERVICE_LOG_HINT        where the service writes its log (shown on errors)
 
 const STATE_LABELS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', muted: 'Muted', closed: 'Closed' }
+
+// Contact lists (wa_core/lists.py). A list belongs to the person or group (shared by every number);
+// one conversation may override it for its number only.
+const LIST_LABELS = {
+  admin: 'Admin',
+  work: 'Work',
+  personal: 'Personal',
+  unclassified: 'To classify',
+  ignored: 'Ignored'
+}
+const LIST_IDS = ['admin', 'work', 'personal', 'unclassified', 'ignored']
+// No list param = every list except Ignored.
+const LIST_FILTERS = [
+  ['', 'All lists'],
+  ...['work', 'personal', 'unclassified', 'admin', 'ignored'].map(id => [id, LIST_LABELS[id]])
+]
+const TYPE_FILTERS = [
+  ['', 'All'],
+  ['direct', 'Direct'],
+  ['group', 'Groups']
+]
+const LIST_COLORS = {
+  admin: 'var(--ui-purple)',
+  work: 'var(--ui-blue)',
+  personal: 'var(--ui-green)',
+  unclassified: 'var(--ui-orange)',
+  ignored: 'var(--ui-text-quaternary)'
+}
+const SILENCE_FOREVER = 32503680000
+const SILENCE_PRESETS = [
+  [8, '8 hours'],
+  [24, '1 day'],
+  [168, '1 week'],
+  [null, 'Forever']
+]
+// Group senders get a stable colour from this fixed list (hashed by sender jid).
+const SENDER_COLORS = [
+  'var(--ui-blue)',
+  'var(--ui-green)',
+  'var(--ui-orange)',
+  'var(--ui-purple)',
+  'var(--ui-cyan)',
+  'var(--ui-red)',
+  'var(--ui-yellow)',
+  'color-mix(in srgb, var(--ui-red) 55%, var(--ui-purple))'
+]
 
 const ACCOUNT_COLORS = {
   red: 'var(--ui-red)',
@@ -238,7 +284,7 @@ function AccountDot({ account, size = 8 }) {
 const SERVICE_LOG_HINT = '~/.hermes/plugin-data/hermes-whatsapp-chat/logs/channel.log'
 
 const SERVICE_START_TIMEOUT_MS = 30000
-const REQUIRED_API_VERSION = 9
+const REQUIRED_API_VERSION = 10
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
   'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
@@ -496,10 +542,42 @@ function fmtPhone(p) {
 function displayName(c) {
   return (
     c.contact_name ||
+    (c.is_group ? 'Group' : '') ||
     fmtPhone(c.phone) ||
     (/@lid$/.test(c.chat_jid || '') ? 'Unknown contact' : c.chat_jid) ||
     'Unknown'
   )
+}
+
+const listLabel = id => LIST_LABELS[id] || id
+
+function silencedText(c) {
+  return c.silenced_until >= SILENCE_FOREVER ? 'Silenced forever' : 'Silenced until ' + fmtTime(c.silenced_until)
+}
+
+function senderColor(key) {
+  let hash = 0
+  for (const ch of String(key)) {
+    hash = (hash * 31 + ch.codePointAt(0)) >>> 0
+  }
+  return SENDER_COLORS[hash % SENDER_COLORS.length]
+}
+
+// Phone number of a group sender when WhatsApp told us (digits, or a phone jid), else ''.
+function senderPhone(m) {
+  if (m.sender_phone) {
+    return '+' + String(m.sender_phone).replace(/^\+/, '')
+  }
+  const jid = String(m.sender_jid || '')
+  return /^\d+@s\.whatsapp\.net$/.test(jid) ? '+' + jid.split('@')[0] : ''
+}
+
+function senderLabel(m) {
+  return m.sender_name || senderPhone(m) || 'Unknown participant'
+}
+
+function participantName(p) {
+  return p.name || (p.phone ? '+' + String(p.phone).replace(/^\+/, '') : 'Unknown participant')
 }
 
 function initials(name) {
@@ -882,31 +960,90 @@ function Menu({ label, items, disabled, title }) {
             }
           },
           items.map(item =>
-            h(
-              Button,
-              {
-                key: item.key,
-                size: 'xs',
-                variant: 'ghost',
-                style: { justifyContent: 'flex-start', width: '100%' },
-                onClick: () => {
-                  setOpen(false)
-                  item.onClick()
-                }
-              },
-              item.label
-            )
+            item.heading
+              ? h(
+                  'div',
+                  {
+                    key: item.key,
+                    style: {
+                      padding: '4px 8px 2px',
+                      textTransform: 'uppercase',
+                      fontWeight: 600,
+                      ...T.muted,
+                      fontSize: 10
+                    }
+                  },
+                  item.label
+                )
+              : h(
+                  Button,
+                  {
+                    key: item.key,
+                    size: 'xs',
+                    variant: 'ghost',
+                    style: { justifyContent: 'flex-start', width: '100%' },
+                    onClick: () => {
+                      setOpen(false)
+                      item.onClick()
+                    }
+                  },
+                  item.label
+                )
           )
         )
       : null
   )
 }
 
+// Small list badge, one per list with theme colours.
+function ListBadge({ list }) {
+  const color = LIST_COLORS[list] || 'var(--ui-text-tertiary)'
+  return h(
+    'span',
+    {
+      title: 'List: ' + listLabel(list),
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '0 6px',
+        borderRadius: 999,
+        fontSize: 10,
+        lineHeight: '16px',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        color,
+        border: '1px solid color-mix(in srgb, ' + color + ' 45%, transparent)',
+        background: 'color-mix(in srgb, ' + color + ' 12%, transparent)'
+      }
+    },
+    listLabel(list)
+  )
+}
+
+// Group / list / silenced marks shared by conversation rows and board cards.
+function convMarks(c) {
+  return [
+    c.is_group
+      ? h(
+          Badge,
+          { key: 'group', variant: 'outline', size: 'xs', style: { gap: 3 } },
+          h(Codicon, { name: 'organization' }),
+          'Group'
+        )
+      : null,
+    c.list ? h(ListBadge, { key: 'list', list: c.list }) : null,
+    c.silenced
+      ? h(Codicon, { key: 'silenced', name: 'bell-slash', title: 'Silenced: no notifications', style: T.muted })
+      : null
+  ]
+}
+
 function CardBadges({ c }) {
   return [
     c.priority >= 2 ? h(Badge, { key: 'esc', variant: 'destructive', size: 'xs' }, 'Escalated') : null,
     !c.agent_active ? h(Badge, { key: 'human', variant: 'warn', size: 'xs' }, 'Human') : null,
-    h(Badge, { key: 'state', variant: STATE_VARIANT[c.state] || 'outline', size: 'xs' }, stateLabel(c.state))
+    h(Badge, { key: 'state', variant: STATE_VARIANT[c.state] || 'outline', size: 'xs' }, stateLabel(c.state)),
+    ...convMarks(c)
   ]
 }
 
@@ -1060,10 +1197,36 @@ function SearchResults({ q, accountId, selectedId, onSelect }) {
   )
 }
 
+// List and type filters shared by the chat sidebar and the board header.
+function ListTypeFilters({ list, setList, type, setType }) {
+  return h(
+    'div',
+    { style: { ...F.col, gap: 4 } },
+    h(
+      'div',
+      { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
+      LIST_FILTERS.map(([id, label]) =>
+        h(
+          Chip,
+          { key: id, active: list === id, title: 'Show ' + label.toLowerCase(), onClick: () => setList(id) },
+          label
+        )
+      )
+    ),
+    h(
+      'div',
+      { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
+      TYPE_FILTERS.map(([id, label]) => h(Chip, { key: id, active: type === id, onClick: () => setType(id) }, label))
+    )
+  )
+}
+
 function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSelect, onNewChat }) {
   const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
   const [mode, setMode] = useState('chats')
+  const [listFilter, setListFilter] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
 
   useEffect(() => ctxRef.setTimeout(() => setQ(qInput.trim()), 250), [qInput])
 
@@ -1080,8 +1243,14 @@ function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSel
     if (mode === 'chats' && q) {
       p.q = q
     }
+    if (mode === 'chats' && listFilter) {
+      p.list = listFilter
+    }
+    if (mode === 'chats' && typeFilter) {
+      p.type = typeFilter
+    }
     return p
-  }, [accountId, stateFilter, mode, q])
+  }, [accountId, stateFilter, mode, q, listFilter, typeFilter])
 
   const filters = [['', 'All'], ['unread', 'Unread'], ...Object.keys(STATE_LABELS).map(s => [s, STATE_LABELS[s]])]
 
@@ -1129,6 +1298,9 @@ function ConvSidebar({ accountId, stateFilter, setStateFilter, selectedId, onSel
               h(Chip, { key: id, active: stateFilter === id, onClick: () => setStateFilter(id) }, label)
             )
           )
+        : null,
+      mode === 'chats'
+        ? h(ListTypeFilters, { list: listFilter, setList: setListFilter, type: typeFilter, setType: setTypeFilter })
         : null
     ),
     h(
@@ -1310,7 +1482,7 @@ function DraftCard({ m, blocked }) {
   )
 }
 
-function Message({ m, retried, onRetry, onMediaLoad }) {
+function Message({ m, retried, onRetry, onMediaLoad, sender }) {
   const out = m.direction === 'out'
   const failed = m.status === 'failed'
   const media = m.media || []
@@ -1348,6 +1520,13 @@ function Message({ m, retried, onRetry, onMediaLoad }) {
           opacity: m.source === 'history' ? 0.85 : 1
         }
       },
+      sender
+        ? h(
+            'div',
+            { title: sender.title, style: { ...F.ellipsis, fontSize: 12, fontWeight: 600, color: sender.color } },
+            sender.label
+          )
+        : null,
       media.map(item => h(MediaItem, { key: item.index, msg: m, item, auto: autoImage, onLoad: onMediaLoad })),
       m.body
         ? h(
@@ -1428,7 +1607,7 @@ function DaySeparator({ ts }) {
   )
 }
 
-function Thread({ id, optimistic, retried, blocked, onRetry }) {
+function Thread({ id, optimistic, retried, blocked, isGroup, onRetry }) {
   const latest = useApi(['messages', id], '/conversations/' + id + '/messages?limit=' + PAGE_SIZE)
   const [older, setOlder] = useState([])
   const [olderMore, setOlderMore] = useState(null)
@@ -1535,11 +1714,24 @@ function Thread({ id, optimistic, retried, blocked, onRetry }) {
 
   const items = []
   let lastDay = ''
+  let lastSender = ''
   for (const m of messages) {
     const dk = dayKey(m.ts)
     if (dk !== lastDay) {
       items.push(h(DaySeparator, { key: 'd' + dk, ts: m.ts }))
       lastDay = dk
+      lastSender = ''
+    }
+    // Group threads name the sender once per run of consecutive messages from the same person.
+    let sender = null
+    if (isGroup && m.direction === 'in') {
+      const senderKey = m.sender_jid || m.sender_name || '?'
+      if (senderKey !== lastSender) {
+        sender = { label: senderLabel(m), title: senderPhone(m), color: senderColor(senderKey) }
+      }
+      lastSender = senderKey
+    } else {
+      lastSender = ''
     }
     items.push(
       m.status === 'draft' && m.direction === 'out'
@@ -1547,6 +1739,7 @@ function Thread({ id, optimistic, retried, blocked, onRetry }) {
         : h(Message, {
             key: m.id,
             m,
+            sender,
             retried: retried.includes(m.id),
             onRetry,
             onMediaLoad
@@ -1799,6 +1992,42 @@ function ChatHeader({ data, settings, infoOpen, onToggleInfo }) {
     label: 'Mute for ' + fmtHours(hrs),
     onClick: () => act(base + '/mute', { muted_until: nowSec() + hrs * 3600 })
   }))
+  const participants = c.participants || data.participants || []
+  const setList = (list, scope) => act(base + '/list', { list, scope }, 'PUT')
+  const mark = (on, text) => (on ? '✓ ' : '') + text
+  const listItems = [
+    { key: 'h-contact', heading: true, label: 'Contact (all numbers)' },
+    ...LIST_IDS.map(id => ({
+      key: 'c-' + id,
+      label: mark(c.list === id && c.list_scope !== 'number', LIST_LABELS[id]),
+      onClick: () => setList(id, 'contact')
+    })),
+    ...(c.is_group
+      ? []
+      : [
+          { key: 'h-number', heading: true, label: 'This number only' },
+          ...LIST_IDS.map(id => ({
+            key: 'n-' + id,
+            label: mark(c.list === id && c.list_scope === 'number', LIST_LABELS[id]),
+            onClick: () => setList(id, 'number')
+          })),
+          { key: 'n-follow', label: 'Follow the contact', onClick: () => setList(null, 'number') }
+        ])
+  ]
+  const silenceItems = [
+    ...(c.silenced
+      ? [
+          { key: 'h-state', heading: true, label: silencedText(c) },
+          { key: 'unsilence', label: 'Unsilence', onClick: () => act(base + '/unsilence', {}) }
+        ]
+      : []),
+    { key: 'h-silence', heading: true, label: 'Silence notifications' },
+    ...SILENCE_PRESETS.map(([hrs, label]) => ({
+      key: 's-' + hrs,
+      label,
+      onClick: () => act(base + '/silence', { hours: hrs })
+    }))
+  ]
   return h(
     'div',
     { style: { ...F.col, gap: 6, padding: '8px 12px', borderBottom: BORDER } },
@@ -1813,7 +2042,11 @@ function ChatHeader({ data, settings, infoOpen, onToggleInfo }) {
         h(
           'div',
           { style: { ...F.row, gap: 6, ...T.muted, ...F.ellipsis } },
-          c.contact_name && c.phone ? h('span', null, fmtPhone(c.phone)) : null,
+          c.is_group
+            ? h('span', null, 'Group · ' + participants.length + ' participants')
+            : c.contact_name && c.phone
+              ? h('span', null, fmtPhone(c.phone))
+              : null,
           h(AccountDot, { account: data.account }),
           h('span', null, data.account.label)
         )
@@ -1822,12 +2055,37 @@ function ChatHeader({ data, settings, infoOpen, onToggleInfo }) {
       c.state === 'muted' && c.muted_until ? h(Badge, { variant: 'muted' }, 'until ' + fmtTime(c.muted_until)) : null,
       c.priority >= 2 ? h(Badge, { variant: 'destructive' }, 'Escalated') : null,
       !c.agent_active ? h(Badge, { variant: 'warn' }, 'Human') : null,
+      c.silenced
+        ? h(
+            Badge,
+            { variant: 'muted', title: 'No notifications for this conversation', style: { gap: 4 } },
+            h(Codicon, { name: 'bell-slash' }),
+            silencedText(c)
+          )
+        : null,
       jevInfo ? h(Badge, { variant: 'outline', title: jevScores }, jevBadge) : null,
       h(
         'div',
         { style: { ...F.row, gap: 4, flexWrap: 'wrap' } },
         h(Menu, { label: 'Move to', items: moveItems, disabled: moveItems.length === 0 }),
         h(Menu, { label: 'Mute', items: muteItems, disabled: !allowed.includes('muted') }),
+        h(Menu, {
+          label: 'List: ' + listLabel(c.list || 'unclassified'),
+          items: listItems,
+          title: 'Move this chat to a list'
+        }),
+        c.list_scope === 'number'
+          ? h(
+              Badge,
+              { variant: 'outline', size: 'xs', title: 'The list is set for this number only' },
+              'only this number'
+            )
+          : null,
+        h(Menu, {
+          label: c.silenced ? 'Silenced' : 'Silence',
+          items: silenceItems,
+          title: 'Stop notifications for this conversation'
+        }),
         c.agent_active
           ? h(Button, { size: 'xs', variant: 'secondary', onClick: () => act(base + '/takeover', {}) }, 'Take over')
           : h(
@@ -1870,6 +2128,16 @@ function ChatHeader({ data, settings, infoOpen, onToggleInfo }) {
       )
     ),
     jevError ? h('div', { style: T.warn }, 'Jev failed: ' + jevError) : null,
+    c.list === 'unclassified'
+      ? h(
+          'div',
+          { style: { ...F.row, gap: 6, flexWrap: 'wrap' } },
+          h('span', { style: T.secondary }, 'To classify:'),
+          h(Button, { size: 'xs', variant: 'secondary', onClick: () => setList('work', 'contact') }, 'Work'),
+          h(Button, { size: 'xs', variant: 'secondary', onClick: () => setList('personal', 'contact') }, 'Personal'),
+          h(Button, { size: 'xs', variant: 'outline', onClick: () => setList('ignored', 'contact') }, 'Ignore')
+        )
+      : null,
     h(TagEditor, { c })
   )
 }
@@ -1881,6 +2149,7 @@ function InfoPanel({ data, onClose }) {
   const account = data.account
   const history = data.state_history || []
   const runs = data.runs || []
+  const participants = c.participants || data.participants || []
   return h(
     'div',
     { style: { ...F.col, width: '19rem', flex: '0 0 auto', minHeight: 0, overflowY: 'auto', borderLeft: BORDER } },
@@ -1894,8 +2163,13 @@ function InfoPanel({ data, onClose }) {
       Section,
       { title: 'Contact' },
       h(KV, { label: 'Name' }, c.contact_name || '—'),
-      h(KV, { label: 'Phone' }, fmtPhone(c.phone) || '—'),
+      c.is_group ? null : h(KV, { label: 'Phone' }, fmtPhone(c.phone) || '—'),
       h(KV, { label: 'Chat id' }, c.chat_jid),
+      c.is_group ? h(KV, { label: 'Type' }, 'Group') : null,
+      c.list
+        ? h(KV, { label: 'List' }, listLabel(c.list) + (c.list_scope === 'number' ? ' (this number only)' : ''))
+        : null,
+      h(KV, { label: 'Notifications' }, c.silenced ? silencedText(c) : 'On'),
       h(
         KV,
         { label: 'Account' },
@@ -1913,6 +2187,25 @@ function InfoPanel({ data, onClose }) {
       h(KV, { label: 'Started' }, c.created_at ? fmtTime(c.created_at) : '—'),
       h(KV, { label: 'Last message' }, c.last_message_at ? fmtTime(c.last_message_at) : '—')
     ),
+    c.is_group
+      ? h(
+          Section,
+          { title: 'Participants (' + participants.length + ')' },
+          participants.length === 0 ? h('div', { style: T.muted }, 'Not loaded yet') : null,
+          participants.map(p =>
+            h(
+              'div',
+              { key: p.jid, style: { ...F.row, gap: 6, fontSize: 12 } },
+              h(
+                'span',
+                { style: { ...F.ellipsis, flex: '1 1 auto' }, title: p.phone ? '+' + p.phone : p.jid },
+                participantName(p)
+              ),
+              p.admin ? h(Badge, { variant: 'outline', size: 'xs' }, 'Admin') : null
+            )
+          )
+        )
+      : null,
     h(
       Section,
       { title: 'State history' },
@@ -2037,7 +2330,14 @@ function ChatPane({ id, infoOpen, onToggleInfo, onCloseInfo }) {
       detail.error
         ? h('div', { style: { ...T.warn, padding: '4px 12px' } }, 'Data may be stale: ' + errorText(detail.error))
         : null,
-      h(Thread, { id, optimistic, retried, blocked, onRetry: retry }),
+      h(Thread, {
+        id,
+        optimistic,
+        retried,
+        blocked,
+        isGroup: Boolean(detail.data.conversation.is_group),
+        onRetry: retry
+      }),
       h(Composer, { key: id, id, blocked, maxMb, onSend: sendText, onSendMedia: sendMedia, onDraft: saveDraft })
     ),
     infoOpen ? h(InfoPanel, { data: detail.data, onClose: onCloseInfo }) : null
@@ -2092,7 +2392,8 @@ function BoardCard({ card, onOpen }) {
       card.priority >= 2 ? h(Badge, { variant: 'destructive', size: 'xs' }, 'Escalated') : null,
       !card.agent_active ? h(Badge, { variant: 'warn', size: 'xs' }, 'Human') : null,
       card.state === 'muted' && card.muted_until ? h('span', null, 'until ' + fmtTime(card.muted_until)) : null,
-      (card.tags || []).map(t => h(Badge, { key: t, variant: 'muted', size: 'xs' }, t))
+      (card.tags || []).map(t => h(Badge, { key: t, variant: 'muted', size: 'xs' }, t)),
+      convMarks(card)
     )
   )
 }
@@ -2148,6 +2449,8 @@ function BoardView({ accountId, onOpen }) {
   const [qInput, setQInput] = useState('')
   const [q, setQ] = useState('')
   const settings = useApi('settings', '/settings')
+  const [listFilter, setListFilter] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
 
   useEffect(() => ctxRef.setTimeout(() => setQ(qInput.trim()), 250), [qInput])
 
@@ -2157,6 +2460,12 @@ function BoardView({ accountId, onOpen }) {
   }
   if (q) {
     qs.set('q', q)
+  }
+  if (listFilter) {
+    qs.set('list', listFilter)
+  }
+  if (typeFilter) {
+    qs.set('type', typeFilter)
   }
   const board = useApi('board', '/board?' + qs)
   const dropHours = (settings.data && settings.data.board && settings.data.board.drop_mute_hours) || 24
@@ -2191,6 +2500,7 @@ function BoardView({ accountId, onOpen }) {
       ),
       h('span', { style: T.muted }, 'Dropping a card on Muted snoozes it for ' + fmtHours(dropHours))
     ),
+    h(ListTypeFilters, { list: listFilter, setList: setListFilter, type: typeFilter, setType: setTypeFilter }),
     gate(board, data =>
       h(
         'div',
@@ -2657,6 +2967,23 @@ function notifyConv(title, e, body) {
   })
 }
 
+// Silenced and Ignored conversations raise no notifications. Event payloads carry `silenced` and `list`;
+// when they are missing (older rows, other event types) the conversation is fetched.
+async function isQuiet(e, payload) {
+  let silenced = payload.silenced
+  let list = payload.list
+  if (typeof silenced !== 'boolean' || typeof list !== 'string') {
+    try {
+      const d = await ctxRef.rest('/conversations/' + e.conversation_id)
+      silenced = Boolean(d.conversation.silenced)
+      list = d.conversation.list
+    } catch {
+      return false
+    }
+  }
+  return silenced || list === 'ignored'
+}
+
 async function notifyEvents(events) {
   if (events.some(e => e.type === 'settings.updated')) {
     settingsCache = null
@@ -2678,14 +3005,14 @@ async function notifyEvents(events) {
       continue
     }
     const payload = parsePayload(e.payload)
-    const who = e.contact_name || 'Unknown contact'
+    const who = e.contact_name || (payload.is_group ? 'Group' : 'Unknown contact')
     if (e.type === 'conversation.created') {
       created.add(e.conversation_id)
-      if (n.new_conversation) {
+      if (n.new_conversation && !(await isQuiet(e, payload))) {
         notifyConv('New conversation', e, who)
       }
     } else if (e.type === 'message.in') {
-      if (n.every_inbound && !created.has(e.conversation_id)) {
+      if (n.every_inbound && !created.has(e.conversation_id) && !(await isQuiet(e, payload))) {
         notifyConv(who, e, payload.preview || payload.body || payload.text || 'New message')
       }
     } else if (e.type === 'conversation.updated' && n.escalation) {
@@ -2702,7 +3029,7 @@ async function notifyEvents(events) {
           escalated = false
         }
       }
-      if (escalated) {
+      if (escalated && !(await isQuiet(e, payload))) {
         notifyConv('Escalated: ' + who, e, 'This conversation needs a human')
       }
     }
@@ -3556,11 +3883,15 @@ function SettingsAccountForm({ initial, isNew, busy, error, onSubmit, onCancel }
   const [color, setColor] = useState(initial.color || 'blue')
   const [history, setHistory] = useState(initial.history_mode || 'recent')
   const [profile, setProfile] = useState(initial.hermes_profile || '')
+  const [newContactList, setNewContactList] = useState(initial.new_contact_list || 'unclassified')
+  const [newGroupList, setNewGroupList] = useState(initial.new_group_list || 'unclassified')
   const hist = SETTINGS_HISTORY_MODES.find(h => h[0] === history)
   const submit = () => {
     const out = { label: label.trim(), color, history_mode: history }
     if (!isNew) {
       out.hermes_profile = profile.trim() || null
+      out.new_contact_list = newContactList
+      out.new_group_list = newGroupList
     }
     onSubmit(out)
   }
@@ -3588,6 +3919,30 @@ function SettingsAccountForm({ initial, isNew, busy, error, onSubmit, onCancel }
           hint: 'Profile used for this number. Leave empty for the default profile.',
           children: jsx(Input, { value: profile, onChange: e => setProfile(e.target.value), placeholder: 'default' })
         }),
+    isNew
+      ? null
+      : set_h(
+          'div',
+          { className: 'grid grid-cols-2 gap-3' },
+          jsx(SettingsField, {
+            label: 'New contacts go to',
+            hint: 'List for people who write to this number for the first time.',
+            children: jsx(SettingsSelect, {
+              value: newContactList,
+              onChange: setNewContactList,
+              options: LIST_IDS.map(id => [id, LIST_LABELS[id]])
+            })
+          }),
+          jsx(SettingsField, {
+            label: 'New groups go to',
+            hint: 'List for groups this number is added to.',
+            children: jsx(SettingsSelect, {
+              value: newGroupList,
+              onChange: setNewGroupList,
+              options: LIST_IDS.map(id => [id, LIST_LABELS[id]])
+            })
+          })
+        ),
     error ? set_h('div', { className: 'text-xs', style: set_errorBox }, error) : null,
     set_h(
       'div',

@@ -279,7 +279,7 @@ def test_health_reports_db_count_and_schema_version(client, db, account):
     body = client.get(f"{PREFIX}/health").json()
     assert body["ok"] is True
     assert body["conversations"] == 2
-    assert body["schema_version"] == 5
+    assert body["schema_version"] == 6
     assert body["db"].endswith("wa_board.db")
 
 
@@ -505,15 +505,15 @@ def test_service_info_reports_installed_flags_and_node(client, svc):
 
 
 def test_health_and_service_report_api_version(client, core):
-    assert core.service.API_VERSION == 9
-    assert client.get(f"{PREFIX}/health").json()["api_version"] == 9
-    assert client.get(f"{PREFIX}/service").json()["api_version"] == 9
+    assert core.service.API_VERSION == 10
+    assert client.get(f"{PREFIX}/health").json()["api_version"] == 10
+    assert client.get(f"{PREFIX}/service").json()["api_version"] == 10
 
 
 def test_health_reports_api_version_even_when_db_is_unopenable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("WA_ARCHIVE_DB", str(tmp_path))
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["api_version"]) == (False, 9)
+    assert (body["ok"], body["api_version"]) == (False, 10)
 
 
 def _installed_with_heartbeat(client, core, db, svc, *, heartbeat_age):
@@ -1136,7 +1136,7 @@ def test_v1_db_migrates_keeping_conversations_and_creating_accounts(client, core
     assert detail["state_history"][0]["to_state"] == "new"
     conn = core.db.connect()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         assert conn.execute("SELECT last_inbound_at FROM conversations WHERE chat_jid = ?", (CONTACT_JID,)).fetchone()[0] == NOW - 100
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert not any(t.startswith("v1_") for t in tables)
@@ -1477,13 +1477,13 @@ def test_first_inbound_creates_new_conversation_with_audit_and_events(core, db, 
     assert event_payloads(db, "conversation.state_changed")[0]["from"] is None
 
 
-def test_inbound_dedups_per_account_and_ignores_groups(core, db, account):
+def test_inbound_dedups_per_account_and_still_drops_broadcast_and_status_chats(core, db, account):
     other = add_account(core, db, "Second")
     first = core.ingest.ingest_event(db, account, wa_event(), NOW)
     assert first is not None
     assert core.ingest.ingest_event(db, account, wa_event(), NOW) is None
-    assert core.ingest.ingest_event(db, account, wa_event(messageId="G1", isGroup=True), NOW) is None
-    assert core.ingest.ingest_event(db, account, wa_event(messageId="G2", chatId="123-456@g.us", senderId="x@lid"), NOW) is None
+    for jid in ("status@broadcast", "12345@broadcast", "1203@newsletter", "0@s.whatsapp.net"):
+        assert core.ingest.ingest_event(db, account, wa_event(messageId="X" + jid, chatId=jid, senderId="x@lid"), NOW) is None
     # the same wa_id on another number is a different message, and a different conversation
     assert core.ingest.ingest_event(db, other, wa_event(), NOW) is not None
     assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
@@ -2272,7 +2272,9 @@ def test_seeded_400_conversations_board_is_bounded_and_fast(client, db, seed_mod
     assert sorted(timings)[18] < 0.3
 
     start = time.perf_counter()
-    assert client.get(f"{PREFIX}/conversations", params={"limit": 50}).json()["total"] == 400
+    # the demo has one Ignored chat: hidden from the default list, present with list=all
+    assert client.get(f"{PREFIX}/conversations", params={"limit": 50}).json()["total"] == 399
+    assert client.get(f"{PREFIX}/conversations", params={"limit": 50, "list": "all"}).json()["total"] == 400
     assert time.perf_counter() - start < 0.3
 
     with pytest.raises(ValueError):
@@ -2353,7 +2355,7 @@ def test_v2_db_migrates_to_v5_keeping_rows_and_marking_old_inbound_read(client, 
     raw.close()
 
     body = client.get(f"{PREFIX}/health").json()
-    assert (body["ok"], body["schema_version"], body["conversations"]) == (True, 5, 1)
+    assert (body["ok"], body["schema_version"], body["conversations"]) == (True, 6, 1)
 
     conn = core.db.connect()
     try:

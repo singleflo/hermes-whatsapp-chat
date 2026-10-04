@@ -247,8 +247,8 @@ def enqueue_for_event(
     if not auto["enabled"]:
         return []
     conv = _conversation(conn, conversation_id)
-    if conv is None:
-        return []
+    if conv is None or conv.get("is_group"):
+        return []  # groups never trigger automations until the group phase
     msg = None
     if message_id is not None:
         msg = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()

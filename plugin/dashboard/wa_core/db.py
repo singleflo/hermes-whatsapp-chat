@@ -1,4 +1,4 @@
-"""Paths, schema v4, v1/v2/v3 -> v4 migrations, connection helpers."""
+"""Paths, schema v6, v1/v2/v3/v4/v5 -> v6 migrations, connection helpers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 PLUGIN_ID = "hermes-whatsapp-chat"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEMO_SUFFIX = "@demo.invalid"
 
 SCHEMA = """
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   history_mode TEXT NOT NULL DEFAULT 'recent' CHECK (history_mode IN ('off','recent','full')),
   hermes_profile TEXT, restart_requested_at INTEGER,
   delete_conversations INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL, updated_at INTEGER);
+  created_at INTEGER NOT NULL, updated_at INTEGER,
+  new_contact_list TEXT NOT NULL DEFAULT 'unclassified', new_group_list TEXT NOT NULL DEFAULT 'unclassified');
 CREATE TABLE IF NOT EXISTS account_status (
   account_id INTEGER PRIMARY KEY, state TEXT NOT NULL,
   qr TEXT, qr_svg TEXT, qr_at INTEGER, error TEXT, pid INTEGER,
@@ -43,6 +44,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_message_at INTEGER, last_inbound_at INTEGER,
   unread_count INTEGER NOT NULL DEFAULT 0, agent_active INTEGER NOT NULL DEFAULT 1,
   tags TEXT NOT NULL DEFAULT '[]', created_at INTEGER, updated_at INTEGER, classification TEXT,
+  is_group INTEGER NOT NULL DEFAULT 0, list_override TEXT, silenced_until INTEGER, participants TEXT,
+  group_refreshed_at INTEGER,
   UNIQUE (account_id, chat_jid));
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
@@ -52,7 +55,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ('received','pending','sent','delivered','read','played','failed','draft','discarded')),
   source TEXT NOT NULL DEFAULT 'live' CHECK (source IN ('live','history')),
   meta TEXT, error TEXT, rule_id INTEGER,
-  delivered_at INTEGER, read_at INTEGER, remote_jid TEXT);
+  delivered_at INTEGER, read_at INTEGER, remote_jid TEXT, sender_jid TEXT, sender_name TEXT, participant TEXT);
 CREATE TABLE IF NOT EXISTS conversation_state_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
   from_state TEXT, to_state TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, at INTEGER NOT NULL);
@@ -78,6 +81,10 @@ CREATE TABLE IF NOT EXISTS jev_runs (
   attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER, error TEXT, model TEXT,
   latency_ms INTEGER, input_tokens INTEGER,
   created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
+CREATE TABLE IF NOT EXISTS contact_lists (
+  jid TEXT PRIMARY KEY,
+  list TEXT NOT NULL CHECK (list IN ('admin','work','personal','unclassified','ignored')),
+  updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conversation_id, ts, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(account_id, wa_id) WHERE wa_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_state ON conversations(state);
@@ -173,15 +180,21 @@ def _upgrade(conn: sqlite3.Connection) -> None:
             return
         if _is_v1(conn):
             _migrate_v1(conn, int(time.time()))
+            _migrate_v5(conn)
         elif version == 2:
             _migrate_v2(conn)
             _migrate_v3(conn)
             _migrate_v4(conn)
+            _migrate_v5(conn)
         elif version == 3:
             _migrate_v3(conn)
             _migrate_v4(conn)
+            _migrate_v5(conn)
         elif version == 4:
             _migrate_v4(conn)
+            _migrate_v5(conn)
+        elif version == 5:
+            _migrate_v5(conn)
         else:
             for stmt in _statements():
                 conn.execute(stmt)
@@ -194,6 +207,48 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE conversations ADD COLUMN classification TEXT")
     for stmt in _statements():
         conn.execute(stmt)
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    """v5 -> v6: groups as conversations, contact lists, silence, per-message sender, per-number list defaults.
+
+    Idempotent (it also finishes a v1 migration): every existing conversation's chat JID starts in ``unclassified``.
+    """
+    _add_columns(
+        conn,
+        "conversations",
+        {
+            "is_group": "INTEGER NOT NULL DEFAULT 0",
+            "list_override": "TEXT",
+            "silenced_until": "INTEGER",
+            "participants": "TEXT",
+            "group_refreshed_at": "INTEGER",
+        },
+    )
+    _add_columns(conn, "messages", {"sender_jid": "TEXT", "sender_name": "TEXT", "participant": "TEXT"})
+    _add_columns(
+        conn,
+        "accounts",
+        {
+            "new_contact_list": "TEXT NOT NULL DEFAULT 'unclassified'",
+            "new_group_list": "TEXT NOT NULL DEFAULT 'unclassified'",
+        },
+    )
+    for stmt in _statements():
+        conn.execute(stmt)
+    conn.execute("UPDATE conversations SET is_group = 1 WHERE chat_jid LIKE '%@g.us'")
+    conn.execute(
+        "INSERT OR IGNORE INTO contact_lists (jid, list, updated_at)"
+        " SELECT DISTINCT chat_jid, 'unclassified', ? FROM conversations",
+        (int(time.time()),),
+    )
 
 
 def _migrate_v4(conn: sqlite3.Connection) -> None:

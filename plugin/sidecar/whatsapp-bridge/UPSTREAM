@@ -1,10 +1,10 @@
 repo: NousResearch/hermes-agent
 path: scripts/whatsapp-bridge
 commit: 4e3fcd5cd7e40c37cb6f9a21a76fc57a7361957a
-date: 2026-10-03
+date: 2026-10-04
 files: allowlist.js bridge.js bridge_helpers.js outbound_ids.js owner_message_gate.js package.json package-lock.json
 license: LICENSE
-patches: 0001-history-sync.patch 0002-receipts-contacts.patch 0003-check-numbers.patch
+patches: 0001-history-sync.patch 0002-receipts-contacts.patch 0003-check-numbers.patch 0004-groups.patch
 
 The files above are copied verbatim from the upstream commit, then the patches
 in ../patches/ are applied in order (patch -p1 from the plugin directory).

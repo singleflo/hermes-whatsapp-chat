@@ -3,4 +3,4 @@
 Loaded by path from ``plugin_api.py`` (see ``_load_core``); modules use relative imports only.
 """
 
-from . import errors, db, settings, service, accounts, bridge, events, conversations, contacts, outbound, newchat, ingest, media, automations, automations_api, jev, jev_rules, jev_api  # noqa: E402,F401
+from . import errors, db, settings, service, lists, groups, accounts, bridge, events, conversations, contacts, outbound, newchat, ingest, media, automations, automations_api, jev, jev_rules, jev_api  # noqa: E402,F401

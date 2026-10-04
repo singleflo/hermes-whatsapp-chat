@@ -15,7 +15,7 @@ from typing import Any
 from . import accounts, db, events
 
 SYSTEM_JIDS = frozenset({"0@s.whatsapp.net", "status@broadcast"})
-_IGNORED_SUFFIXES = ("@broadcast", "@newsletter", "@g.us")
+_IGNORED_SUFFIXES = ("@broadcast", "@newsletter")
 _PHONE_SUFFIX = "@s.whatsapp.net"
 _DIGITS = re.compile(r"[0-9]+")
 
@@ -32,7 +32,7 @@ def own_number(account: Any) -> str | None:
 
 
 def is_ignored_jid(jid: str, own: str | None) -> bool:
-    """System, broadcast, newsletter, group chats and the account's own "Message yourself" chat."""
+    """System, broadcast, newsletter chats and the account's own "Message yourself" chat (groups are kept)."""
     return (
         jid in SYSTEM_JIDS
         or jid.endswith(_IGNORED_SUFFIXES)
@@ -86,7 +86,7 @@ def apply_contact(conn: sqlite3.Connection, account_id: int, item: dict, now: in
     with db.write_txn(conn):
         rows = conn.execute(
             f"SELECT id FROM conversations WHERE account_id = ? AND chat_jid IN ({marks})"
-            " AND (contact_name IS NULL OR contact_name = '')",
+            " AND is_group = 0 AND (contact_name IS NULL OR contact_name = '')",
             (account_id, *sorted(candidates)),
         ).fetchall()
         for row in rows:
@@ -113,6 +113,17 @@ def delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
     conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
 
 
+def _move_list(conn: sqlite3.Connection, old: str, new: str, now: int) -> None:
+    """The list of a LID JID follows the conversation to its phone JID (an existing phone JID row wins)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO contact_lists (jid, list, updated_at)"
+        " SELECT ?, list, ? FROM contact_lists WHERE jid = ?",
+        (new, now, old),
+    )
+    if conn.execute("SELECT 1 FROM conversations WHERE chat_jid = ? LIMIT 1", (old,)).fetchone() is None:
+        conn.execute("DELETE FROM contact_lists WHERE jid = ?", (old,))
+
+
 def _max_nullable(a: int | None, b: int | None) -> int | None:
     values = [v for v in (a, b) if v is not None]
     return max(values) if values else None
@@ -137,6 +148,7 @@ def _rename(conn: sqlite3.Connection, row: sqlite3.Row, target: str, now: int) -
         "UPDATE conversations SET chat_jid = ?, phone = ?, updated_at = ? WHERE id = ?",
         (target, target.split("@", 1)[0], now, row["id"]),
     )
+    _move_list(conn, row["chat_jid"], target, now)
     events.emit(
         conn,
         "conversation.updated",
@@ -169,6 +181,7 @@ def _merge(conn: sqlite3.Connection, src: sqlite3.Row, dst: sqlite3.Row, now: in
         ),
     )
     conn.execute("DELETE FROM conversations WHERE id = ?", (src["id"],))
+    _move_list(conn, src["chat_jid"], dst["chat_jid"], now)
     events.emit(
         conn,
         "conversation.updated",
@@ -194,7 +207,7 @@ def repair_lid_conversations(conn: sqlite3.Connection, account_id: int, now: int
     candidates = conn.execute(
         "SELECT id FROM conversations WHERE account_id = ? AND (chat_jid LIKE '%@lid'"
         " OR chat_jid IN ('0@s.whatsapp.net','status@broadcast') OR chat_jid LIKE '%@broadcast'"
-        " OR chat_jid LIKE '%@newsletter' OR chat_jid LIKE '%@g.us' OR chat_jid = ?) ORDER BY id",
+        " OR chat_jid LIKE '%@newsletter' OR chat_jid = ?) ORDER BY id",
         (account_id, own_jid),
     ).fetchall()
     done = 0

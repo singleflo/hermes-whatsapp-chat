@@ -3,7 +3,7 @@
 A [Hermes](https://hermes-agent.nousresearch.com) plugin that turns WhatsApp into a real chat inbox inside the Hermes desktop app and web dashboard, and lets Hermes agents work the inbox with you.
 
 - **Multi-number chat.** Link several WhatsApp numbers by scanning a QR code from the plugin itself. Each number has its own session, label and color. Conversations are stored per number: the same contact on two numbers is two conversations.
-- **Chats + Kanban board.** A full chat UI (thread, media, reply, drafts, search) and a board of conversation states: New, In progress, Waiting, Muted, Closed.
+- **Chats + Kanban board.** A full chat UI (thread, media, reply, drafts, search) and a board of conversation states: New, In progress, Waiting, Muted, Closed. WhatsApp groups are conversations too, and every contact or group sits in a list (Admin, Work, Personal, To classify, Ignored).
 - **Independent WhatsApp channel.** A small background service (LaunchAgent on macOS, systemd user unit on Linux, sign-in launcher on Windows) runs one vendored [Baileys](https://github.com/WhiskeySockets/Baileys) bridge per number. It has nothing to do with Hermes' native WhatsApp gateway, so you can keep a dedicated number (or several) for this inbox.
 - **Automations / dispatcher.** Rules react to inbound or outbound messages and conversation events, and dispatch to a Hermes agent or profile, a webhook, a script, or a built-in action. Agent replies can be saved as drafts for you to approve, sent immediately, or kept only in the run log.
 - **CLI + Hermes skill.** `plugin/scripts/wa.py` and the bundled `whatsapp-chat` skill let any Hermes agent list, read, draft, send, tag and re-state conversations. Everything shows up live in the UI.
@@ -99,6 +99,13 @@ Five columns, one card per conversation: New, In progress, Waiting, Muted, Close
 
 Conversations created by history import start Closed, and history messages never trigger rules, unread counters, notifications or automations.
 
+### Groups, lists and silence
+
+- **Groups.** WhatsApp groups appear as conversations (marked "Group"); the group history is imported like any other chat, and your own messages typed on the phone show up too. Each incoming message shows who wrote it, and the group's name and participants are read from WhatsApp in the background. You can reply in a group like in any chat. Automations and Jev do not run on groups yet.
+- **Lists.** Every contact and group is in one of five lists: **Admin**, **Work**, **Personal**, **To classify** (where everything new starts) and **Ignored**. The list belongs to the person or group, so it is the same on all your numbers; a single conversation can override it for one number only. In Settings → Numbers, each number chooses which list new contacts and new groups go to. **Ignored** conversations are hidden from the chat list and the board unless you filter for them, and never notify. Lists do not change what Jev or agents do yet.
+- **Silence.** Silence a conversation for 8 hours, a day, a week or forever: it stops notifications only, whatever its state or list.
+- **Filters.** The chat list and the board filter by list (default: every list except Ignored) and by type (All, Direct, Groups). Over the API: `list=<id>|all` and `type=group|direct` on `GET /conversations` and `GET /board`.
+
 ### Automations
 
 An automation rule has an optional number filter, event types, conditions, an action, a reply mode and a "stop after match" flag. Rules run in order.
@@ -134,13 +141,15 @@ Optional. You write your rules in plain words, like a `USER.md`: which situation
 ## CLI for Hermes (and you)
 
 ```bash
-~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa list [--state S] [--account ID] [--unread] [--json]
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa list [--state S] [--account ID] [--unread] [--list LIST|all] [--groups|--direct] [--json]
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa show ID [--limit N] [--json]
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa draft ID TEXT          # for a human to review (preferred)
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa send ID TEXT           # real WhatsApp message
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa state ID STATE [--reason R]
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa tag ID +vip -spam
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa takeover ID            # also: handback ID
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa set-list ID LIST [--this-number]   # admin work personal unclassified ignored (default: the contact on every number)
+~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa silence ID [--hours N]  # no notifications (default: forever); also: unsilence ID
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa search QUERY [--account ID]
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa check PHONE [PHONE ...] [--account ID|LABEL]   # is it on WhatsApp? exit 0 yes, 2 not on WhatsApp
 ~/.hermes/plugin-data/hermes-whatsapp-chat/bin/wa draft-to PHONE TEXT [--account ID|LABEL] [--name NAME]   # first message as a draft (preferred)
@@ -205,7 +214,7 @@ An existing v1 database (single number, `wa-session`) is migrated automatically 
 
 ## Updating the vendored bridge
 
-`plugin/sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `plugin/sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`; `0002-receipts-contacts.patch`, delivery receipts and contact names; `0003-check-numbers.patch`, `POST /check` to ask WhatsApp whether numbers exist). This is maintainer work, done in a clone of this repository. To refresh it from a Hermes checkout:
+`plugin/sidecar/whatsapp-bridge/` is a copy of Hermes' bridge (`scripts/whatsapp-bridge` in `NousResearch/hermes-agent`) plus our own versioned patches in `plugin/sidecar/patches/` (currently `0001-history-sync.patch`, which adds history import and `GET /history`; `0002-receipts-contacts.patch`, delivery receipts and contact names; `0003-check-numbers.patch`, `POST /check` to ask WhatsApp whether numbers exist; `0004-groups.patch`, groups: your own messages in groups, the sender (`participant`) on every event, group history, and the participant list of `GET /chat/:id`). The service starts each bridge with `WHATSAPP_GROUP_POLICY=open` and refreshes group names and participants in the background (at most 3 groups at a time, each group every 6 hours). This is maintainer work, done in a clone of this repository. To refresh it from a Hermes checkout:
 
 ```bash
 plugin/sidecar/update_bridge.sh [HERMES_CHECKOUT]     # default ~/.hermes/hermes-agent
@@ -236,7 +245,7 @@ cd hermes-whatsapp-chat
 uv sync --python 3.11                                   # FastAPI, pydantic, pytest, ruff, ty
 npm ci --prefix plugin/sidecar/whatsapp-bridge          # the bridge's Node deps (the installed service does this itself)
 
-uv run pytest -q                                        # tests/test_plugin_api.py, test_automations.py, test_jev.py, test_jev_rules.py
+uv run pytest -q                                        # tests/test_plugin_api.py, test_automations.py, test_jev.py, test_jev_rules.py, test_newchat.py, test_groups_lists.py, test_sidecar_groups.py
 uv run ruff check . && uv run ty check plugin tests
 pnpm lint && pnpm format:check                          # JS halves (hand-written, no build step)
 uv run python plugin/scripts/seed_demo.py --reset       # demo conversations (@demo.invalid; --remove to delete)

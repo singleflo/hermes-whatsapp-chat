@@ -107,6 +107,8 @@ class AccountPatch(BaseModel):
     color: str | None = None
     history_mode: str | None = None
     hermes_profile: str | None = None
+    new_contact_list: str | None = None
+    new_group_list: str | None = None
 
 
 class StateBody(BaseModel):
@@ -122,6 +124,15 @@ class MuteBody(BaseModel):
 
 class EscalateBody(BaseModel):
     escalated: bool
+
+
+class ListBody(BaseModel):
+    list: str | None = None
+    scope: Literal["contact", "number"] = "contact"
+
+
+class SilenceBody(BaseModel):
+    hours: int | None = None
 
 
 class TagsBody(BaseModel):
@@ -283,13 +294,28 @@ def put_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 # --- Board, list, detail, messages, search -------------------------------------------
 
 
+@router.get("/lists")
+def get_lists() -> list[dict[str, str]]:
+    return core.lists.catalog()
+
+
 @router.get("/board")
 def get_board(
-    account_id: int | None = Query(None), q: str = Query(""), include_closed: bool = Query(False)
+    account_id: int | None = Query(None),
+    q: str = Query(""),
+    include_closed: bool = Query(False),
+    list_id: str | None = Query(None, alias="list"),
+    kind: str | None = Query(None, alias="type"),
 ) -> dict[str, Any]:
     with _session("board read failed") as conn:
         return core.conversations.get_board(
-            conn, account_id=account_id, q=q, include_closed=include_closed, now=_now()
+            conn,
+            account_id=account_id,
+            q=q,
+            include_closed=include_closed,
+            list_id=list_id,
+            kind=kind,
+            now=_now(),
         )
 
 
@@ -299,6 +325,8 @@ def list_conversations(
     state: str | None = Query(None),
     q: str = Query(""),
     unread_only: bool = Query(False),
+    list_id: str | None = Query(None, alias="list"),
+    kind: str | None = Query(None, alias="type"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -309,6 +337,8 @@ def list_conversations(
             state=state,
             q=q,
             unread_only=unread_only,
+            list_id=list_id,
+            kind=kind,
             limit=limit,
             offset=offset,
             now=_now(),
@@ -394,6 +424,28 @@ def mark_read(conversation_id: int) -> dict[str, Any]:
 def set_tags(conversation_id: int, payload: TagsBody) -> dict[str, Any]:
     with _session("tag update failed") as conn:
         return core.conversations.set_tags(conn, conversation_id, payload.tags, now=_now())
+
+
+@router.put("/conversations/{conversation_id}/list")
+def set_list(conversation_id: int, payload: ListBody) -> dict[str, Any]:
+    with _session("list change failed") as conn:
+        core.lists.set_list(conn, conversation_id, payload.list, payload.scope, now=_now(), actor="user")
+        return core.conversations.get_conversation(conn, conversation_id, now=_now())
+
+
+@router.post("/conversations/{conversation_id}/silence")
+def silence(conversation_id: int, payload: SilenceBody | None = None) -> dict[str, Any]:
+    with _session("silence failed") as conn:
+        hours = payload.hours if payload is not None else None
+        core.lists.silence(conn, conversation_id, hours, now=_now())
+        return core.conversations.get_conversation(conn, conversation_id, now=_now())
+
+
+@router.post("/conversations/{conversation_id}/unsilence")
+def unsilence(conversation_id: int) -> dict[str, Any]:
+    with _session("unsilence failed") as conn:
+        core.lists.unsilence(conn, conversation_id, now=_now())
+        return core.conversations.get_conversation(conn, conversation_id, now=_now())
 
 
 # --- Outbound ------------------------------------------------------------------------

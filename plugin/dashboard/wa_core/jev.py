@@ -249,6 +249,9 @@ def enqueue_for_message(conn, *, conversation_id: int, message_id: int, now: int
     msg = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if msg is None or msg["source"] != "live" or msg["direction"] != "in" or not (msg["body"] or "").strip():
         return None
+    conv_row = conn.execute("SELECT is_group FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    if conv_row is None or conv_row["is_group"]:
+        return None  # groups never reach Jev until the group phase
     if msg["conversation_id"] != conversation_id:
         return None
     meta = db.jloads(msg["meta"], {}) if msg["meta"] else {}
