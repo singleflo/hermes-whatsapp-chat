@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -98,11 +99,32 @@ CREATE INDEX IF NOT EXISTS idx_messages_drafts ON messages(conversation_id) WHER
 """
 
 _V1_TABLES = ("conversations", "messages", "conversation_state_log")
-_V1_INDEXES = ("idx_messages_chat_ts", "idx_messages_wa_id", "idx_conversations_state", "idx_state_log_chat")
-_V2_MESSAGE_INDEXES = ("idx_messages_conv_ts", "idx_messages_wa_id", "idx_messages_drafts")
+_V1_INDEXES = (
+    "idx_messages_chat_ts",
+    "idx_messages_wa_id",
+    "idx_conversations_state",
+    "idx_state_log_chat",
+)
+_V2_MESSAGE_INDEXES = (
+    "idx_messages_conv_ts",
+    "idx_messages_wa_id",
+    "idx_messages_drafts",
+)
 
 
 # --- Paths ---------------------------------------------------------------------
+
+
+def hermes_home(platform: str | None = None) -> Path:
+    """``HERMES_HOME``, else Hermes' platform default: ``%LOCALAPPDATA%\\hermes`` on Windows, ``~/.hermes``
+    elsewhere (mirrors ``hermes_constants``; ``platform`` defaults to ``sys.platform``)."""
+    configured = os.environ.get("HERMES_HOME")
+    if configured:
+        return Path(configured)
+    if (platform or sys.platform) == "win32":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        return (Path(local) if local else Path.home() / "AppData" / "Local") / "hermes"
+    return Path.home() / ".hermes"
 
 
 def data_dir() -> Path:
@@ -113,7 +135,7 @@ def data_dir() -> Path:
         return Path(plugin_data_dir(PLUGIN_ID))
     except ImportError:
         # Dev venv, sidecar, seed script: same layout, computed locally.
-        root = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "plugin-data" / PLUGIN_ID
+        root = hermes_home() / "plugin-data" / PLUGIN_ID
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -151,7 +173,11 @@ def write_txn(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _statements() -> list[str]:
-    return [s.strip() for s in SCHEMA.split(";") if s.strip() and not s.strip().startswith("PRAGMA")]
+    return [
+        s.strip()
+        for s in SCHEMA.split(";")
+        if s.strip() and not s.strip().startswith("PRAGMA")
+    ]
 
 
 def _is_v1(conn: sqlite3.Connection) -> bool:
@@ -203,7 +229,9 @@ def _upgrade(conn: sqlite3.Connection) -> None:
 
 def _migrate_v3(conn: sqlite3.Connection) -> None:
     """v3 -> v4: ``conversations.classification`` and the ``jev_runs`` table."""
-    if "classification" not in [r[1] for r in conn.execute("PRAGMA table_info(conversations)")]:
+    if "classification" not in [
+        r[1] for r in conn.execute("PRAGMA table_info(conversations)")
+    ]:
         conn.execute("ALTER TABLE conversations ADD COLUMN classification TEXT")
     for stmt in _statements():
         conn.execute(stmt)
@@ -232,7 +260,11 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
             "group_refreshed_at": "INTEGER",
         },
     )
-    _add_columns(conn, "messages", {"sender_jid": "TEXT", "sender_name": "TEXT", "participant": "TEXT"})
+    _add_columns(
+        conn,
+        "messages",
+        {"sender_jid": "TEXT", "sender_name": "TEXT", "participant": "TEXT"},
+    )
     _add_columns(
         conn,
         "accounts",
@@ -253,7 +285,9 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
 
 def _migrate_v4(conn: sqlite3.Connection) -> None:
     """v4 -> v5: ``automation_rules.managed_by`` (NULL = user rule, ``'jev'`` = generated from the Jev rules)."""
-    if "managed_by" not in [r[1] for r in conn.execute("PRAGMA table_info(automation_rules)")]:
+    if "managed_by" not in [
+        r[1] for r in conn.execute("PRAGMA table_info(automation_rules)")
+    ]:
         conn.execute("ALTER TABLE automation_rules ADD COLUMN managed_by TEXT")
 
 
@@ -285,8 +319,12 @@ def _migrate_v1(conn: sqlite3.Connection, now: int) -> None:
         conn.execute(stmt)
 
     pattern = f"%{DEMO_SUFFIX}"
-    has_real = conn.execute("SELECT 1 FROM v1_conversations WHERE chat_jid NOT LIKE ? LIMIT 1", (pattern,)).fetchone()
-    has_demo = conn.execute("SELECT 1 FROM v1_conversations WHERE chat_jid LIKE ? LIMIT 1", (pattern,)).fetchone()
+    has_real = conn.execute(
+        "SELECT 1 FROM v1_conversations WHERE chat_jid NOT LIKE ? LIMIT 1", (pattern,)
+    ).fetchone()
+    has_demo = conn.execute(
+        "SELECT 1 FROM v1_conversations WHERE chat_jid LIKE ? LIMIT 1", (pattern,)
+    ).fetchone()
     main_id = demo_id = None
     if has_real or (data_dir() / "wa-session" / "creds.json").exists():
         main_id = conn.execute(
@@ -325,11 +363,19 @@ def _migrate_v1(conn: sqlite3.Connection, now: int) -> None:
         " SELECT l.id, c.id, l.from_state, l.to_state, l.actor, l.reason, l.at"
         " FROM v1_conversation_state_log l JOIN conversations c ON c.chat_jid = l.chat_jid"
     )
-    for row in conn.execute("SELECT id, meta FROM messages WHERE meta IS NOT NULL").fetchall():
+    for row in conn.execute(
+        "SELECT id, meta FROM messages WHERE meta IS NOT NULL"
+    ).fetchall():
         meta = jloads(row["meta"], None)
         if not isinstance(meta, dict) or "mediaUrls" not in meta:
             continue
-        new_meta = {"mediaType": meta.get("mediaType"), "media": media.media_entries(meta.get("mediaUrls"))}
-        conn.execute("UPDATE messages SET meta = ? WHERE id = ?", (json.dumps(new_meta), row["id"]))
+        new_meta = {
+            "mediaType": meta.get("mediaType"),
+            "media": media.media_entries(meta.get("mediaUrls")),
+        }
+        conn.execute(
+            "UPDATE messages SET meta = ? WHERE id = ?",
+            (json.dumps(new_meta), row["id"]),
+        )
     for table in _V1_TABLES:
         conn.execute(f"DROP TABLE v1_{table}")

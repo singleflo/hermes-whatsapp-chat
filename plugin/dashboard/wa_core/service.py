@@ -64,7 +64,7 @@ def plugin_dir() -> Path:
 
 
 def hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return db.hermes_home(_platform())
 
 
 def plist_path() -> Path:

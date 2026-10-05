@@ -179,7 +179,8 @@ const routedToScope = query => {
   return query.queryKey[1] === (routed ?? LOCAL_SCOPE)
 }
 
-// ctx.rest errors read "409: {"detail": ...}".
+// ctx.rest errors read "409: {"detail": ...}". A 404 without our {"detail"} body comes from Hermes itself:
+// the plugin's routes are not mounted on that backend.
 function errorText(err) {
   const msg = String((err && err.message) || err)
   const m = /^(\d{3}):\s*([\s\S]*)$/.exec(msg)
@@ -194,7 +195,7 @@ function errorText(err) {
   } catch {
     // not JSON: fall through to the raw text
   }
-  return m[2]
+  return m[1] === '404' ? 'The WhatsApp Chat backend is not loaded on this Hermes.' : m[2]
 }
 
 function errorStatus(err) {
