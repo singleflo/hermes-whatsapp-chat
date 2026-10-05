@@ -14,6 +14,7 @@ The desktop app is the full experience. The web dashboard has the board, the cha
 
 - macOS, Linux (systemd) or Windows: the channel service runs as a LaunchAgent, a systemd user unit or a Startup-folder launcher respectively.
 - A working Hermes install (desktop app and/or dashboard). Node 22 comes with it (`~/.hermes/node/bin/node`); the service needs Node 20 or newer.
+- On Windows, Git (for example `winget install --id Git.Git -e`) if Hermes did not bring its own: Hermes clones every plugin installed from Git, and without it the install fails with `spawn git ENOENT`. Restart Hermes after installing Git.
 
 Nothing else: no Python environment to create, no repository to clone, no terminal commands. The plugin runs on Hermes' own Python and installs its Node dependencies by itself.
 
@@ -33,7 +34,7 @@ Nothing else: no Python environment to create, no repository to clone, no termin
    hermes plugins install singleflo/hermes-whatsapp-chat#plugin --enable
    ```
 
-2. If the Conversations page reports "Backend unreachable", restart the Hermes app: the backend routes mount only at startup.
+2. Open **Conversations**: the first time it shows **Restart Hermes to finish installing WhatsApp Chat** (Hermes loads plugin backends only when it starts). Click **Restart Hermes now**; the app closes and opens again with the plugin loaded. Without the desktop app, quit and reopen Hermes (or restart `hermes dashboard`).
 3. The WhatsApp channel service installs and starts itself the first time Hermes starts with the plugin (macOS LaunchAgent, Linux systemd user unit, Windows Startup launcher with a keep-alive supervisor); no click is needed. On its first start it downloads the bridge's Node dependencies (progress in `<data>/logs/npm.log`); numbers show "starting" until that finishes. **Settings → Numbers** (or the **Numbers** tab of the dashboard) shows its status and has **Install service** / **Reinstall** / **Uninstall service**; after an explicit uninstall the service is not installed again automatically until you click **Install service**. On Linux the unit needs systemd and, to survive logout, lingering (`loginctl enable-linger <user>`, enabled automatically when permitted).
 4. Click **Add number** and scan the QR code: WhatsApp on your phone → Settings → Linked devices → Link a device.
 5. Optional: click **Install skill** in the same screen to give Hermes agents the CLI skill (see below).
@@ -49,6 +50,8 @@ If something does not start, the service log is `~/.hermes/plugin-data/hermes-wh
 | Your data: database, WhatsApp sessions, media, uploads, logs, launchers | `~/.hermes/plugin-data/hermes-whatsapp-chat/` (survives update and removal) |
 | Service definition | macOS LaunchAgent `~/Library/LaunchAgents/it.fl1.hermes-whatsapp-chat.channel.plist`; Linux systemd user unit `~/.config/systemd/user/hermes-whatsapp-chat-channel.service`; Windows Startup-folder launcher `hermes-whatsapp-chat-channel.vbs` |
 | Installed skill | `~/.hermes/skills/whatsapp-chat/SKILL.md` |
+
+On Windows the Hermes home is `%LOCALAPPDATA%\hermes` instead of `~/.hermes` (unless `HERMES_HOME` is set), so every `~/.hermes/...` path above lives there.
 
 The service and the CLI run through a small launcher, `<data>/bin/hwc-python` (`hwc-python.cmd` and `wa.cmd` on Windows), written by the backend. It starts the same Python interpreter and import path as the Hermes dashboard backend, so no separate virtualenv is needed. `<data>/bin/wa` is the CLI wrapper the skill and the automation templates use.
 
