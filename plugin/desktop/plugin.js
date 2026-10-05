@@ -87,7 +87,7 @@ const $restart = atom(null)
 //   ACCOUNT_COLORS          account color name → var(--ui-*) css color
 //   AccountDot({account})   colored dot for an account (Account or conversation Card)
 //   ServiceBanner()         "WhatsApp service not installed / not running / restarting" + Install / Reinstall button
-//   BackendBanner()         "WhatsApp Chat is not loaded on this Hermes" / "older backend": quit and reopen Hermes
+//   BackendBanner()         "Restart Hermes to finish installing" / "older backend" + Restart Hermes now
 //   useBackendState()       'ok' | 'missing' (/health 404 on the active Hermes) | 'outdated' (api_version too low)
 //   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes;
 //                           'install' then waits for a fresh heartbeat (progress in $restart)
@@ -289,10 +289,17 @@ const SERVICE_START_TIMEOUT_MS = 30000
 const REQUIRED_API_VERSION = 10
 const RESTART_TITLE = 'Restart Hermes to finish installing or updating WhatsApp Chat'
 const RESTART_BODY =
-  'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then quit Hermes and open it again.'
-const MISSING_TITLE = 'WhatsApp Chat is not loaded on this Hermes'
+  'This Hermes is running an older WhatsApp Chat backend. Update the plugin on this Hermes if it is older, then restart Hermes.'
+const MISSING_TITLE = 'Restart Hermes to finish installing WhatsApp Chat'
 const MISSING_BODY =
-  'Install and enable WhatsApp Chat on this Hermes from the Plugins page, then quit Hermes and open it again: Hermes loads plugin backends only when it starts.'
+  'Hermes loads plugin backends only when it starts. If WhatsApp Chat is not installed and enabled on this Hermes yet, do that from the Plugins page first.'
+
+// The desktop app's own relaunch (its "Restart Hermes" button for updates): it stops the backend, local or the
+// remote one it started, and opens the app again, which loads the plugin backend. Missing on other builds.
+function relaunchHermes() {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+  return desktop && typeof desktop.relaunchApp === 'function' ? () => desktop.relaunchApp() : null
+}
 
 // 'missing': the plugin routes do not exist on the active Hermes (404, plugin routes are mounted only at Hermes
 // startup). 'outdated': /health lacks api_version or reports a lower one than this UI needs. Else 'ok'.
@@ -307,9 +314,11 @@ function useBackendState() {
 
 function BackendBanner() {
   const state = useBackendState()
+  const [restarting, setRestarting] = useState(false)
   if (state === 'ok') {
     return null
   }
+  const relaunch = relaunchHermes()
   return h(
     'div',
     {
@@ -322,7 +331,34 @@ function BackendBanner() {
       }
     },
     h('div', { style: { fontWeight: 600 } }, state === 'missing' ? MISSING_TITLE : RESTART_TITLE),
-    h('div', { style: T.muted }, state === 'missing' ? MISSING_BODY : RESTART_BODY)
+    h(
+      'div',
+      { style: T.muted },
+      (state === 'missing' ? MISSING_BODY : RESTART_BODY) + (relaunch ? '' : ' Quit Hermes and open it again.')
+    ),
+    relaunch
+      ? h(
+          'div',
+          { style: { ...F.row, gap: 6 } },
+          h(
+            Button,
+            {
+              size: 'xs',
+              variant: 'secondary',
+              loading: restarting,
+              disabled: restarting,
+              onClick: () => {
+                setRestarting(true)
+                Promise.resolve(relaunch()).catch(err => {
+                  setRestarting(false)
+                  host.notifyError(err, 'Could not restart Hermes')
+                })
+              }
+            },
+            'Restart Hermes now'
+          )
+        )
+      : null
   )
 }
 
