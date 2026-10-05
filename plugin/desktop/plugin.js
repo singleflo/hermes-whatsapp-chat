@@ -87,8 +87,8 @@ const $restart = atom(null)
 //   ACCOUNT_COLORS          account color name → var(--ui-*) css color
 //   AccountDot({account})   colored dot for an account (Account or conversation Card)
 //   ServiceBanner()         "WhatsApp service not installed / not running / restarting" + Install / Reinstall button
-//   BackendBanner()         "Restart Hermes to finish installing" / "older backend" + Restart Hermes now
-//   useBackendState()       'ok' | 'missing' (/health 404 on the active Hermes) | 'outdated' (api_version too low)
+//   BackendBanner()         restart banner (plugin backend not loaded / outdated) + Restart Hermes now, or sign-in banner
+//   useBackendState()       'loading' | 'ok' | 'outdated' | 'missing' | 'signin' | 'unreachable' (probeBackend on /health)
 //   useServiceAction()      [busyKey, run(key, path, doneMessage)] for service/skill POST routes;
 //                           'install' then waits for a fresh heartbeat (progress in $restart)
 //   SERVICE_LOG_HINT        where the service writes its log (shown on errors)
@@ -256,14 +256,22 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })
 }
 
-// key: string | array of key segments; opts: ctx.rest options plus { enabled }.
+// Statuses that are an answer, not a transient failure: retrying them only multiplies the same error (and every 401
+// can open a sign-in window on a password-protected Hermes).
+const FINAL_STATUSES = new Set([401, 403, 404])
+
+// key: string | array of key segments; opts: ctx.rest options plus { enabled }. Nothing is fetched until the backend
+// probe says the plugin backend serves this connection (see backendServes).
 function useApi(key, path, opts) {
   const { enabled = true, ...restOpts } = opts || {}
   const hasOpts = Object.keys(restOpts).length > 0
+  const backend = useBackendProbe()
+  const serves = backendServes(backend.data)
   return useQuery({
     queryKey: [ID, useConnScope(), ...[].concat(key), path],
     queryFn: () => ctxRef.rest(path, hasOpts ? restOpts : undefined),
-    enabled: query => enabled && routedToScope(query),
+    enabled: query => enabled && serves && routedToScope(query),
+    retry: (count, err) => count < 3 && !FINAL_STATUSES.has(errorStatus(err)),
     refetchInterval: POLL_MS
   })
 }
@@ -316,11 +324,7 @@ function useRestartMode() {
       }
       return desktop && typeof desktop.relaunchApp === 'function' ? 'relaunch' : null
     }
-    const lookup =
-      desktop && typeof desktop.getConnection === 'function'
-        ? Promise.resolve(desktop.getConnection()).catch(() => null)
-        : Promise.resolve(null)
-    lookup.then(conn => {
+    activeConnection().then(conn => {
       if (live) {
         setMode(pick(conn))
       }
@@ -332,27 +336,85 @@ function useRestartMode() {
   return mode
 }
 
-function restartBackend(mode) {
-  const desktop = window.hermesDesktop
-  if (mode === 'recycle') {
-    const profile = String(host.state.profile.get() || '').trim() || 'default'
-    return Promise.resolve(desktop.recycleBackend(profile))
+function activeConnection() {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+  return desktop && typeof desktop.getConnection === 'function'
+    ? Promise.resolve(desktop.getConnection()).catch(() => null)
+    : Promise.resolve(null)
+}
+
+// The desktop's key for the backend behind a connection descriptor (window.hermesDesktop.getConnection()), as
+// recycleBackend expects it: 'conn:<id>::<profile>' for a registry connection (the desktop's backendScopeKey),
+// a profile name for a local pool backend, '' for the primary backend (local, or a legacy primary SSH host).
+export function recycleKey(conn) {
+  if (!conn) {
+    return ''
   }
-  return Promise.resolve(desktop.relaunchApp())
+  const profile = String(conn.profile || '').trim() || 'default'
+  const id = String(conn.connectionId || '').trim()
+  if (conn.registryScoped && id && id !== LOCAL_SCOPE) {
+    return 'conn:' + id + '::' + profile
+  }
+  return conn.profile && !conn.sharedPrimary ? profile : ''
+}
+
+async function restartBackend(mode) {
+  const desktop = window.hermesDesktop
+  if (mode !== 'recycle') {
+    return desktop.relaunchApp()
+  }
+  return desktop.recycleBackend(recycleKey(await activeConnection()))
 }
 
 const SERVER_RESTART_HINT =
   ' This connection is a Hermes server the app does not start: restart its Hermes dashboard on that machine (for example its systemd service).'
+const SIGNIN_TITLE = 'Sign in to this Hermes again'
+const SIGNIN_BODY =
+  'This Hermes refused the request (401/403): its sign-in has expired or is missing. Sign in from the connection settings, then press Refresh. WhatsApp Chat stops asking until then, so no further sign-in windows open.'
 
-// 'missing': the plugin routes do not exist on the active Hermes (404, plugin routes are mounted only at Hermes
-// startup). 'outdated': /health lacks api_version or reports a lower one than this UI needs. Else 'ok'.
-function useBackendState() {
-  const q = useApi('health', '/health')
-  if (!q.data) {
-    return errorStatus(q.error) === 404 ? 'missing' : 'ok'
+// One /health call per connection decides what the plugin may do there. The answer is data, not an error, so it stays
+// stable while it is refetched and is never masked by data cached from an earlier backend:
+// 'ok'; 'outdated' (api_version missing or lower than this UI needs); 'missing' (404: the plugin routes are not
+// mounted on that backend, they mount only when Hermes starts, or the plugin is disabled); 'signin' (401/403);
+// 'unreachable' (anything else).
+export function backendStateOf(result) {
+  if (result.error === undefined) {
+    const v = result.data && result.data.api_version
+    return typeof v !== 'number' || v < REQUIRED_API_VERSION ? 'outdated' : 'ok'
   }
-  const v = q.data.api_version
-  return typeof v !== 'number' || v < REQUIRED_API_VERSION ? 'outdated' : 'ok'
+  const status = errorStatus(result.error)
+  return status === 404 ? 'missing' : status === 401 || status === 403 ? 'signin' : 'unreachable'
+}
+
+async function probeBackend() {
+  try {
+    const data = await ctxRef.rest('/health')
+    return { state: backendStateOf({ data }), data }
+  } catch (error) {
+    return { state: backendStateOf({ error }), error: errorText(error) }
+  }
+}
+
+function useBackendProbe() {
+  return useQuery({
+    queryKey: [ID, useConnScope(), 'backend'],
+    queryFn: probeBackend,
+    enabled: routedToScope,
+    retry: false,
+    // Signed out: stop asking (each 401 may open a sign-in window); Refresh asks again.
+    refetchInterval: query => (query.state.data && query.state.data.state === 'signin' ? false : POLL_MS)
+  })
+}
+
+// Other routes are worth calling only when the plugin backend is there (an outdated one still serves most of them;
+// an unreachable one gets its usual errors).
+function backendServes(probe) {
+  return Boolean(probe) && probe.state !== 'missing' && probe.state !== 'signin'
+}
+
+function useBackendState() {
+  const q = useBackendProbe()
+  return q.data ? q.data.state : 'loading'
 }
 
 function BackendBanner() {
@@ -370,7 +432,20 @@ function BackendBanner() {
     }
     return ctxRef.setTimeout(() => setRestarting(false), 60000)
   }, [restarting, state])
-  if (state === 'ok') {
+  if (state === 'signin') {
+    return h(
+      'div',
+      { style: { ...BANNER, ...F.col, gap: 4, border: '1px solid var(--ui-orange)' } },
+      h('div', { style: { fontWeight: 600 } }, SIGNIN_TITLE),
+      h('div', { style: T.muted }, SIGNIN_BODY),
+      h(
+        'div',
+        { style: { ...F.row, gap: 6 } },
+        h(Button, { size: 'xs', variant: 'secondary', onClick: () => refresh() }, 'Refresh')
+      )
+    )
+  }
+  if (state !== 'missing' && state !== 'outdated') {
     return null
   }
   const canRestart = mode === 'recycle' || mode === 'relaunch'
@@ -2990,6 +3065,9 @@ function WaPage({ route, accountId }) {
   const account = useValue(scope.account)
   const health = useApi('service', '/service')
   const accounts = useApi('accounts', '/accounts')
+  // Plugin backend not loaded here, or signed out: only the banner, never data cached from an earlier backend.
+  const backend = useBackendState()
+  const blocked = backend === 'missing' || backend === 'signin'
   const open = useCallback(
     id => {
       scope.selected.set(id)
@@ -2998,7 +3076,7 @@ function WaPage({ route, accountId }) {
     [scope]
   )
 
-  const unreachable = !health.data && !accounts.data && (health.error || accounts.error)
+  const unreachable = !blocked && !health.data && !accounts.data && (health.error || accounts.error)
 
   return h(
     'div',
@@ -3028,9 +3106,13 @@ function WaPage({ route, accountId }) {
     ),
     h(BackendBanner, {}),
     h(ServiceBanner, {}),
-    tab === 'chats' ? h(ChatsView, { accountId: account, selected, onSelect: open, newChatAtom: scope.newChat }) : null,
-    tab === 'board' ? h(BoardView, { accountId: account, onOpen: open }) : null,
-    tab === 'settings' ? h('div', { style: { ...F.fill, overflowY: 'auto' } }, jsx(SettingsPage, {})) : null
+    blocked
+      ? null
+      : tab === 'chats'
+        ? h(ChatsView, { accountId: account, selected, onSelect: open, newChatAtom: scope.newChat })
+        : tab === 'board'
+          ? h(BoardView, { accountId: account, onOpen: open })
+          : h('div', { style: { ...F.fill, overflowY: 'auto' } }, jsx(SettingsPage, {}))
   )
 }
 
@@ -3050,7 +3132,23 @@ function StatusChip() {
   const unread = useApi('chip-unread', '/conversations?unread_only=true&limit=1' + filter, { enabled: open })
   const working = useApi('chip-progress', '/conversations?state=in_progress&limit=1' + filter, { enabled: open })
   const waiting = useApi('chip-waiting', '/conversations?state=waiting&limit=1' + filter, { enabled: open })
+  const backend = useBackendState()
 
+  if (backend === 'missing' || backend === 'signin') {
+    return h(
+      'button',
+      {
+        type: 'button',
+        className: 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]',
+        style: T.muted,
+        title: backend === 'missing' ? MISSING_TITLE : SIGNIN_TITLE,
+        onClick: () => host.navigate(ROUTE)
+      },
+      h(StatusDot, { tone: 'bad' }),
+      h('span', null, 'WhatsApp'),
+      h('span', { style: { color: 'var(--ui-red)' } }, backend === 'missing' ? '· restart needed' : '· sign in')
+    )
+  }
   if (!news.data && !news.error) {
     return null
   }
