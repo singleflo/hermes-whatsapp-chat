@@ -294,12 +294,55 @@ const MISSING_TITLE = 'Restart Hermes to finish installing WhatsApp Chat'
 const MISSING_BODY =
   'Hermes loads plugin backends only when it starts. If WhatsApp Chat is not installed and enabled on this Hermes yet, do that from the Plugins page first.'
 
-// The desktop app's own relaunch (its "Restart Hermes" button for updates): it stops the backend, local or the
-// remote one it started, and opens the app again, which loads the plugin backend. Missing on other builds.
-function relaunchHermes() {
-  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
-  return desktop && typeof desktop.relaunchApp === 'function' ? () => desktop.relaunchApp() : null
+// How "Restart Hermes now" restarts the backend of the active connection:
+// - 'recycle': the desktop's backend recycle (its Models-page recovery): stops the backend it owns, the local one
+//   or the `serve --isolated` it started over SSH, and reconnects to a fresh one, which mounts the plugin routes.
+//   An app relaunch is not enough over SSH: it skips the quit teardown and reattaches to the old remote backend.
+// - 'relaunch': older builds without recycle: the app's own relaunch (fine for a local backend).
+// - 'server': a URL or cloud connection, a backend the desktop does not own: restart it on that server.
+// - null: unknown yet, or no way to do it from here.
+function useRestartMode() {
+  const scope = useConnScope()
+  const [mode, setMode] = useState(null)
+  useEffect(() => {
+    let live = true
+    const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+    const pick = conn => {
+      if (conn && conn.mode === 'remote' && conn.remoteKind !== 'ssh') {
+        return 'server'
+      }
+      if (desktop && typeof desktop.recycleBackend === 'function') {
+        return 'recycle'
+      }
+      return desktop && typeof desktop.relaunchApp === 'function' ? 'relaunch' : null
+    }
+    const lookup =
+      desktop && typeof desktop.getConnection === 'function'
+        ? Promise.resolve(desktop.getConnection()).catch(() => null)
+        : Promise.resolve(null)
+    lookup.then(conn => {
+      if (live) {
+        setMode(pick(conn))
+      }
+    })
+    return () => {
+      live = false
+    }
+  }, [scope])
+  return mode
 }
+
+function restartBackend(mode) {
+  const desktop = window.hermesDesktop
+  if (mode === 'recycle') {
+    const profile = String(host.state.profile.get() || '').trim() || 'default'
+    return Promise.resolve(desktop.recycleBackend(profile))
+  }
+  return Promise.resolve(desktop.relaunchApp())
+}
+
+const SERVER_RESTART_HINT =
+  ' This connection is a Hermes server the app does not start: restart its Hermes dashboard on that machine (for example its systemd service).'
 
 // 'missing': the plugin routes do not exist on the active Hermes (404, plugin routes are mounted only at Hermes
 // startup). 'outdated': /health lacks api_version or reports a lower one than this UI needs. Else 'ok'.
@@ -314,11 +357,24 @@ function useBackendState() {
 
 function BackendBanner() {
   const state = useBackendState()
+  const mode = useRestartMode()
   const [restarting, setRestarting] = useState(false)
+  // The recycle keeps this page mounted: stop the spinner once the backend answers, or after a minute.
+  useEffect(() => {
+    if (!restarting) {
+      return undefined
+    }
+    if (state === 'ok') {
+      setRestarting(false)
+      return undefined
+    }
+    return ctxRef.setTimeout(() => setRestarting(false), 60000)
+  }, [restarting, state])
   if (state === 'ok') {
     return null
   }
-  const relaunch = relaunchHermes()
+  const canRestart = mode === 'recycle' || mode === 'relaunch'
+  const hint = mode === 'server' ? SERVER_RESTART_HINT : canRestart ? '' : ' Quit Hermes and open it again.'
   return h(
     'div',
     {
@@ -331,12 +387,8 @@ function BackendBanner() {
       }
     },
     h('div', { style: { fontWeight: 600 } }, state === 'missing' ? MISSING_TITLE : RESTART_TITLE),
-    h(
-      'div',
-      { style: T.muted },
-      (state === 'missing' ? MISSING_BODY : RESTART_BODY) + (relaunch ? '' : ' Quit Hermes and open it again.')
-    ),
-    relaunch
+    h('div', { style: T.muted }, (state === 'missing' ? MISSING_BODY : RESTART_BODY) + hint),
+    canRestart
       ? h(
           'div',
           { style: { ...F.row, gap: 6 } },
@@ -349,10 +401,12 @@ function BackendBanner() {
               disabled: restarting,
               onClick: () => {
                 setRestarting(true)
-                Promise.resolve(relaunch()).catch(err => {
-                  setRestarting(false)
-                  host.notifyError(err, 'Could not restart Hermes')
-                })
+                restartBackend(mode)
+                  .then(() => refresh())
+                  .catch(err => {
+                    setRestarting(false)
+                    host.notifyError(err, 'Could not restart Hermes')
+                  })
               }
             },
             'Restart Hermes now'
